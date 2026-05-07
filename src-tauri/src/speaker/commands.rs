@@ -105,7 +105,9 @@ pub async fn start_system_audio_capture(
         .map_err(|e| format!("Failed to set capturing state: {}", e))? = true;
 
     // Emit capture started event
-    let _ = app_clone.emit("capture-started", sr);
+    if let Err(e) = app_clone.emit("capture-started", sr) {
+        error!("Failed to emit capture-started: {}", e);
+    }
 
     let state_clone = app.state::<crate::AudioState>();
     let task = tokio::spawn(async move {
@@ -182,7 +184,9 @@ async fn run_vad_capture(
                     // Include pre-speech buffer for natural sound
                     speech_buffer.extend(pre_speech.drain(..));
 
-                    let _ = app.emit("speech-start", ());
+                    if let Err(e) = app.emit("speech-start", ()) {
+                        error!("Failed to emit speech-start: {}", e);
+                    }
                 }
 
                 speech_chunks += 1;
@@ -192,9 +196,13 @@ async fn run_vad_capture(
                 // Safety cap: force emit if exceeds 30s
                 if speech_buffer.len() > max_samples {
                     let normalized_buffer = normalize_audio_level(&speech_buffer, 0.1);
-                    if let Ok(b64) = samples_to_wav_b64(sr, &normalized_buffer) {
-                        // let duration = speech_buffer.len() as f32 / sr as f32;
-                        let _ = app.emit("speech-detected", b64);
+                    match samples_to_wav_b64(sr, &normalized_buffer) {
+                        Ok(b64) => {
+                            if let Err(e) = app.emit("speech-detected", b64) {
+                                error!("Failed to emit speech-detected (max-samples cap): {}", e);
+                            }
+                        }
+                        Err(e) => error!("Failed to encode speech (max-samples cap): {}", e),
                     }
                     speech_buffer.clear();
                     in_speech = false;
@@ -224,18 +232,29 @@ async fn run_vad_capture(
 
                             // Emit complete speech segment
                             let normalized_buffer = normalize_audio_level(&speech_buffer, 0.1);
-                            if let Ok(b64) = samples_to_wav_b64(sr, &normalized_buffer) {
-                                // let duration = speech_buffer.len() as f32 / sr as f32;
-                                let _ = app.emit("speech-detected", b64);
-                            } else {
-                                error!("Failed to encode speech to WAV");
-                                let _ = app.emit("audio-encoding-error", "Failed to encode speech");
+                            match samples_to_wav_b64(sr, &normalized_buffer) {
+                                Ok(b64) => {
+                                    if let Err(e) = app.emit("speech-detected", b64) {
+                                        error!("Failed to emit speech-detected: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to encode speech to WAV: {}", e);
+                                    if let Err(emit_err) =
+                                        app.emit("audio-encoding-error", "Failed to encode speech")
+                                    {
+                                        error!(
+                                            "Failed to emit audio-encoding-error: {}",
+                                            emit_err
+                                        );
+                                    }
+                                }
                             }
-                        } else {
-                            let _ = app.emit(
-                                "speech-discarded",
-                                "Audio too short (likely background noise)",
-                            );
+                        } else if let Err(e) = app.emit(
+                            "speech-discarded",
+                            "Audio too short (likely background noise)",
+                        ) {
+                            error!("Failed to emit speech-discarded: {}", e);
                         }
 
                         // Reset for next speech detection
@@ -288,10 +307,12 @@ async fn run_continuous_capture(
     });
 
     // Emit recording started
-    let _ = app.emit(
+    if let Err(e) = app.emit(
         "continuous-recording-start",
         config.max_recording_duration_secs,
-    );
+    ) {
+        error!("Failed to emit continuous-recording-start: {}", e);
+    }
 
     // Accumulate audio - check stop flag on EVERY sample for immediate response
     loop {
@@ -314,7 +335,9 @@ async fn run_continuous_capture(
 
                         // Emit progress every second
                         if audio_buffer.len() % (sr as usize) == 0 {
-                            let _ = app.emit("recording-progress", elapsed.as_secs());
+                            if let Err(e) = app.emit("recording-progress", elapsed.as_secs()) {
+                                error!("Failed to emit recording-progress: {}", e);
+                            }
                         }
 
                         // Check size limit (safety)
@@ -351,19 +374,27 @@ async fn run_continuous_capture(
 
         match samples_to_wav_b64(sr, &cleaned_audio) {
             Ok(b64) => {
-                let _ = app.emit("speech-detected", b64);
+                if let Err(e) = app.emit("speech-detected", b64) {
+                    error!("Failed to emit speech-detected (continuous): {}", e);
+                }
             }
             Err(e) => {
                 error!("Failed to encode continuous audio: {}", e);
-                let _ = app.emit("audio-encoding-error", e);
+                if let Err(emit_err) = app.emit("audio-encoding-error", e) {
+                    error!("Failed to emit audio-encoding-error: {}", emit_err);
+                }
             }
         }
     } else {
         warn!("No audio captured in continuous mode");
-        let _ = app.emit("audio-encoding-error", "No audio recorded");
+        if let Err(e) = app.emit("audio-encoding-error", "No audio recorded") {
+            error!("Failed to emit audio-encoding-error: {}", e);
+        }
     }
 
-    let _ = app.emit("continuous-recording-stopped", ());
+    if let Err(e) = app.emit("continuous-recording-stopped", ()) {
+        error!("Failed to emit continuous-recording-stopped: {}", e);
+    }
 }
 
 // Apply noise gate
@@ -494,14 +525,18 @@ pub async fn stop_system_audio_capture(app: AppHandle) -> Result<(), String> {
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Emit stopped event
-    let _ = app.emit("capture-stopped", ());
+    if let Err(e) = app.emit("capture-stopped", ()) {
+        error!("Failed to emit capture-stopped: {}", e);
+    }
     Ok(())
 }
 
 /// Manual stop for continuous recording
 #[tauri::command]
 pub async fn manual_stop_continuous(app: AppHandle) -> Result<(), String> {
-    let _ = app.emit("manual-stop-continuous", ());
+    if let Err(e) = app.emit("manual-stop-continuous", ()) {
+        error!("Failed to emit manual-stop-continuous: {}", e);
+    }
 
     tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
 
