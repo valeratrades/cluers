@@ -169,11 +169,13 @@ export const useCompletion = () => {
 
         // Handle attachments: split images and documents (PDFs)
         const imagesBase64: string[] = [];
+        const imagesMime: string[] = [];
         const documentsBase64: string[] = [];
         if (state.attachedFiles.length > 0) {
           state.attachedFiles.forEach((file) => {
             if (file.type.startsWith("image/")) {
               imagesBase64.push(file.base64);
+              imagesMime.push(file.type);
             } else if (file.type === "application/pdf") {
               documentsBase64.push(file.base64);
             }
@@ -220,6 +222,7 @@ export const useCompletion = () => {
             history: messageHistory,
             userMessage: input,
             imagesBase64,
+            imagesMime,
             documentsBase64,
             signal,
           })) {
@@ -623,6 +626,7 @@ export const useCompletion = () => {
               history: messageHistory,
               userMessage: prompt,
               imagesBase64: [base64],
+              imagesMime: ["image/png"],
               signal,
             })) {
               // Only update if this is still the current request

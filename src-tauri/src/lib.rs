@@ -21,7 +21,7 @@ use tauri_nspanel::{cocoa::appkit::NSWindowCollectionBehavior, panel_delegate, W
 pub struct AudioState {
     stream_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     vad_config: Arc<Mutex<VadConfig>>,
-    is_capturing: Arc<Mutex<bool>>,
+    is_capturing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[tauri::command]

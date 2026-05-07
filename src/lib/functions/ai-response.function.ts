@@ -171,6 +171,7 @@ export async function* fetchAIResponse(params: {
   history?: Message[];
   userMessage: string;
   imagesBase64?: string[];
+  imagesMime?: string[];
   documentsBase64?: string[];
   signal?: AbortSignal;
 }): AsyncIterable<string> {
@@ -182,6 +183,7 @@ export async function* fetchAIResponse(params: {
       history = [],
       userMessage,
       imagesBase64 = [],
+      imagesMime = [],
       documentsBase64 = [],
       signal,
     } = params;
@@ -265,6 +267,7 @@ export async function* fetchAIResponse(params: {
         history,
         userMessage,
         imagesBase64,
+        imagesMime,
         documentsBase64
       );
       bodyObj[messagesKey] = finalMessages;

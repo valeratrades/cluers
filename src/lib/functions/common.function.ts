@@ -55,7 +55,7 @@ export function extractVariables(
 
   const doNotInclude = includeAll
     ? []
-    : ["SYSTEM_PROMPT", "TEXT", "IMAGE", "AUDIO", "DOCUMENT"];
+    : ["SYSTEM_PROMPT", "TEXT", "IMAGE", "IMAGE_MIME", "AUDIO", "DOCUMENT"];
 
   const filteredVariables = uniqueVariables?.filter(
     (variable) => !doNotInclude?.includes(variable)
@@ -72,6 +72,7 @@ export function extractVariables(
  * @param template The user message template object.
  * @param userMessage The user's text message.
  * @param imagesBase64 An array of base64 encoded images.
+ * @param imagesMime An array of MIME types for the images, parallel to imagesBase64.
  * @param documentsBase64 An array of base64 encoded documents (e.g. PDFs).
  * @returns The processed user message object.
  */
@@ -79,6 +80,7 @@ export function processUserMessageTemplate(
   template: any,
   userMessage: string,
   imagesBase64: string[] = [],
+  imagesMime: string[] = [],
   documentsBase64: string[] = []
 ): any {
   const escapeForJson = (value: string) =>
@@ -90,32 +92,43 @@ export function processUserMessageTemplate(
   );
   const result = JSON.parse(templateStr);
 
-  // Expands a single template node containing `{{<TOKEN>}}` into N copies
-  // (one per provided base64 payload), or removes it if no payloads are given.
-  const expandTokenInArray = (
+  // Expands a single template node containing any of the given tokens into N copies
+  // (one per payload entry); each entry maps token name -> substitution value.
+  // Removes the template node if no payloads are given.
+  const expandTokensInArray = (
     node: any[],
-    token: string,
-    payloads: string[]
+    tokens: string[],
+    payloads: Record<string, string>[]
   ): any[] => {
-    const idx = node.findIndex((item) =>
-      JSON.stringify(item).includes(`{{${token}}}`)
-    );
+    const idx = node.findIndex((item) => {
+      const s = JSON.stringify(item);
+      return tokens.some((t) => s.includes(`{{${t}}}`));
+    });
     if (idx === -1) return node;
     const tpl = node[idx];
-    const parts = payloads.map((p) => {
-      const partStr = JSON.stringify(tpl).replace(
-        new RegExp(`\\{\\{${token}\\}\\}`, "g"),
-        p
-      );
+    const parts = payloads.map((payload) => {
+      let partStr = JSON.stringify(tpl);
+      for (const token of tokens) {
+        partStr = partStr.replace(
+          new RegExp(`\\{\\{${token}\\}\\}`, "g"),
+          escapeForJson(payload[token] ?? "")
+        );
+      }
       return JSON.parse(partStr);
     });
     return [...node.slice(0, idx), ...parts, ...node.slice(idx + 1)];
   };
 
+  const imagePayloads = imagesBase64.map((b64, i) => ({
+    IMAGE: b64,
+    IMAGE_MIME: imagesMime[i] ?? "image/png",
+  }));
+  const documentPayloads = documentsBase64.map((b64) => ({ DOCUMENT: b64 }));
+
   const replacer = (node: any): any => {
     if (Array.isArray(node)) {
-      let arr = expandTokenInArray(node, "IMAGE", imagesBase64);
-      arr = expandTokenInArray(arr, "DOCUMENT", documentsBase64);
+      let arr = expandTokensInArray(node, ["IMAGE", "IMAGE_MIME"], imagePayloads);
+      arr = expandTokensInArray(arr, ["DOCUMENT"], documentPayloads);
       return arr.map(replacer);
     } else if (node && typeof node === "object") {
       const newNode: { [key: string]: any } = {};
@@ -136,6 +149,7 @@ export function processUserMessageTemplate(
  * @param history An array of previous messages in the conversation.
  * @param userMessage The user's current text message.
  * @param imagesBase64 An array of base64 encoded images for the current message.
+ * @param imagesMime An array of image MIME types parallel to imagesBase64.
  * @param documentsBase64 An array of base64 encoded documents (e.g. PDFs) for the current message.
  * @returns The fully constructed messages array.
  */
@@ -144,6 +158,7 @@ export function buildDynamicMessages(
   history: Message[],
   userMessage: string,
   imagesBase64: string[] = [],
+  imagesMime: string[] = [],
   documentsBase64: string[] = []
 ): any[] {
   const userMessageTemplateIndex = messagesTemplate.findIndex((m) =>
@@ -162,6 +177,7 @@ export function buildDynamicMessages(
     userMessageTemplate,
     userMessage,
     imagesBase64,
+    imagesMime,
     documentsBase64
   );
 

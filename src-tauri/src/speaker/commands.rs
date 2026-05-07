@@ -9,6 +9,11 @@ use std::collections::VecDeque;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+// Memory ordering choice for capture state:
+// `Acquire` on the load side and `Release` on the store side establish a
+// happens-before relationship - any thread that observes `is_capturing == true`
+// is guaranteed to see all the side-effects that preceded the store, and vice versa.
+// `AcqRel` on compare_exchange combines both for the success case.
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Listener, Manager};
 use tauri_plugin_shell::ShellExt;
@@ -52,57 +57,65 @@ pub async fn start_system_audio_capture(
 ) -> Result<(), String> {
     let state = app.state::<crate::AudioState>();
 
-    // Check if already capturing (atomic check)
+    // Atomic entry guard: flips false -> true exactly once. Concurrent callers
+    // that lose the CAS race exit immediately without setting up any resources.
+    if state
+        .is_capturing
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        let guard = state
-            .stream_task
-            .lock()
-            .map_err(|e| format!("Failed to acquire lock: {}", e))?;
-
-        if guard.is_some() {
-            warn!("Capture already running");
-            return Err("Capture already running".to_string());
-        }
+        warn!("Capture already running");
+        return Err("Capture already running".to_string());
     }
 
-    // Update VAD config if provided
-    if let Some(config) = vad_config {
-        let mut vad_cfg = state
+    // From here on, any error path must reset is_capturing back to false.
+    // Wrap the setup in a closure so we can roll back on failure with one path.
+    let setup = (|| -> Result<_, String> {
+        // Update VAD config if provided
+        if let Some(config) = vad_config {
+            let mut vad_cfg = state
+                .vad_config
+                .lock()
+                .map_err(|e| format!("Failed to acquire VAD config lock: {}", e))?;
+            *vad_cfg = config;
+        }
+
+        let input = SpeakerInput::new_with_device(device_id).map_err(|e| {
+            error!("Failed to create speaker input: {}", e);
+            format!("Failed to access system audio: {}", e)
+        })?;
+
+        let stream = input.stream();
+        let sr = stream.sample_rate();
+
+        // Validate sample rate
+        if !(8000..=96000).contains(&sr) {
+            error!("Invalid sample rate: {}", sr);
+            return Err(format!(
+                "Invalid sample rate: {}. Expected 8000-96000 Hz",
+                sr
+            ));
+        }
+
+        let vad_config = state
             .vad_config
             .lock()
-            .map_err(|e| format!("Failed to acquire VAD config lock: {}", e))?;
-        *vad_cfg = config;
-    }
+            .map_err(|e| format!("Failed to read VAD config: {}", e))?
+            .clone();
 
-    let input = SpeakerInput::new_with_device(device_id).map_err(|e| {
-        error!("Failed to create speaker input: {}", e);
-        format!("Failed to access system audio: {}", e)
-    })?;
+        Ok((stream, sr, vad_config))
+    })();
 
-    let stream = input.stream();
-    let sr = stream.sample_rate();
-
-    // Validate sample rate
-    if !(8000..=96000).contains(&sr) {
-        error!("Invalid sample rate: {}", sr);
-        return Err(format!(
-            "Invalid sample rate: {}. Expected 8000-96000 Hz",
-            sr
-        ));
-    }
+    let (stream, sr, vad_config) = match setup {
+        Ok(v) => v,
+        Err(e) => {
+            // Roll back the entry guard so the next start can proceed.
+            state.is_capturing.store(false, Ordering::Release);
+            return Err(e);
+        }
+    };
 
     let app_clone = app.clone();
-    let vad_config = state
-        .vad_config
-        .lock()
-        .map_err(|e| format!("Failed to read VAD config: {}", e))?
-        .clone();
-
-    // Mark as capturing BEFORE spawning task
-    *state
-        .is_capturing
-        .lock()
-        .map_err(|e| format!("Failed to set capturing state: {}", e))? = true;
 
     // Emit capture started event
     if let Err(e) = app_clone.emit("capture-started", sr) {
@@ -125,11 +138,7 @@ pub async fn start_system_audio_capture(
         }
         // Also clear `is_capturing` so the next start isn't blocked by stale state
         // when the task ends naturally (max duration, safety cap, stream EOF, etc.)
-        {
-            if let Ok(mut guard) = state.is_capturing.lock() {
-                *guard = false;
-            };
-        }
+        state.is_capturing.store(false, Ordering::Release);
     });
 
     *state_clone
@@ -516,10 +525,7 @@ pub async fn stop_system_audio_capture(app: AppHandle) -> Result<(), String> {
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
     // Mark as not capturing
-    *state
-        .is_capturing
-        .lock()
-        .map_err(|e| format!("Failed to update capturing state: {}", e))? = false;
+    state.is_capturing.store(false, Ordering::Release);
 
     // Additional cleanup delay (CRITICAL for mic indicator)
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -631,11 +637,7 @@ pub async fn update_vad_config(app: AppHandle, config: VadConfig) -> Result<(), 
 #[tauri::command]
 pub async fn get_capture_status(app: AppHandle) -> Result<bool, String> {
     let state = app.state::<crate::AudioState>();
-    let is_capturing = *state
-        .is_capturing
-        .lock()
-        .map_err(|e| format!("Failed to get capture status: {}", e))?;
-    Ok(is_capturing)
+    Ok(state.is_capturing.load(Ordering::Acquire))
 }
 
 #[tauri::command]
