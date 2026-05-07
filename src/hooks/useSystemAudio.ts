@@ -433,6 +433,9 @@ export function useSystemAudio() {
       setRecordingProgress(0);
       setError("");
 
+      // Stop any existing capture (auto-listen / leftover task) before starting a new one
+      await invoke<string>("stop_system_audio_capture").catch(() => {});
+
       const deviceId =
         selectedAudioDevices.output.id !== "default"
           ? selectedAudioDevices.output.id

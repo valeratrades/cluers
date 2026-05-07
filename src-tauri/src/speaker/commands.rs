@@ -121,6 +121,13 @@ pub async fn start_system_audio_capture(
                 *guard = None;
             };
         }
+        // Also clear `is_capturing` so the next start isn't blocked by stale state
+        // when the task ends naturally (max duration, safety cap, stream EOF, etc.)
+        {
+            if let Ok(mut guard) = state.is_capturing.lock() {
+                *guard = false;
+            };
+        }
     });
 
     *state_clone
