@@ -164,12 +164,15 @@ export const useChatCompletion = (
           content: msg.content,
         }));
 
-        // Handle image attachments
+        // Handle attachments: split images and documents (PDFs)
         const imagesBase64: string[] = [];
+        const documentsBase64: string[] = [];
         if (state.attachedFiles.length > 0) {
           state.attachedFiles.forEach((file) => {
             if (file.type.startsWith("image/")) {
               imagesBase64.push(file.base64);
+            } else if (file.type === "application/pdf") {
+              documentsBase64.push(file.base64);
             }
           });
         }
@@ -233,6 +236,7 @@ export const useChatCompletion = (
             history: messageHistory,
             userMessage: input,
             imagesBase64,
+            documentsBase64,
             signal,
           })) {
             // Only update if this is still the current request
@@ -412,10 +416,9 @@ export const useChatCompletion = (
     const files = Array.from(e.target.files || []);
 
     files.forEach((file) => {
-      if (
-        file.type.startsWith("image/") &&
-        state.attachedFiles.length < MAX_FILES
-      ) {
+      const isAccepted =
+        file.type.startsWith("image/") || file.type === "application/pdf";
+      if (isAccepted && state.attachedFiles.length < MAX_FILES) {
         addFile(file);
       }
     });

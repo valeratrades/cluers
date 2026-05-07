@@ -171,6 +171,7 @@ export async function* fetchAIResponse(params: {
   history?: Message[];
   userMessage: string;
   imagesBase64?: string[];
+  documentsBase64?: string[];
   signal?: AbortSignal;
 }): AsyncIterable<string> {
   try {
@@ -181,6 +182,7 @@ export async function* fetchAIResponse(params: {
       history = [],
       userMessage,
       imagesBase64 = [],
+      documentsBase64 = [],
       signal,
     } = params;
 
@@ -244,6 +246,11 @@ export async function* fetchAIResponse(params: {
         `Provider ${provider?.id ?? "unknown"} does not support image input`
       );
     }
+    if (documentsBase64.length > 0 && !provider.curl.includes("{{DOCUMENT}}")) {
+      throw new Error(
+        `Provider ${provider?.id ?? "unknown"} does not support document input`
+      );
+    }
 
     let bodyObj: any = curlJson.data
       ? JSON.parse(JSON.stringify(curlJson.data))
@@ -257,7 +264,8 @@ export async function* fetchAIResponse(params: {
         bodyObj[messagesKey],
         history,
         userMessage,
-        imagesBase64
+        imagesBase64,
+        documentsBase64
       );
       bodyObj[messagesKey] = finalMessages;
     }
@@ -291,11 +299,9 @@ export async function* fetchAIResponse(params: {
       }
     }
 
-    const fetchFunction = url?.includes("http") ? fetch : tauriFetch;
-
     let response;
     try {
-      response = await fetchFunction(url, {
+      response = await tauriFetch(url, {
         method: curlJson.method || "POST",
         headers,
         body: curlJson.method === "GET" ? undefined : JSON.stringify(bodyObj),
