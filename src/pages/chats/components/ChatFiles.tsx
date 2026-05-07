@@ -6,7 +6,13 @@ import {
   Button,
   ScrollArea,
 } from "@/components";
-import { PaperclipIcon, XIcon, PlusIcon, TrashIcon } from "lucide-react";
+import {
+  PaperclipIcon,
+  XIcon,
+  PlusIcon,
+  TrashIcon,
+  FileTextIcon,
+} from "lucide-react";
 import { MAX_FILES } from "@/config";
 import { useApp } from "@/contexts";
 
@@ -60,8 +66,8 @@ export const ChatFiles = ({
             className="size-7 lg:size-9 rounded-lg lg:rounded-xl"
             title={
               supportsImages
-                ? "Attach images"
-                : "Image upload not supported by current AI provider"
+                ? "Attach images or PDFs"
+                : "File upload not supported by current AI provider"
             }
           >
             <PaperclipIcon className="size-3 lg:size-4" />
@@ -84,7 +90,7 @@ export const ChatFiles = ({
           >
             <div className="flex items-center justify-between px-4 py-2 border-b bg-muted/30">
               <h3 className="font-semibold text-sm select-none">
-                Attached Images ({attachedFiles.length}/{MAX_FILES})
+                Attached files ({attachedFiles.length}/{MAX_FILES})
               </h3>
               <Button
                 size="icon"
@@ -111,11 +117,17 @@ export const ChatFiles = ({
                     key={file.id}
                     className="relative group border rounded-lg overflow-hidden bg-muted/20"
                   >
-                    <img
-                      src={`data:${file.type};base64,${file.base64}`}
-                      alt={file.name}
-                      className={`w-32 object-cover h-32`}
-                    />
+                    {file.type.startsWith("image/") ? (
+                      <img
+                        src={`data:${file.type};base64,${file.base64}`}
+                        alt={file.name}
+                        className={`w-32 object-cover h-32`}
+                      />
+                    ) : (
+                      <div className="w-32 h-32 flex items-center justify-center bg-muted/40">
+                        <FileTextIcon className="h-10 w-10 opacity-70" />
+                      </div>
+                    )}
 
                     {/* File info overlay */}
                     <div className="absolute bottom-0 left-0 right-0 bg-black/70 text-white p-2 text-xs">
@@ -131,7 +143,7 @@ export const ChatFiles = ({
                       variant="default"
                       className="absolute top-2 right-2 h-6 w-6 cursor-pointer"
                       onClick={() => removeFile(file.id)}
-                      title="Remove image"
+                      title="Remove file"
                     >
                       <XIcon className="h-3 w-3" />
                     </Button>
@@ -168,7 +180,7 @@ export const ChatFiles = ({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*"
+        accept="image/*,application/pdf"
         onChange={handleFileSelect}
         className="hidden"
       />

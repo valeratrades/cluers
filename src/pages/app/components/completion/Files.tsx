@@ -5,7 +5,13 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Button, ScrollArea } from "@/components";
-import { PaperclipIcon, XIcon, PlusIcon, TrashIcon } from "lucide-react";
+import {
+  PaperclipIcon,
+  XIcon,
+  PlusIcon,
+  TrashIcon,
+  FileTextIcon,
+} from "lucide-react";
 import { UseCompletionReturn } from "@/types";
 import { MAX_FILES } from "@/config";
 import { useApp } from "@/contexts";
@@ -47,8 +53,8 @@ export const Files = ({
             className="cursor-pointer"
             title={
               supportsImages
-                ? "Attach images"
-                : "Image upload not supported by current AI provider"
+                ? "Attach images or PDFs"
+                : "File upload not supported by current AI provider"
             }
           >
             <PaperclipIcon className="h-4 w-4" />
@@ -71,7 +77,7 @@ export const Files = ({
           >
             <div className="flex items-center justify-between px-4 py-2 border-b bg-muted/30">
               <h3 className="font-semibold text-sm select-none">
-                Attached Images ({attachedFiles.length}/{MAX_FILES})
+                Attached files ({attachedFiles.length}/{MAX_FILES})
               </h3>
               <Button
                 size="icon"
@@ -98,11 +104,17 @@ export const Files = ({
                     key={file.id}
                     className="relative group border rounded-lg overflow-hidden bg-muted/20"
                   >
-                    <img
-                      src={`data:${file.type};base64,${file.base64}`}
-                      alt={file.name}
-                      className={`w-full object-cover h-full`}
-                    />
+                    {file.type.startsWith("image/") ? (
+                      <img
+                        src={`data:${file.type};base64,${file.base64}`}
+                        alt={file.name}
+                        className={`w-full object-cover h-full`}
+                      />
+                    ) : (
+                      <div className="w-full h-40 flex items-center justify-center bg-muted/40">
+                        <FileTextIcon className="h-12 w-12 opacity-70" />
+                      </div>
+                    )}
 
                     {/* File info overlay */}
                     <div className="absolute bottom-0 left-0 right-0 bg-black/70 text-white p-2 text-xs">
@@ -118,7 +130,7 @@ export const Files = ({
                       variant="default"
                       className="absolute top-2 right-2 h-6 w-6 cursor-pointer"
                       onClick={() => removeFile(file.id)}
-                      title="Remove image"
+                      title="Remove file"
                     >
                       <XIcon className="h-3 w-3" />
                     </Button>
@@ -136,7 +148,7 @@ export const Files = ({
                 variant="outline"
               >
                 <PlusIcon className="h-4 w-4 mr-2" />
-                Add More Images {!canAddMore && `(${MAX_FILES} max)`}
+                Add More {!canAddMore && `(${MAX_FILES} max)`}
               </Button>
               <Button
                 className="w-2/4"
@@ -144,7 +156,7 @@ export const Files = ({
                 onClick={onRemoveAllFiles}
               >
                 <TrashIcon className="h-4 w-4 mr-2" />
-                Remove All Images
+                Remove All
               </Button>
             </div>
           </PopoverContent>
@@ -155,7 +167,7 @@ export const Files = ({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*"
+        accept="image/*,application/pdf"
         onChange={handleFileSelect}
         className="hidden"
       />

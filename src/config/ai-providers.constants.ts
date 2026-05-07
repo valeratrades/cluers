@@ -21,7 +21,7 @@ export const AI_PROVIDERS = [
   -d '{
     "model": "{{MODEL}}",
     "system": "{{SYSTEM_PROMPT}}",
-    "messages": [{"role": "user", "content": [{"type": "text", "text": "{{TEXT}}"}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "{{IMAGE}}"}}]}],
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "{{TEXT}}"}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "{{IMAGE}}"}}, {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "{{DOCUMENT}}"}}]}],
     "max_tokens": 1024
   }'`,
     responseContentPath: "content[0].text",
