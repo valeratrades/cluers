@@ -74,8 +74,6 @@ export interface UseCompletionReturn {
   currentConversationId: string | null;
   /** Array of messages in the current conversation */
   conversationHistory: any[];
-  /** Function to load an existing conversation */
-  loadConversation: (conversation: any) => void;
   /** Function to start a new conversation (clears current state) */
   startNewConversation: () => void;
 

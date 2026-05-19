@@ -3,12 +3,8 @@ import { useApp } from "@/contexts";
 import { MAX_FILES } from "@/config";
 import {
   fetchAIResponse,
-  saveConversation,
-  getConversationById,
-  generateConversationTitle,
+  appendMessage,
   shouldUsePluelyAPI,
-  MESSAGE_ID_OFFSET,
-  generateMessageId,
   generateRequestId,
   getResponseSettings,
 } from "@/lib";
@@ -200,13 +196,19 @@ export const useChatCompletion = (
           return;
         }
 
-        // Add user message to UI immediately
-        const timestamp = Date.now();
-        const userMsg: ChatMessage = {
-          id: generateMessageId("user", timestamp),
+        // Persist user message; server assigns id+timestamp.
+        const turnAttachedFiles = state.attachedFiles;
+        const userAppended = await appendMessage(conversationId, {
           role: "user",
           content: input,
-          timestamp,
+          attachedFiles:
+            turnAttachedFiles.length > 0 ? turnAttachedFiles : undefined,
+        });
+        const userMsg: ChatMessage = {
+          id: userAppended.id,
+          role: "user",
+          content: input,
+          timestamp: userAppended.timestamp,
         };
 
         const updatedMessages = {
@@ -228,6 +230,9 @@ export const useChatCompletion = (
         setTimeout(scrollToBottom, 100);
 
         let fullResponse = "";
+        // Transient assistant entry id used only while streaming; replaced
+        // once `appendMessage` returns the persisted id.
+        const streamingAssistantId = `streaming_${userAppended.id}`;
 
         try {
           // Use the fetchAIResponse function with signal
@@ -254,32 +259,28 @@ export const useChatCompletion = (
 
             fullResponse += chunk;
 
-            // Update the last message (assistant's response) in real-time
-            const assistantMsg: ChatMessage = {
-              id: generateMessageId("assistant", timestamp + MESSAGE_ID_OFFSET),
+            const streamingAssistant: ChatMessage = {
+              id: streamingAssistantId,
               role: "assistant",
               content: fullResponse,
-              timestamp: timestamp + MESSAGE_ID_OFFSET,
+              timestamp: userAppended.timestamp + 1,
             };
 
             const updatedWithResponse = {
               ...updatedMessages,
-              messages: [...updatedMessages.messages, assistantMsg],
+              messages: [...updatedMessages.messages, streamingAssistant],
             };
 
-            // Check if assistant message already exists
             const lastMessage =
               updatedWithResponse.messages[
                 updatedWithResponse.messages.length - 1
               ];
             if (lastMessage.role === "assistant") {
-              // Update existing assistant message
               updatedWithResponse.messages[
                 updatedWithResponse.messages.length - 1
-              ] = assistantMsg;
+              ] = streamingAssistant;
             } else {
-              // Add new assistant message
-              updatedWithResponse.messages.push(assistantMsg);
+              updatedWithResponse.messages.push(streamingAssistant);
             }
 
             setMessages(updatedWithResponse);
@@ -311,57 +312,26 @@ export const useChatCompletion = (
           inputRef.current?.focus();
         }, 100);
 
-        // Save the conversation after successful completion
+        // Persist the assistant's final response and swap the streaming
+        // placeholder for the server-assigned id+timestamp.
         if (fullResponse) {
-          const assistantMsg: ChatMessage = {
-            id: generateMessageId("assistant", timestamp + MESSAGE_ID_OFFSET),
-            role: "assistant",
-            content: fullResponse,
-            timestamp: timestamp + MESSAGE_ID_OFFSET,
-          };
-
-          const newMessages = [
-            ...(messages?.messages || []),
-            userMsg,
-            assistantMsg,
-          ];
-
-          // Get existing conversation if updating
-          let existingConversation = null;
-          if (conversationId) {
-            try {
-              existingConversation = await getConversationById(conversationId);
-            } catch (error) {
-              console.error("Failed to get existing conversation:", error);
-            }
-          }
-
-          const title =
-            existingConversation?.title ||
-            messages?.title ||
-            generateConversationTitle(input);
-
-          const conversation: ChatConversation = {
-            id: conversationId,
-            title,
-            messages: newMessages,
-            createdAt:
-              existingConversation?.createdAt ||
-              messages?.createdAt ||
-              timestamp,
-            updatedAt: timestamp,
-          };
-
           try {
-            await saveConversation(conversation);
+            const assistantAppended = await appendMessage(conversationId, {
+              role: "assistant",
+              content: fullResponse,
+            });
+            const assistantMsg: ChatMessage = {
+              id: assistantAppended.id,
+              role: "assistant",
+              content: fullResponse,
+              timestamp: assistantAppended.timestamp,
+            };
 
-            // Reload conversation from database to ensure consistency
-            const updatedConversation = await getConversationById(
-              conversationId
-            );
-            if (updatedConversation) {
-              setMessages(updatedConversation);
-            }
+            setMessages({
+              ...updatedMessages,
+              updatedAt: assistantAppended.timestamp,
+              messages: [...updatedMessages.messages, assistantMsg],
+            });
           } catch (error) {
             console.error("Failed to save conversation:", error);
             setState((prev) => ({

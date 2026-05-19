@@ -13,10 +13,9 @@ import {
   safeLocalStorage,
   shouldUsePluelyAPI,
   generateConversationTitle,
-  saveConversation,
+  startConversation,
+  appendMessage,
   CONVERSATION_SAVE_DEBOUNCE_MS,
-  generateConversationId,
-  generateMessageId,
 } from "@/lib";
 import { Message } from "@/types/completion";
 
@@ -136,6 +135,9 @@ export function useSystemAudio() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isSavingRef = useRef<boolean>(false);
+  // IDs of messages already written to the DB. Diffed against
+  // conversation.messages on each debounced sync to append only the new ones.
+  const persistedIdsRef = useRef<Set<string>>(new Set());
   const scrollAreaRef = useRef<HTMLDivElement>(null);
 
   // Load context settings and VAD config from localStorage on mount
@@ -453,7 +455,7 @@ export function useSystemAudio() {
       if (!lastMessage || lastMessage.content !== lastTranscription) {
         const timestamp = Date.now();
         const userMessage = {
-          id: generateMessageId("user", timestamp),
+          id: `local_${timestamp}_user`,
           role: "user" as const,
           content: lastTranscription,
           timestamp,
@@ -591,13 +593,13 @@ export function useSystemAudio() {
             ...prev,
             messages: [
               {
-                id: generateMessageId("user", timestamp),
+                id: `local_${timestamp}_user`,
                 role: "user" as const,
                 content: transcription,
                 timestamp,
               },
               {
-                id: generateMessageId("assistant", timestamp + 1),
+                id: `local_${timestamp + 1}_assistant`,
                 role: "assistant" as const,
                 content: fullResponse,
                 timestamp: timestamp + 1,
@@ -631,10 +633,10 @@ export function useSystemAudio() {
 
       const isContinuous = !vadConfig.enabled;
 
-      // Set up conversation
-      const conversationId = generateConversationId("sysaudio");
+      // Set up conversation (id assigned by the server on first append).
+      persistedIdsRef.current = new Set();
       setConversation({
-        id: conversationId,
+        id: "",
         title: "",
         messages: [],
         createdAt: 0,
@@ -789,32 +791,73 @@ export function useSystemAudio() {
     };
   }, []);
 
-  // Debounced save to prevent race conditions and improve performance
+  // Debounced sync: diff against persisted IDs and append new messages.
+  // The first append in a fresh session also starts the conversation on the
+  // server (which assigns the conversation id).
   useEffect(() => {
-    // Clear any pending save
     if (saveTimeoutRef.current) {
       clearTimeout(saveTimeoutRef.current);
     }
 
-    // Only debounce if there are messages to save
-    if (
-      !conversation.id ||
-      conversation.updatedAt === 0 ||
-      conversation.messages.length === 0
-    ) {
+    if (conversation.updatedAt === 0 || conversation.messages.length === 0) {
       return;
     }
 
-    // Debounce saves (only save 500ms after last change)
     saveTimeoutRef.current = setTimeout(async () => {
-      // Don't save if already saving (prevent concurrent saves)
-      if (isSavingRef.current) {
-        return;
-      }
+      if (isSavingRef.current) return;
 
       try {
         isSavingRef.current = true;
-        await saveConversation(conversation);
+
+        // Append in chronological order so message timestamps remain monotonic.
+        const sortedMessages = [...conversation.messages].sort(
+          (a, b) => a.timestamp - b.timestamp
+        );
+        const unpersisted = sortedMessages.filter(
+          (m) => !persistedIdsRef.current.has(m.id)
+        );
+        if (unpersisted.length === 0) return;
+
+        let convId = conversation.id;
+        if (!convId) {
+          const seedTitle =
+            conversation.title ||
+            generateConversationTitle(unpersisted[0].content);
+          const started = await startConversation(seedTitle);
+          convId = started.id;
+          setConversation((prev) => ({
+            ...prev,
+            id: started.id,
+            title: prev.title || seedTitle,
+            createdAt: started.createdAt,
+          }));
+        }
+
+        const remapping = new Map<
+          string,
+          { newId: string; newTimestamp: number }
+        >();
+        for (const msg of unpersisted) {
+          const appended = await appendMessage(convId, {
+            role: msg.role,
+            content: msg.content,
+          });
+          remapping.set(msg.id, {
+            newId: appended.id,
+            newTimestamp: appended.timestamp,
+          });
+          persistedIdsRef.current.add(appended.id);
+        }
+
+        // Replace the optimistic local IDs with the server-assigned ones.
+        setConversation((prev) => ({
+          ...prev,
+          messages: prev.messages.map((m) => {
+            const r = remapping.get(m.id);
+            if (!r) return m;
+            return { ...m, id: r.newId, timestamp: r.newTimestamp };
+          }),
+        }));
       } catch (error) {
         console.error("Failed to save system audio conversation:", error);
       } finally {
@@ -822,22 +865,22 @@ export function useSystemAudio() {
       }
     }, CONVERSATION_SAVE_DEBOUNCE_MS);
 
-    // Cleanup on unmount or dependency change
     return () => {
       if (saveTimeoutRef.current) {
         clearTimeout(saveTimeoutRef.current);
       }
     };
   }, [
-    conversation.messages.length,
+    conversation.messages,
     conversation.title,
     conversation.id,
     conversation.updatedAt,
   ]);
 
   const startNewConversation = useCallback(() => {
+    persistedIdsRef.current = new Set();
     setConversation({
-      id: generateConversationId("sysaudio"),
+      id: "",
       title: "",
       messages: [],
       createdAt: 0,

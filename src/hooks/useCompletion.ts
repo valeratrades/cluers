@@ -5,13 +5,11 @@ import { MAX_FILES } from "@/config";
 import { useApp } from "@/contexts";
 import {
   fetchAIResponse,
-  saveConversation,
-  getConversationById,
+  startConversation,
+  appendMessage,
+  loadConversation as loadConversationFromDb,
   generateConversationTitle,
   shouldUsePluelyAPI,
-  MESSAGE_ID_OFFSET,
-  generateConversationId,
-  generateMessageId,
   generateRequestId,
   getResponseSettings,
 } from "@/lib";
@@ -237,7 +235,7 @@ export const useCompletion = () => {
 
         // Save the conversation after successful completion
         if (fullResponse) {
-          await saveCurrentConversation(input, fullResponse, attachedFiles);
+          await persistTurn(input, fullResponse, attachedFiles);
           // Clear input and attached files after saving
           setState((prev) => ({
             ...prev,
@@ -291,10 +289,7 @@ export const useCompletion = () => {
     clearAttachedFiles();
   }, [cancel, keepEngaged, clearAttachedFiles]);
 
-  // Note: saveConversation, getConversationById, and generateConversationTitle
-  // are now imported from lib/database/chat-history.action.ts
-
-  const loadConversation = useCallback((conversation: ChatConversation) => {
+  const applyConversation = useCallback((conversation: ChatConversation) => {
     setState((prev) => ({
       ...prev,
       currentConversationId: conversation.id,
@@ -319,82 +314,68 @@ export const useCompletion = () => {
     clearAttachedFiles();
   }, [clearAttachedFiles]);
 
-  const saveCurrentConversation = useCallback(
+  const persistTurn = useCallback(
     async (
       userMessage: string,
       assistantResponse: string,
-      _attachedFiles: AttachedFile[]
+      turnAttachedFiles: AttachedFile[]
     ) => {
-      // Validate inputs
       if (!userMessage || !assistantResponse) {
         console.error("Cannot save conversation: missing message content");
         return;
       }
 
-      const conversationId =
-        state.currentConversationId || generateConversationId("chat");
-      const timestamp = Date.now();
-
-      const userMsg: ChatMessage = {
-        id: generateMessageId("user", timestamp),
-        role: "user",
-        content: userMessage,
-        timestamp,
-      };
-
-      const assistantMsg: ChatMessage = {
-        id: generateMessageId("assistant", timestamp + MESSAGE_ID_OFFSET),
-        role: "assistant",
-        content: assistantResponse,
-        timestamp: timestamp + MESSAGE_ID_OFFSET,
-      };
-
-      const newMessages = [...state.conversationHistory, userMsg, assistantMsg];
-
-      // Get existing conversation if updating
-      let existingConversation = null;
-      if (state.currentConversationId) {
-        try {
-          existingConversation = await getConversationById(
-            state.currentConversationId
-          );
-        } catch (error) {
-          console.error("Failed to get existing conversation:", error);
-        }
-      }
-
-      const title =
-        state.conversationHistory.length === 0
-          ? generateConversationTitle(userMessage)
-          : existingConversation?.title ||
-            generateConversationTitle(userMessage);
-
-      const conversation: ChatConversation = {
-        id: conversationId,
-        title,
-        messages: newMessages,
-        createdAt: existingConversation?.createdAt || timestamp,
-        updatedAt: timestamp,
-      };
-
       try {
-        await saveConversation(conversation);
+        let conversationId = state.currentConversationId;
+        if (!conversationId) {
+          const started = await startConversation(
+            generateConversationTitle(userMessage)
+          );
+          conversationId = started.id;
+        }
+
+        const userAppended = await appendMessage(conversationId, {
+          role: "user",
+          content: userMessage,
+          attachedFiles:
+            turnAttachedFiles.length > 0 ? turnAttachedFiles : undefined,
+        });
+        const assistantAppended = await appendMessage(conversationId, {
+          role: "assistant",
+          content: assistantResponse,
+        });
+
+        const userMsg: ChatMessage = {
+          id: userAppended.id,
+          role: "user",
+          content: userMessage,
+          timestamp: userAppended.timestamp,
+        };
+        const assistantMsg: ChatMessage = {
+          id: assistantAppended.id,
+          role: "assistant",
+          content: assistantResponse,
+          timestamp: assistantAppended.timestamp,
+        };
 
         setState((prev) => ({
           ...prev,
           currentConversationId: conversationId,
-          conversationHistory: newMessages,
+          conversationHistory: [
+            ...prev.conversationHistory,
+            userMsg,
+            assistantMsg,
+          ],
         }));
       } catch (error) {
         console.error("Failed to save conversation:", error);
-        // Show error to user
         setState((prev) => ({
           ...prev,
           error: "Failed to save conversation. Please try again.",
         }));
       }
     },
-    [state.currentConversationId, state.conversationHistory]
+    [state.currentConversationId]
   );
 
   // Listen for conversation events from the main ChatHistory component
@@ -414,18 +395,8 @@ export const useCompletion = () => {
       }
       console.log(id, "id");
       try {
-        // Fetch the full conversation from SQLite
-        const conversation = await getConversationById(id);
-
-        if (conversation) {
-          loadConversation(conversation);
-        } else {
-          console.error(`Conversation ${id} not found in database`);
-          setState((prev) => ({
-            ...prev,
-            error: "Conversation not found. It may have been deleted.",
-          }));
-        }
+        const conversation = await loadConversationFromDb(id);
+        applyConversation(conversation);
       } catch (error) {
         console.error("Failed to load conversation:", error);
         setState((prev) => ({
@@ -453,10 +424,8 @@ export const useCompletion = () => {
           const data = JSON.parse(e.newValue);
           const { id } = data;
           if (id && typeof id === "string") {
-            const conversation = await getConversationById(id);
-            if (conversation) {
-              loadConversation(conversation);
-            }
+            const conversation = await loadConversationFromDb(id);
+            applyConversation(conversation);
           }
         } catch (error) {
           console.error("Failed to parse conversation selection:", error);
@@ -481,7 +450,7 @@ export const useCompletion = () => {
       );
       window.removeEventListener("storage", handleStorageChange);
     };
-  }, [loadConversation, startNewConversation, state.currentConversationId]);
+  }, [applyConversation, startNewConversation, state.currentConversationId]);
 
   const handleScreenshotSubmit = useCallback(
     async (base64: string, prompt?: string) => {
@@ -592,9 +561,7 @@ export const useCompletion = () => {
 
             // Save the conversation after successful completion
             if (fullResponse) {
-              await saveCurrentConversation(prompt, fullResponse, [
-                attachedFile,
-              ]);
+              await persistTurn(prompt, fullResponse, [attachedFile]);
               // Clear input after saving
               setState((prev) => ({
                 ...prev,
@@ -637,7 +604,7 @@ export const useCompletion = () => {
       selectedAIProvider,
       allAiProviders,
       systemPrompt,
-      saveCurrentConversation,
+      persistTurn,
       inputRef,
       addAttachedScreenshot,
     ]
@@ -924,7 +891,6 @@ export const useCompletion = () => {
     setMicOpen,
     currentConversationId: state.currentConversationId,
     conversationHistory: state.conversationHistory,
-    loadConversation,
     startNewConversation,
     messageHistoryOpen,
     setMessageHistoryOpen,

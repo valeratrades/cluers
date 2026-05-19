@@ -7,7 +7,7 @@ import {
   Textarea,
   GetLicense,
 } from "@/components";
-import { getConversationById } from "@/lib";
+import { loadConversation } from "@/lib";
 import { ChatConversation } from "@/types";
 import {
   Download,
@@ -59,11 +59,16 @@ const View = () => {
 
   useEffect(() => {
     const getMessages = async () => {
-      const conversation = await getConversationById(conversationId as string);
-      setMessages(conversation || null);
+      try {
+        const conversation = await loadConversation(conversationId as string);
+        setMessages(conversation);
+      } catch (error) {
+        console.error("Failed to load conversation:", error);
+        navigate(-1);
+      }
     };
     getMessages();
-  }, [conversationId]);
+  }, [conversationId, navigate]);
 
   useEffect(() => {
     // Scroll to bottom when messages load
