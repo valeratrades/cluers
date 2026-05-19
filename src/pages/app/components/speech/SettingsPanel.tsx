@@ -19,8 +19,12 @@ import {
   WandIcon,
   RotateCcwIcon,
   ChevronUpIcon,
+  ActivityIcon,
+  LoaderIcon,
+  AlertTriangleIcon,
+  CheckCircle2Icon,
 } from "lucide-react";
-import { VadConfig } from "@/hooks/useSystemAudio";
+import { VadConfig, VadCalibration } from "@/hooks/useSystemAudio";
 import {
   PROMPT_TEMPLATES,
   getPromptTemplateById,
@@ -55,6 +59,12 @@ interface SettingsPanelProps {
   // VAD Config
   vadConfig: VadConfig;
   onUpdateVadConfig: (config: VadConfig) => void;
+  // Calibration
+  onCalibrate: (durationSecs?: number) => Promise<void> | void;
+  isCalibrating: boolean;
+  calibrationError: string;
+  lastCalibration: VadCalibration | null;
+  isCapturing: boolean;
   // Context settings
   useSystemPrompt: boolean;
   setUseSystemPrompt: (value: boolean) => void;
@@ -65,6 +75,11 @@ interface SettingsPanelProps {
 export const SettingsPanel = ({
   vadConfig,
   onUpdateVadConfig,
+  onCalibrate,
+  isCalibrating,
+  calibrationError,
+  lastCalibration,
+  isCapturing,
   useSystemPrompt,
   setUseSystemPrompt,
   contextContent,
@@ -150,6 +165,77 @@ export const SettingsPanel = ({
             <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
               Recording
             </h4>
+
+            {/* Noise-floor calibration - VAD mode only */}
+            {vadConfig.enabled && (
+              <div className="space-y-2 rounded-md border border-border/50 bg-background/40 p-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex-1">
+                    <Label className="text-xs font-medium">
+                      Calibrate noise floor
+                    </Label>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">
+                      Stay quiet for ~3s. Result is saved as your sensitivity
+                      and noise-gate thresholds.
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => onCalibrate(3)}
+                    disabled={isCalibrating || isCapturing}
+                    className="h-7 text-[10px] gap-1.5"
+                    title={
+                      isCapturing
+                        ? "Stop the current capture session to calibrate"
+                        : "Sample 3s of ambient audio and set thresholds"
+                    }
+                  >
+                    {isCalibrating ? (
+                      <>
+                        <LoaderIcon className="w-3 h-3 animate-spin" />
+                        Listening…
+                      </>
+                    ) : (
+                      <>
+                        <ActivityIcon className="w-3 h-3" />
+                        Calibrate
+                      </>
+                    )}
+                  </Button>
+                </div>
+
+                {calibrationError && (
+                  <div className="flex items-start gap-1.5 text-[10px] text-amber-700">
+                    <AlertTriangleIcon className="w-3 h-3 mt-0.5 flex-shrink-0" />
+                    <span>{calibrationError}</span>
+                  </div>
+                )}
+
+                {!calibrationError && lastCalibration && (
+                  <div className="flex items-start gap-1.5 text-[10px] text-muted-foreground">
+                    <CheckCircle2Icon className="w-3 h-3 mt-0.5 flex-shrink-0 text-green-600" />
+                    <span>
+                      Calibrated. Noise floor{" "}
+                      <span className="font-mono">
+                        {(lastCalibration.noise_floor_rms * 1000).toFixed(2)}
+                      </span>{" "}
+                      → sensitivity{" "}
+                      <span className="font-mono">
+                        {(lastCalibration.sensitivity_rms * 1000).toFixed(1)}
+                      </span>
+                      , gate{" "}
+                      <span className="font-mono">
+                        {(lastCalibration.noise_gate_threshold * 1000).toFixed(
+                          2
+                        )}
+                      </span>
+                      .
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Sensitivity Presets - Only for VAD mode */}
             {vadConfig.enabled && (

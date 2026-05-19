@@ -21,6 +21,7 @@ import { ResultsSection } from "./ResultsSection";
 import { SettingsPanel } from "./SettingsPanel";
 import { PermissionFlow } from "./PermissionFlow";
 import { QuickActions } from "./QuickActions";
+import { VadMonitor } from "./VadMonitor";
 import { Warning } from "./Warning";
 import { useSystemAudioType } from "@/hooks";
 import { useApp } from "@/contexts";
@@ -61,6 +62,12 @@ export const SystemAudio = (props: useSystemAudioType) => {
     manualStopAndSend,
     startContinuousRecording,
     ignoreContinuousRecording,
+    vadMetrics,
+    discardedNotice,
+    calibrateVad,
+    isCalibrating,
+    calibrationError,
+    lastCalibration,
     scrollAreaRef,
   } = props;
 
@@ -258,6 +265,14 @@ export const SystemAudio = (props: useSystemAudioType) => {
                       onIgnore={ignoreContinuousRecording}
                     />
 
+                    {/* Live VAD telemetry (auto-detect mode only) */}
+                    {isVadMode && capturing && (
+                      <VadMonitor
+                        metrics={vadMetrics}
+                        discardedNotice={discardedNotice}
+                      />
+                    )}
+
                     {/* AI Response */}
                     <ResultsSection
                       lastTranscription={lastTranscription}
@@ -272,6 +287,11 @@ export const SystemAudio = (props: useSystemAudioType) => {
                     <SettingsPanel
                       vadConfig={vadConfig}
                       onUpdateVadConfig={updateVadConfiguration}
+                      onCalibrate={calibrateVad}
+                      isCalibrating={isCalibrating}
+                      calibrationError={calibrationError}
+                      lastCalibration={lastCalibration}
+                      isCapturing={capturing}
                       useSystemPrompt={useSystemPrompt}
                       setUseSystemPrompt={setUseSystemPrompt}
                       contextContent={contextContent}

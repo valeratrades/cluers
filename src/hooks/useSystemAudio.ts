@@ -33,6 +33,24 @@ export interface VadConfig {
   max_recording_duration_secs: number;
 }
 
+// Live per-chunk metrics emitted from the Rust VAD loop (~10 Hz).
+export interface VadMetrics {
+  rms: number;
+  peak: number;
+  sensitivity_rms: number;
+  peak_threshold: number;
+  noise_gate_threshold: number;
+  in_speech: boolean;
+}
+
+// Returned from the calibrate_vad_thresholds command.
+export interface VadCalibration {
+  noise_floor_rms: number;
+  sensitivity_rms: number;
+  peak_threshold: number;
+  noise_gate_threshold: number;
+}
+
 // OPTIMIZED VAD defaults - matches backend exactly for perfect performance
 const DEFAULT_VAD_CONFIG: VadConfig = {
   enabled: true,
@@ -81,6 +99,14 @@ export function useSystemAudio() {
     useState<boolean>(false);
   const [showQuickActions, setShowQuickActions] = useState<boolean>(true);
   const [vadConfig, setVadConfig] = useState<VadConfig>(DEFAULT_VAD_CONFIG);
+  const [vadMetrics, setVadMetrics] = useState<VadMetrics | null>(null);
+  const [lastCalibration, setLastCalibration] = useState<VadCalibration | null>(
+    null
+  );
+  const [isCalibrating, setIsCalibrating] = useState<boolean>(false);
+  const [calibrationError, setCalibrationError] = useState<string>("");
+  const [discardedNotice, setDiscardedNotice] = useState<string>("");
+  const discardedTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [recordingProgress, setRecordingProgress] = useState<number>(0); // For continuous mode
   const [isContinuousMode, setIsContinuousMode] = useState<boolean>(false);
   const [isRecordingInContinuousMode, setIsRecordingInContinuousMode] =
@@ -164,6 +190,7 @@ export function useSystemAudio() {
     let stopUnlisten: (() => void) | undefined;
     let errorUnlisten: (() => void) | undefined;
     let discardedUnlisten: (() => void) | undefined;
+    let metricsUnlisten: (() => void) | undefined;
 
     const setupContinuousListeners = async () => {
       try {
@@ -195,11 +222,21 @@ export function useSystemAudio() {
           setIsRecordingInContinuousMode(false);
         });
 
-        // Speech discarded (too short)
+        // Speech discarded (too short) - surface so the user can see "almost worked"
         discardedUnlisten = await listen("speech-discarded", (event) => {
           const reason = event.payload as string;
-          console.log("Speech discarded:", reason);
-          // Don't show error - this is expected behavior
+          setDiscardedNotice(reason);
+          if (discardedTimeoutRef.current) {
+            clearTimeout(discardedTimeoutRef.current);
+          }
+          discardedTimeoutRef.current = setTimeout(() => {
+            setDiscardedNotice("");
+          }, 3500);
+        });
+
+        // Live VAD metrics (~10 Hz)
+        metricsUnlisten = await listen("vad-metrics", (event) => {
+          setVadMetrics(event.payload as VadMetrics);
         });
       } catch (err) {
         console.error("Failed to setup continuous recording listeners:", err);
@@ -214,6 +251,10 @@ export function useSystemAudio() {
       if (stopUnlisten) stopUnlisten();
       if (errorUnlisten) errorUnlisten();
       if (discardedUnlisten) discardedUnlisten();
+      if (metricsUnlisten) metricsUnlisten();
+      if (discardedTimeoutRef.current) {
+        clearTimeout(discardedTimeoutRef.current);
+      }
     };
   }, []);
 
@@ -596,6 +637,8 @@ export function useSystemAudio() {
       setIsPopoverOpen(true);
       setIsContinuousMode(isContinuous);
       setRecordingProgress(0);
+      setVadMetrics(null);
+      setDiscardedNotice("");
 
       // If continuous mode
       if (isContinuous) {
@@ -646,6 +689,8 @@ export function useSystemAudio() {
       setLastAIResponse("");
       setError("");
       setIsPopoverOpen(false);
+      setVadMetrics(null);
+      setDiscardedNotice("");
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       setError(`Failed to stop capture: ${errorMessage}`);
@@ -811,6 +856,42 @@ export function useSystemAudio() {
     }
   }, []);
 
+  // Explicit calibration: stop capturing if needed, sample ambient audio,
+  // bake the resulting thresholds into vadConfig (which persists via the
+  // existing localStorage save in updateVadConfiguration).
+  const calibrateVad = useCallback(
+    async (durationSecs: number = 3) => {
+      if (isCalibrating) return;
+      setCalibrationError("");
+      setIsCalibrating(true);
+      try {
+        const deviceId =
+          selectedAudioDevices.output.id !== "default"
+            ? selectedAudioDevices.output.id
+            : null;
+
+        const result = await invoke<VadCalibration>(
+          "calibrate_vad_thresholds",
+          { durationSecs, deviceId }
+        );
+
+        setLastCalibration(result);
+        await updateVadConfiguration({
+          ...vadConfig,
+          sensitivity_rms: result.sensitivity_rms,
+          peak_threshold: result.peak_threshold,
+          noise_gate_threshold: result.noise_gate_threshold,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setCalibrationError(msg);
+      } finally {
+        setIsCalibrating(false);
+      }
+    },
+    [isCalibrating, selectedAudioDevices.output.id, updateVadConfiguration, vadConfig]
+  );
+
   useEffect(() => {
     if (capturing) {
       setIsContinuousMode(!vadConfig.enabled);
@@ -934,6 +1015,14 @@ export function useSystemAudio() {
     // VAD configuration
     vadConfig,
     updateVadConfiguration,
+    // Live VAD telemetry
+    vadMetrics,
+    discardedNotice,
+    // Calibration
+    calibrateVad,
+    isCalibrating,
+    calibrationError,
+    lastCalibration,
     // Continuous recording
     isContinuousMode,
     isRecordingInContinuousMode,

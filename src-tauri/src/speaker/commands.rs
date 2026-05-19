@@ -49,6 +49,28 @@ impl Default for VadConfig {
     }
 }
 
+/// Live per-chunk metrics emitted to the UI so users can see why VAD does or
+/// does not trigger on their setup.
+#[derive(Debug, Clone, Serialize)]
+struct VadMetrics {
+    rms: f32,
+    peak: f32,
+    sensitivity_rms: f32,
+    peak_threshold: f32,
+    noise_gate_threshold: f32,
+    in_speech: bool,
+}
+
+/// Result of an explicit calibration run. Returned to the caller, who is
+/// responsible for writing these into `VadConfig` if they want them persisted.
+#[derive(Debug, Clone, Serialize)]
+pub struct VadCalibration {
+    pub noise_floor_rms: f32,
+    pub sensitivity_rms: f32,
+    pub peak_threshold: f32,
+    pub noise_gate_threshold: f32,
+}
+
 #[tauri::command]
 pub async fn start_system_audio_capture(
     app: AppHandle,
@@ -166,6 +188,12 @@ async fn run_vad_capture(
     let mut speech_chunks = 0;
     let max_samples = sr as usize * 30; // 30s safety cap per utterance
 
+    // Throttle metrics emission to ~10 Hz regardless of sample rate / hop size.
+    let metrics_interval = Duration::from_millis(100);
+    let mut last_metrics_emit = Instant::now()
+        .checked_sub(metrics_interval)
+        .unwrap_or_else(Instant::now);
+
     while let Some(sample) = stream.next().await {
         buffer.push_back(sample);
 
@@ -182,7 +210,26 @@ async fn run_vad_capture(
             let mono = apply_noise_gate(&mono, config.noise_gate_threshold);
 
             let (rms, peak) = calculate_audio_metrics(&mono);
-            let is_speech = rms > config.sensitivity_rms || peak > config.peak_threshold;
+            let is_speech =
+                rms > config.sensitivity_rms || peak > config.peak_threshold;
+
+            // Throttled metrics emission so the UI can render a live meter.
+            if last_metrics_emit.elapsed() >= metrics_interval {
+                last_metrics_emit = Instant::now();
+                if let Err(e) = app.emit(
+                    "vad-metrics",
+                    VadMetrics {
+                        rms,
+                        peak,
+                        sensitivity_rms: config.sensitivity_rms,
+                        peak_threshold: config.peak_threshold,
+                        noise_gate_threshold: config.noise_gate_threshold,
+                        in_speech,
+                    },
+                ) {
+                    error!("Failed to emit vad-metrics: {}", e);
+                }
+            }
 
             if is_speech {
                 if !in_speech {
@@ -613,6 +660,104 @@ pub async fn get_vad_config(app: AppHandle) -> Result<VadConfig, String> {
         .map_err(|e| format!("Failed to get VAD config: {}", e))?
         .clone();
     Ok(config)
+}
+
+/// Sample ambient audio for `duration_secs` and derive proposed VAD thresholds
+/// from the measured noise floor. The caller is responsible for persisting the
+/// result into VadConfig if they want it kept.
+///
+/// Refuses to run while a capture session is active (would fight over the
+/// audio device).
+#[tauri::command]
+pub async fn calibrate_vad_thresholds(
+    app: AppHandle,
+    duration_secs: u64,
+    device_id: Option<String>,
+) -> Result<VadCalibration, String> {
+    if !(1..=10).contains(&duration_secs) {
+        return Err("duration_secs must be between 1 and 10".to_string());
+    }
+
+    let state = app.state::<crate::AudioState>();
+    if state.is_capturing.load(Ordering::Acquire) {
+        return Err("Stop the current capture before calibrating.".to_string());
+    }
+
+    let input = SpeakerInput::new_with_device(device_id).map_err(|e| {
+        error!("Calibration: failed to open audio source: {}", e);
+        format!("Failed to access system audio: {}", e)
+    })?;
+
+    let mut stream = input.stream();
+    let sr = stream.sample_rate();
+    if !(8000..=96000).contains(&sr) {
+        return Err(format!("Invalid sample rate: {}", sr));
+    }
+
+    let hop_size: usize = 1024;
+    let target_chunks = ((sr as usize * duration_secs as usize) / hop_size).max(8);
+    let mut buffer: VecDeque<f32> = VecDeque::new();
+    let mut floor_samples: Vec<f32> = Vec::with_capacity(target_chunks);
+
+    // Hard timeout so a misbehaving source can't hang the UI.
+    let deadline = Instant::now() + Duration::from_secs(duration_secs + 2);
+
+    while floor_samples.len() < target_chunks {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match stream.next().await {
+            Some(sample) => {
+                buffer.push_back(sample);
+                while buffer.len() >= hop_size && floor_samples.len() < target_chunks {
+                    let mut mono = Vec::with_capacity(hop_size);
+                    for _ in 0..hop_size {
+                        if let Some(v) = buffer.pop_front() {
+                            mono.push(v);
+                        }
+                    }
+                    let (rms, _peak) = calculate_audio_metrics(&mono);
+                    floor_samples.push(rms);
+                }
+            }
+            None => break,
+        }
+    }
+
+    if floor_samples.is_empty() {
+        return Err(
+            "No audio captured during calibration — is the source actually producing sound?"
+                .to_string(),
+        );
+    }
+
+    // Use the 90th-percentile RMS as the noise-floor "ceiling" so a single
+    // transient (keystroke, mouse click) doesn't blow out the result.
+    floor_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((floor_samples.len() as f32) * 0.9) as usize;
+    let noise_floor = floor_samples[idx.min(floor_samples.len() - 1)];
+
+    // Refuse to calibrate if user is clearly talking — would set thresholds
+    // above their normal speech volume.
+    if noise_floor > 0.05 {
+        return Err(format!(
+            "Detected loud audio ({:.3}) during calibration. Stay quiet and try again.",
+            noise_floor
+        ));
+    }
+
+    // Clamp to sane minimums so a perfectly digital-silent source doesn't
+    // result in zero thresholds that would treat every sample as speech.
+    let noise_gate_threshold = (noise_floor * 1.5).max(0.0005);
+    let sensitivity_rms = (noise_floor * 4.0).max(0.003);
+    let peak_threshold = (noise_floor * 10.0).max(0.01);
+
+    Ok(VadCalibration {
+        noise_floor_rms: noise_floor,
+        sensitivity_rms,
+        peak_threshold,
+        noise_gate_threshold,
+    })
 }
 
 #[tauri::command]

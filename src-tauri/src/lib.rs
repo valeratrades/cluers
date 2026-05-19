@@ -111,6 +111,7 @@ pub fn run() {
             speaker::request_system_audio_access,
             speaker::get_vad_config,
             speaker::update_vad_config,
+            speaker::calibrate_vad_thresholds,
             speaker::get_capture_status,
             speaker::get_audio_sample_rate,
             speaker::get_input_devices,
