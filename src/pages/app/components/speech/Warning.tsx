@@ -5,7 +5,6 @@ import {
   KeyboardIcon,
   AudioWaveformIcon,
   MicIcon,
-  CameraIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -111,31 +110,6 @@ export const Warning = ({ isVadMode }: WarningProps) => {
             </div>
           </div>
 
-          {/* Screenshot Feature */}
-          <div className="space-y-2">
-            <div className="flex items-center gap-1.5">
-              <CameraIcon className="w-3 h-3 text-muted-foreground" />
-              <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
-                Screenshot Feature
-              </span>
-            </div>
-            <div className="p-2 rounded-md bg-primary/5 text-[10px] text-muted-foreground space-y-1">
-              <p>
-                Screenshot: Captures your current screen and attaches it to your
-                next transcription.
-              </p>
-              <p>
-                The AI will receive both the transcribed audio and the
-                screenshot image, allowing it to provide context-aware responses
-                based on what you're viewing.
-              </p>
-              <p className="text-[9px] opacity-70">
-                The screenshot is automatically cleared after each message is
-                sent.
-              </p>
-            </div>
-          </div>
-
           {/* Tips */}
           <div className="text-[10px] text-muted-foreground space-y-1 pt-2 border-t border-border/50">
             <p>
@@ -151,8 +125,8 @@ export const Warning = ({ isVadMode }: WarningProps) => {
               with one click.
             </p>
             <p>
-              <strong>Tip:</strong> Use Screenshot to share your screen context
-              with the AI for more relevant responses.
+              <strong>Tip:</strong> Files attached from the main chat composer
+              are also sent with every transcription here.
             </p>
           </div>
         </div>

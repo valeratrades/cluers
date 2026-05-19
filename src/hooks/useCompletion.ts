@@ -19,13 +19,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 // Types for completion
-interface AttachedFile {
-  id: string;
-  name: string;
-  type: string;
-  base64: string;
-  size: number;
-}
+import { AttachedFile } from "@/types";
 
 interface ChatMessage {
   id: string;
@@ -47,7 +41,6 @@ interface CompletionState {
   response: string;
   isLoading: boolean;
   error: string | null;
-  attachedFiles: AttachedFile[];
   currentConversationId: string | null;
   conversationHistory: ChatMessage[];
 }
@@ -59,6 +52,15 @@ export const useCompletion = () => {
     systemPrompt,
     screenshotConfiguration,
     setScreenshotConfiguration,
+    attachedFiles,
+    addAttachedFile,
+    addAttachedScreenshot,
+    removeAttachedFile,
+    clearAttachedFiles,
+    handleAttachedFileSelect,
+    handleAttachedPaste,
+    isFilesPopoverOpen,
+    setIsFilesPopoverOpen,
   } = useApp();
   const globalShortcuts = useGlobalShortcuts();
 
@@ -67,14 +69,12 @@ export const useCompletion = () => {
     response: "",
     isLoading: false,
     error: null,
-    attachedFiles: [],
     currentConversationId: null,
     conversationHistory: [],
   });
   const [micOpen, setMicOpen] = useState(false);
   const [enableVAD, setEnableVAD] = useState(false);
   const [messageHistoryOpen, setMessageHistoryOpen] = useState(false);
-  const [isFilesPopoverOpen, setIsFilesPopoverOpen] = useState(false);
   const [isScreenshotLoading, setIsScreenshotLoading] = useState(false);
   const [keepEngaged, setKeepEngaged] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -100,37 +100,6 @@ export const useCompletion = () => {
 
   const setResponse = useCallback((value: string) => {
     setState((prev) => ({ ...prev, response: value }));
-  }, []);
-
-  const addFile = useCallback(async (file: File) => {
-    try {
-      const base64 = await fileToBase64(file);
-      const attachedFile: AttachedFile = {
-        id: Date.now().toString(),
-        name: file.name,
-        type: file.type,
-        base64,
-        size: file.size,
-      };
-
-      setState((prev) => ({
-        ...prev,
-        attachedFiles: [...prev.attachedFiles, attachedFile],
-      }));
-    } catch (error) {
-      console.error("Failed to process file:", error);
-    }
-  }, []);
-
-  const removeFile = useCallback((fileId: string) => {
-    setState((prev) => ({
-      ...prev,
-      attachedFiles: prev.attachedFiles.filter((f) => f.id !== fileId),
-    }));
-  }, []);
-
-  const clearFiles = useCallback(() => {
-    setState((prev) => ({ ...prev, attachedFiles: [] }));
   }, []);
 
   const submit = useCallback(
@@ -171,8 +140,8 @@ export const useCompletion = () => {
         const imagesBase64: string[] = [];
         const imagesMime: string[] = [];
         const documentsBase64: string[] = [];
-        if (state.attachedFiles.length > 0) {
-          state.attachedFiles.forEach((file) => {
+        if (attachedFiles.length > 0) {
+          attachedFiles.forEach((file) => {
             if (file.type.startsWith("image/")) {
               imagesBase64.push(file.base64);
               imagesMime.push(file.type);
@@ -268,17 +237,13 @@ export const useCompletion = () => {
 
         // Save the conversation after successful completion
         if (fullResponse) {
-          await saveCurrentConversation(
-            input,
-            fullResponse,
-            state.attachedFiles
-          );
+          await saveCurrentConversation(input, fullResponse, attachedFiles);
           // Clear input and attached files after saving
           setState((prev) => ({
             ...prev,
             input: "",
-            attachedFiles: [],
           }));
+          clearAttachedFiles();
         }
       } catch (error) {
         // Only show error if not aborted
@@ -293,11 +258,12 @@ export const useCompletion = () => {
     },
     [
       state.input,
-      state.attachedFiles,
+      attachedFiles,
       selectedAIProvider,
       allAiProviders,
       systemPrompt,
       state.conversationHistory,
+      clearAttachedFiles,
     ]
   );
 
@@ -321,22 +287,9 @@ export const useCompletion = () => {
       input: "",
       response: "",
       error: null,
-      attachedFiles: [],
     }));
-  }, [cancel, keepEngaged]);
-
-  // Helper function to convert file to base64
-  const fileToBase64 = useCallback(async (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.readAsDataURL(file);
-      reader.onload = () => {
-        const base64 = (reader.result as string)?.split(",")[1] || "";
-        resolve(base64);
-      };
-      reader.onerror = reject;
-    });
-  }, []);
+    clearAttachedFiles();
+  }, [cancel, keepEngaged, clearAttachedFiles]);
 
   // Note: saveConversation, getConversationById, and generateConversationTitle
   // are now imported from lib/database/chat-history.action.ts
@@ -362,9 +315,9 @@ export const useCompletion = () => {
       response: "",
       error: null,
       isLoading: false,
-      attachedFiles: [],
     }));
-  }, []);
+    clearAttachedFiles();
+  }, [clearAttachedFiles]);
 
   const saveCurrentConversation = useCallback(
     async (
@@ -530,25 +483,9 @@ export const useCompletion = () => {
     };
   }, [loadConversation, startNewConversation, state.currentConversationId]);
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
-    const MAX_FILES = 6;
-
-    files.forEach((file) => {
-      const isAccepted =
-        file.type.startsWith("image/") || file.type === "application/pdf";
-      if (isAccepted && state.attachedFiles.length < MAX_FILES) {
-        addFile(file);
-      }
-    });
-
-    // Reset input so same file can be selected again
-    e.target.value = "";
-  };
-
   const handleScreenshotSubmit = useCallback(
     async (base64: string, prompt?: string) => {
-      if (state.attachedFiles.length >= MAX_FILES) {
+      if (attachedFiles.length >= MAX_FILES) {
         setState((prev) => ({
           ...prev,
           error: `You can only upload ${MAX_FILES} files`,
@@ -679,19 +616,8 @@ export const useCompletion = () => {
             }
           }
         } else {
-          // Manual mode: Add to attached files
-          const attachedFile: AttachedFile = {
-            id: Date.now().toString(),
-            name: `screenshot_${Date.now()}.png`,
-            type: "image/png",
-            base64: base64,
-            size: base64.length,
-          };
-
-          setState((prev) => ({
-            ...prev,
-            attachedFiles: [...prev.attachedFiles, attachedFile],
-          }));
+          // Manual mode: Add to shared attachment buffer
+          addAttachedScreenshot(base64);
         }
       } catch (error) {
         console.error("Failed to process screenshot:", error);
@@ -706,18 +632,19 @@ export const useCompletion = () => {
       }
     },
     [
-      state.attachedFiles.length,
+      attachedFiles.length,
       state.conversationHistory,
       selectedAIProvider,
       allAiProviders,
       systemPrompt,
       saveCurrentConversation,
       inputRef,
+      addAttachedScreenshot,
     ]
   );
 
   const onRemoveAllFiles = () => {
-    clearFiles();
+    clearAttachedFiles();
     setIsFilesPopoverOpen(false);
   };
 
@@ -729,41 +656,6 @@ export const useCompletion = () => {
       }
     }
   };
-
-  const handlePaste = useCallback(
-    async (e: React.ClipboardEvent) => {
-      // Check if clipboard contains images
-      const items = e.clipboardData?.items;
-      if (!items) return;
-
-      const hasImages = Array.from(items).some((item) =>
-        item.type.startsWith("image/")
-      );
-
-      // If we have images, prevent default text pasting and process images
-      if (hasImages) {
-        e.preventDefault();
-
-        const processedFiles: File[] = [];
-
-        Array.from(items).forEach((item) => {
-          if (
-            item.type.startsWith("image/") &&
-            state.attachedFiles.length + processedFiles.length < MAX_FILES
-          ) {
-            const file = item.getAsFile();
-            if (file) {
-              processedFiles.push(file);
-            }
-          }
-        });
-
-        // Process all files
-        await Promise.all(processedFiles.map((file) => addFile(file)));
-      }
-    },
-    [state.attachedFiles.length, addFile]
-  );
 
   const isPopoverOpen =
     state.isLoading ||
@@ -1018,10 +910,10 @@ export const useCompletion = () => {
     setResponse,
     isLoading: state.isLoading,
     error: state.error,
-    attachedFiles: state.attachedFiles,
-    addFile,
-    removeFile,
-    clearFiles,
+    attachedFiles,
+    addFile: addAttachedFile,
+    removeFile: removeAttachedFile,
+    clearFiles: clearAttachedFiles,
     submit,
     cancel,
     reset,
@@ -1039,9 +931,9 @@ export const useCompletion = () => {
     screenshotConfiguration,
     setScreenshotConfiguration,
     handleScreenshotSubmit,
-    handleFileSelect,
+    handleFileSelect: handleAttachedFileSelect,
     handleKeyPress,
-    handlePaste,
+    handlePaste: handleAttachedPaste,
     isPopoverOpen,
     scrollAreaRef,
     resizeWindow,

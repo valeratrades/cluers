@@ -105,6 +105,7 @@ export function useSystemAudio() {
     allAiProviders,
     systemPrompt,
     selectedAudioDevices,
+    attachedFiles,
   } = useApp();
   const abortControllerRef = useRef<AbortController | null>(null);
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -504,6 +505,19 @@ export function useSystemAudio() {
           return;
         }
 
+        // Split shared attachments into images and documents (PDFs)
+        const imagesBase64: string[] = [];
+        const imagesMime: string[] = [];
+        const documentsBase64: string[] = [];
+        attachedFiles.forEach((file) => {
+          if (file.type.startsWith("image/")) {
+            imagesBase64.push(file.base64);
+            imagesMime.push(file.type);
+          } else if (file.type === "application/pdf") {
+            documentsBase64.push(file.base64);
+          }
+        });
+
         try {
           for await (const chunk of fetchAIResponse({
             provider: usePluelyAPI ? undefined : provider,
@@ -511,7 +525,9 @@ export function useSystemAudio() {
             systemPrompt: prompt,
             history: previousMessages,
             userMessage: transcription,
-            imagesBase64: [],
+            imagesBase64,
+            imagesMime,
+            documentsBase64,
           })) {
             fullResponse += chunk;
             setLastAIResponse((prev) => prev + chunk);
@@ -550,7 +566,7 @@ export function useSystemAudio() {
         // No auto-restart - user manually controls when to start next recording
       }
     },
-    [selectedAIProvider, allAiProviders, conversation.messages]
+    [selectedAIProvider, allAiProviders, conversation.messages, attachedFiles]
   );
 
   const startCapture = useCallback(async () => {
