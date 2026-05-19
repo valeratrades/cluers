@@ -17,15 +17,24 @@ import {
   CursorType,
   updateCursorType,
 } from "@/lib/storage";
-import { IContextType, ScreenshotConfig, TYPE_PROVIDER } from "@/types";
+import {
+  AttachedFile,
+  IContextType,
+  ScreenshotConfig,
+  TYPE_PROVIDER,
+} from "@/types";
+import { MAX_FILES } from "@/config";
 import curl2Json from "@bany/curl-to-json";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { enable, disable } from "@tauri-apps/plugin-autostart";
 import {
+  ChangeEvent,
+  ClipboardEvent,
   ReactNode,
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useState,
@@ -146,6 +155,102 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   // Pluely API State
   const [pluelyApiEnabled, setPluelyApiEnabledState] = useState<boolean>(
     safeLocalStorage.getItem(STORAGE_KEYS.PLUELY_API_ENABLED) === "true"
+  );
+
+  // Shared attachment buffer (chat composer + listening mode)
+  const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
+  const [isFilesPopoverOpen, setIsFilesPopoverOpen] = useState(false);
+
+  const fileToBase64 = useCallback(async (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => {
+        const base64 = (reader.result as string)?.split(",")[1] || "";
+        resolve(base64);
+      };
+      reader.onerror = reject;
+    });
+  }, []);
+
+  const addAttachedFile = useCallback(
+    async (file: File) => {
+      try {
+        const base64 = await fileToBase64(file);
+        const attached: AttachedFile = {
+          id: Date.now().toString() + Math.random().toString(36).slice(2, 6),
+          name: file.name,
+          type: file.type,
+          base64,
+          size: file.size,
+        };
+        setAttachedFiles((prev) => [...prev, attached]);
+      } catch (error) {
+        console.error("Failed to process file:", error);
+      }
+    },
+    [fileToBase64]
+  );
+
+  const addAttachedScreenshot = useCallback((base64: string) => {
+    const attached: AttachedFile = {
+      id: Date.now().toString() + Math.random().toString(36).slice(2, 6),
+      name: `screenshot_${Date.now()}.png`,
+      type: "image/png",
+      base64,
+      size: base64.length,
+    };
+    setAttachedFiles((prev) => [...prev, attached]);
+  }, []);
+
+  const removeAttachedFile = useCallback((fileId: string) => {
+    setAttachedFiles((prev) => prev.filter((f) => f.id !== fileId));
+  }, []);
+
+  const clearAttachedFiles = useCallback(() => {
+    setAttachedFiles([]);
+  }, []);
+
+  const handleAttachedFileSelect = useCallback(
+    (e: ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(e.target.files || []);
+      files.forEach((file) => {
+        const accepted =
+          file.type.startsWith("image/") || file.type === "application/pdf";
+        if (accepted && attachedFiles.length < MAX_FILES) {
+          addAttachedFile(file);
+        }
+      });
+      e.target.value = "";
+    },
+    [attachedFiles.length, addAttachedFile]
+  );
+
+  const handleAttachedPaste = useCallback(
+    async (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      const hasImages = Array.from(items).some((item) =>
+        item.type.startsWith("image/")
+      );
+
+      if (hasImages) {
+        e.preventDefault();
+        const processed: File[] = [];
+        Array.from(items).forEach((item) => {
+          if (
+            item.type.startsWith("image/") &&
+            attachedFiles.length + processed.length < MAX_FILES
+          ) {
+            const file = item.getAsFile();
+            if (file) processed.push(file);
+          }
+        });
+        await Promise.all(processed.map((f) => addAttachedFile(f)));
+      }
+    },
+    [attachedFiles.length, addAttachedFile]
   );
 
   const getActiveLicenseStatus = async () => {
@@ -663,6 +768,15 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     setCursorType,
     supportsImages,
     setSupportsImages,
+    attachedFiles,
+    addAttachedFile,
+    addAttachedScreenshot,
+    removeAttachedFile,
+    clearAttachedFiles,
+    handleAttachedFileSelect,
+    handleAttachedPaste,
+    isFilesPopoverOpen,
+    setIsFilesPopoverOpen,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

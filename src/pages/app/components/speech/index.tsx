@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useEffect } from "react";
 import {
   Button,
   Popover,
@@ -11,11 +11,10 @@ import {
   AlertCircleIcon,
   LoaderIcon,
   AudioLinesIcon,
-  CameraIcon,
+  PaperclipIcon,
   PlusIcon,
   XIcon,
 } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
 import { ModeSwitcher } from "./ModeSwitcher";
 import { RecordingPanel } from "./RecordingPanel";
 import { ResultsSection } from "./ResultsSection";
@@ -65,14 +64,10 @@ export const SystemAudio = (props: useSystemAudioType) => {
     scrollAreaRef,
   } = props;
 
-  const { hasActiveLicense, supportsImages } = useApp();
+  const { attachedFiles } = useApp();
 
   // View mode toggle
   const [conversationMode, setConversationMode] = useState(false);
-
-  // Screenshot state
-  const [screenshotImage, setScreenshotImage] = useState<string | null>(null);
-  const [isCapturingScreenshot, setIsCapturingScreenshot] = useState(false);
 
   const isVadMode = vadConfig.enabled;
   const hasResponse = lastAIResponse || isAIProcessing;
@@ -93,13 +88,6 @@ export const SystemAudio = (props: useSystemAudioType) => {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isPopoverOpen]);
 
-  // Reset screenshot when processing starts (message is being sent)
-  useEffect(() => {
-    if (isProcessing && screenshotImage) {
-      setScreenshotImage(null);
-    }
-  }, [isProcessing, screenshotImage]);
-
   const handleToggleCapture = async () => {
     if (capturing) {
       await stopCapture();
@@ -114,45 +102,6 @@ export const SystemAudio = (props: useSystemAudioType) => {
       enabled: vadEnabled,
     });
   };
-
-  // Capture screenshot functionality
-  const handleCaptureScreenshot = useCallback(async () => {
-    if (isCapturingScreenshot) return;
-
-    setIsCapturingScreenshot(true);
-    try {
-      // Check screen recording permission on macOS
-      const platform = navigator.platform.toLowerCase();
-      if (platform.includes("mac")) {
-        const {
-          checkScreenRecordingPermission,
-          requestScreenRecordingPermission,
-        } = await import("tauri-plugin-macos-permissions-api");
-
-        const hasPermission = await checkScreenRecordingPermission();
-        if (!hasPermission) {
-          await requestScreenRecordingPermission();
-          setIsCapturingScreenshot(false);
-          return;
-        }
-      }
-
-      // Capture screenshot
-      const base64: string = await invoke("capture_screenshot", {
-        screenId: null, // Use default screen
-      });
-
-      setScreenshotImage(base64);
-    } catch (err) {
-      console.error("Failed to capture screenshot:", err);
-    } finally {
-      setIsCapturingScreenshot(false);
-    }
-  }, [isCapturingScreenshot]);
-
-  const handleRemoveScreenshot = useCallback(() => {
-    setScreenshotImage(null);
-  }, []);
 
   const getButtonIcon = () => {
     if (setupRequired) return <AlertCircleIcon className="text-orange-500" />;
@@ -225,26 +174,15 @@ export const SystemAudio = (props: useSystemAudioType) => {
 
                 {/* Action Buttons */}
                 <div className="flex items-center gap-1.5 flex-shrink-0">
-                  {/* Screenshot Button */}
-                  {hasActiveLicense && !setupRequired && supportsImages && (
-                    <Button
-                      size="sm"
-                      variant={screenshotImage ? "default" : "outline"}
-                      onClick={handleCaptureScreenshot}
-                      disabled={isCapturingScreenshot}
-                      className={cn(
-                        "h-6 text-[10px] gap-1 px-2",
-                        screenshotImage && "bg-primary text-primary-foreground"
-                      )}
-                      title="Capture screenshot to include with transcription"
+                  {/* Attached Files Indicator (shared with chat composer) */}
+                  {!setupRequired && attachedFiles.length > 0 && (
+                    <div
+                      className="flex items-center gap-1 h-6 px-2 rounded-md bg-primary/10 border border-primary/20 text-[10px] font-medium text-primary"
+                      title={`${attachedFiles.length} file(s) attached — will be sent with each transcription`}
                     >
-                      {isCapturingScreenshot ? (
-                        <LoaderIcon className="w-3 h-3 animate-spin" />
-                      ) : (
-                        <CameraIcon className="w-3 h-3" />
-                      )}
-                      Screenshot
-                    </Button>
+                      <PaperclipIcon className="w-3 h-3" />
+                      {attachedFiles.length}
+                    </div>
                   )}
 
                   {/* New Conversation Button */}
@@ -282,33 +220,6 @@ export const SystemAudio = (props: useSystemAudioType) => {
 
             <ScrollArea className="flex-1 min-h-0" ref={scrollAreaRef}>
               <div className="p-2 space-y-2">
-                {/* Screenshot Preview */}
-                {screenshotImage && (
-                  <div className="flex items-center gap-2 p-2 rounded-lg bg-primary/5 border border-primary/20">
-                    <img
-                      src={`data:image/png;base64,${screenshotImage}`}
-                      alt="Screenshot"
-                      className="h-12 w-20 object-cover rounded"
-                    />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-[10px] font-medium">
-                        Screenshot attached
-                      </p>
-                      <p className="text-[9px] text-muted-foreground">
-                        Will be sent with next transcription
-                      </p>
-                    </div>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="h-5 w-5"
-                      onClick={handleRemoveScreenshot}
-                    >
-                      <XIcon className="h-3 w-3" />
-                    </Button>
-                  </div>
-                )}
-
                 {/* Error Display */}
                 {error && !setupRequired && (
                   <div className="flex items-start gap-2 p-2.5 rounded-lg bg-red-50 border border-red-200">

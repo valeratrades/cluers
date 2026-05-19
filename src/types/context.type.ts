@@ -1,5 +1,5 @@
-import { Dispatch, SetStateAction } from "react";
-import { ScreenshotConfig, TYPE_PROVIDER } from "@/types";
+import { ChangeEvent, ClipboardEvent, Dispatch, SetStateAction } from "react";
+import { AttachedFile, ScreenshotConfig, TYPE_PROVIDER } from "@/types";
 import { CursorType, CustomizableState } from "@/lib/storage";
 
 export type IContextType = {
@@ -58,4 +58,15 @@ export type IContextType = {
   setCursorType: (type: CursorType) => void;
   supportsImages: boolean;
   setSupportsImages: (value: boolean) => void;
+
+  // Shared attachment buffer (used by chat composer and listening mode)
+  attachedFiles: AttachedFile[];
+  addAttachedFile: (file: File) => Promise<void>;
+  addAttachedScreenshot: (base64: string) => void;
+  removeAttachedFile: (fileId: string) => void;
+  clearAttachedFiles: () => void;
+  handleAttachedFileSelect: (e: ChangeEvent<HTMLInputElement>) => void;
+  handleAttachedPaste: (e: ClipboardEvent) => Promise<void>;
+  isFilesPopoverOpen: boolean;
+  setIsFilesPopoverOpen: Dispatch<SetStateAction<boolean>>;
 };
