@@ -332,7 +332,15 @@ export function useSystemAudio() {
                   previousMessages
                 );
               } else {
-                setError("Received empty transcription");
+                // No speech recognized (e.g. keyboard typing, background noise).
+                // Surface the same way as a too-short segment and skip AI.
+                setDiscardedNotice("no speech recognized");
+                if (discardedTimeoutRef.current) {
+                  clearTimeout(discardedTimeoutRef.current);
+                }
+                discardedTimeoutRef.current = setTimeout(() => {
+                  setDiscardedNotice("");
+                }, 3500);
               }
             } catch (sttError: any) {
               console.error("STT Error:", sttError);
