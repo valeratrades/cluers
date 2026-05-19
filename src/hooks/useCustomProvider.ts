@@ -8,6 +8,7 @@ import {
   updateCustomAiProvider,
   removeCustomAiProvider,
   validateCurl,
+  deleteAllProviderSecrets,
 } from "@/lib";
 
 export function useCustomAiProviders() {
@@ -58,6 +59,10 @@ export function useCustomAiProviders() {
     if (!deleteConfirm) return;
 
     try {
+      // Fan out keychain cleanup before pruning the localStorage entry —
+      // if the user re-adds a provider with the same id, we don't want
+      // ghost secrets surfacing in `listProviderSecretNames`.
+      await deleteAllProviderSecrets(deleteConfirm);
       const success = removeCustomAiProvider(deleteConfirm);
       if (success) {
         setDeleteConfirm(null);

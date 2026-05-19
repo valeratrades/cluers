@@ -78,7 +78,7 @@
             npmFlags = [ "--legacy-peer-deps" ];
             cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
               src = ./src-tauri;
-              hash = "sha256-OhBwVJv1QXHjrntJK70psy3KIIFCQrmNnV9oPPouOPM=";
+              hash = "sha256-5ebJPRXMhCXkemkeXWtW0AmwPrefXLi7HrC3vwGw+ic=";
             };
 
             nativeBuildInputs = [

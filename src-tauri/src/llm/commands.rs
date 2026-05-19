@@ -179,8 +179,3 @@ pub fn pluely_selected_model_get() -> Result<Option<pluely::Model>, String> {
 pub fn pluely_selected_model_set(model: pluely::Model) -> Result<(), String> {
     secrets::pluely_selected_model_set(&model).map_err(|e| e.to_string())
 }
-
-#[tauri::command]
-pub fn mark_secret_migration_complete(app: AppHandle) -> Result<(), String> {
-    secrets::finalize_legacy_migration(&app).map_err(|e| e.to_string())
-}

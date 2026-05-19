@@ -193,8 +193,3 @@ export function pluelySelectedModelSet(model: Model): Promise<void> {
   return invoke("pluely_selected_model_set", { model });
 }
 
-// -- Migration ---------------------------------------------------------------
-
-export function markSecretMigrationComplete(): Promise<void> {
-  return invoke("mark_secret_migration_complete");
-}

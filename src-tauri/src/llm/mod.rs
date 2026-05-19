@@ -6,9 +6,7 @@
 //! - Cancellation is `tokio::select!` against an `oneshot::Receiver`
 //!   whose `Sender` lives in `LlmState` keyed by `request_id`.
 //! - All provider secrets and Pluely credentials live in the OS keychain
-//!   via `secrets.rs`. The plaintext `secure_storage.json` and the
-//!   `localStorage.variables` plaintext dicts are migrated once at
-//!   startup, then deleted.
+//!   via `secrets.rs`.
 
 pub mod commands;
 pub mod pluely;

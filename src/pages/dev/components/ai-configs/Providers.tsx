@@ -3,6 +3,11 @@ import { UseSettingsReturn } from "@/types";
 import curl2Json, { ResultJSON } from "@bany/curl-to-json";
 import { KeyIcon, TrashIcon } from "lucide-react";
 import { useEffect, useState } from "react";
+import {
+  setProviderSecret,
+  deleteProviderSecret,
+  listProviderSecretNames,
+} from "@/lib";
 
 export const Providers = ({
   allAiProviders,
@@ -12,6 +17,11 @@ export const Providers = ({
 }: UseSettingsReturn) => {
   const [localSelectedProvider, setLocalSelectedProvider] =
     useState<ResultJSON | null>(null);
+  // The actual secret value lives in the OS keychain and is never read
+  // back into JS. `apiKeyInput` holds only what the user is currently
+  // typing; on submit we write it through and clear it.
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [apiKeyStored, setApiKeyStored] = useState(false);
 
   useEffect(() => {
     if (selectedAIProvider?.provider) {
@@ -25,18 +35,38 @@ export const Providers = ({
     }
   }, [selectedAIProvider?.provider]);
 
+  // Refresh "is API key set" whenever the provider changes.
+  useEffect(() => {
+    setApiKeyInput("");
+    setApiKeyStored(false);
+    if (!selectedAIProvider?.provider) return;
+    listProviderSecretNames(selectedAIProvider.provider)
+      .then((names) =>
+        setApiKeyStored(names.map((n) => n.toUpperCase()).includes("API_KEY"))
+      )
+      .catch(() => setApiKeyStored(false));
+  }, [selectedAIProvider?.provider]);
+
   const findKeyAndValue = (key: string) => {
     return variables?.find((v) => v?.key === key);
   };
 
-  const getApiKeyValue = () => {
-    const apiKeyVar = findKeyAndValue("api_key");
-    if (!apiKeyVar || !selectedAIProvider?.variables) return "";
-    return selectedAIProvider?.variables?.[apiKeyVar.key] || "";
+  const submitApiKey = async () => {
+    if (!selectedAIProvider?.provider || !apiKeyInput.trim()) return;
+    await setProviderSecret(
+      selectedAIProvider.provider,
+      "API_KEY",
+      apiKeyInput.trim()
+    );
+    setApiKeyInput("");
+    setApiKeyStored(true);
   };
 
-  const isApiKeyEmpty = () => {
-    return !getApiKeyValue().trim();
+  const clearApiKey = async () => {
+    if (!selectedAIProvider?.provider) return;
+    await deleteProviderSecret(selectedAIProvider.provider, "API_KEY");
+    setApiKeyInput("");
+    setApiKeyStored(false);
   };
 
   return (
@@ -94,52 +124,25 @@ export const Providers = ({
             <div className="flex gap-2">
               <Input
                 type="password"
-                placeholder="**********"
-                value={getApiKeyValue()}
+                placeholder={apiKeyStored ? "•••••••• (stored)" : "**********"}
+                value={apiKeyInput}
                 onChange={(value) => {
-                  const apiKeyVar = findKeyAndValue("api_key");
-                  if (!apiKeyVar || !selectedAIProvider) return;
-
-                  onSetSelectedAIProvider({
-                    ...selectedAIProvider,
-                    variables: {
-                      ...selectedAIProvider.variables,
-                      [apiKeyVar.key]:
-                        typeof value === "string" ? value : value.target.value,
-                    },
-                  });
+                  setApiKeyInput(
+                    typeof value === "string" ? value : value.target.value
+                  );
                 }}
                 onKeyDown={(e) => {
-                  const apiKeyVar = findKeyAndValue("api_key");
-                  if (!apiKeyVar || !selectedAIProvider) return;
-
-                  onSetSelectedAIProvider({
-                    ...selectedAIProvider,
-                    variables: {
-                      ...selectedAIProvider.variables,
-                      [apiKeyVar.key]: (e.target as HTMLInputElement).value,
-                    },
-                  });
+                  if (e.key === "Enter") {
+                    void submitApiKey();
+                  }
                 }}
                 disabled={false}
                 className="flex-1 h-11 border-1 border-input/50 focus:border-primary/50 transition-colors"
               />
-              {isApiKeyEmpty() ? (
+              {!apiKeyStored ? (
                 <Button
-                  onClick={() => {
-                    const apiKeyVar = findKeyAndValue("api_key");
-                    if (!apiKeyVar || !selectedAIProvider || isApiKeyEmpty())
-                      return;
-
-                    onSetSelectedAIProvider({
-                      ...selectedAIProvider,
-                      variables: {
-                        ...selectedAIProvider.variables,
-                        [apiKeyVar.key]: getApiKeyValue(),
-                      },
-                    });
-                  }}
-                  disabled={isApiKeyEmpty()}
+                  onClick={() => void submitApiKey()}
+                  disabled={!apiKeyInput.trim()}
                   size="icon"
                   className="shrink-0 h-11 w-11"
                   title="Submit API Key"
@@ -148,18 +151,7 @@ export const Providers = ({
                 </Button>
               ) : (
                 <Button
-                  onClick={() => {
-                    const apiKeyVar = findKeyAndValue("api_key");
-                    if (!apiKeyVar || !selectedAIProvider) return;
-
-                    onSetSelectedAIProvider({
-                      ...selectedAIProvider,
-                      variables: {
-                        ...selectedAIProvider.variables,
-                        [apiKeyVar.key]: "",
-                      },
-                    });
-                  }}
+                  onClick={() => void clearApiKey()}
                   size="icon"
                   variant="destructive"
                   className="shrink-0 h-11 w-11"

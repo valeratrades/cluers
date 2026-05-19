@@ -107,7 +107,6 @@ pub fn run() {
             llm::commands::pluely_license_clear,
             llm::commands::pluely_selected_model_get,
             llm::commands::pluely_selected_model_set,
-            llm::commands::mark_secret_migration_complete,
             db::commands::list_conversation_summaries,
             db::commands::load_conversation,
             db::commands::start_conversation,
@@ -142,14 +141,6 @@ pub fn run() {
                 .join("pluely.db");
             let db = db::Db::open(db_path).expect("open pluely.db");
             app.manage(db);
-
-            // One-time secret migration: copy fields from the legacy
-            // `secure_storage.json` into the OS keychain. The plaintext
-            // file is deleted later, after the JS half of the migration
-            // confirms via `mark_secret_migration_complete`.
-            if let Err(e) = llm::secrets::run_legacy_migration(&app.handle()) {
-                eprintln!("Secret migration probe failed: {}", e);
-            }
 
             // Setup main window positioning
             window::setup_main_window(app).expect("Failed to setup main window");
