@@ -4,7 +4,6 @@ import { useGlobalShortcuts } from "@/hooks";
 import { MAX_FILES } from "@/config";
 import { useApp } from "@/contexts";
 import {
-  fetchAIResponse,
   startConversation,
   appendMessage,
   loadConversation as loadConversationFromDb,
@@ -12,6 +11,10 @@ import {
   shouldUsePluelyAPI,
   generateRequestId,
   getResponseSettings,
+  streamChat,
+  cancelChat,
+  buildEnhancedSystemPrompt,
+  type ProviderInput,
 } from "@/lib";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -89,7 +92,6 @@ export const useCompletion = () => {
 
   const scrollAreaRef = useRef<HTMLDivElement>(null);
 
-  const abortControllerRef = useRef<AbortController | null>(null);
   const currentRequestIdRef = useRef<string | null>(null);
 
   const setInput = useCallback((value: string) => {
@@ -115,17 +117,11 @@ export const useCompletion = () => {
         }));
       }
 
-      // Generate unique request ID
+      if (currentRequestIdRef.current) {
+        cancelChat(currentRequestIdRef.current).catch(() => {});
+      }
       const requestId = generateRequestId();
       currentRequestIdRef.current = requestId;
-
-      // Cancel any existing request
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-
-      abortControllerRef.current = new AbortController();
-      const signal = abortControllerRef.current.signal;
 
       try {
         // Prepare message history for the AI
@@ -133,21 +129,6 @@ export const useCompletion = () => {
           role: msg.role,
           content: msg.content,
         }));
-
-        // Handle attachments: split images and documents (PDFs)
-        const imagesBase64: string[] = [];
-        const imagesMime: string[] = [];
-        const documentsBase64: string[] = [];
-        if (attachedFiles.length > 0) {
-          attachedFiles.forEach((file) => {
-            if (file.type.startsWith("image/")) {
-              imagesBase64.push(file.base64);
-              imagesMime.push(file.type);
-            } else if (file.type === "application/pdf") {
-              documentsBase64.push(file.base64);
-            }
-          });
-        }
 
         let fullResponse = "";
 
@@ -180,29 +161,40 @@ export const useCompletion = () => {
           response: "",
         }));
 
+        const providerInput: ProviderInput = usePluelyAPI
+          ? {
+              id: "pluely",
+              curl: "",
+              responseContentPath: "",
+              streaming: true,
+              isPluelyHosted: true,
+              userVariables: {},
+            }
+          : {
+              id: provider!.id || "",
+              curl: provider!.curl,
+              responseContentPath: provider!.responseContentPath || "",
+              streaming: provider!.streaming ?? false,
+              isPluelyHosted: false,
+              userVariables: Object.fromEntries(
+                Object.entries(selectedAIProvider.variables || {})
+                  .filter(([, v]) => typeof v === "string" && v !== "")
+                  .map(([k, v]) => [k.toUpperCase(), v as string])
+              ),
+            };
+
         try {
-          // Use the fetchAIResponse function with signal
-          for await (const chunk of fetchAIResponse({
-            provider: usePluelyAPI ? undefined : provider,
-            selectedProvider: selectedAIProvider,
-            systemPrompt: systemPrompt || undefined,
+          for await (const chunk of streamChat({
+            provider: providerInput,
+            message: input,
+            systemPrompt: buildEnhancedSystemPrompt(systemPrompt || undefined),
             history: messageHistory,
-            userMessage: input,
-            imagesBase64,
-            imagesMime,
-            documentsBase64,
-            signal,
+            attachedFiles,
+            requestId,
           })) {
-            // Only update if this is still the current request
             if (currentRequestIdRef.current !== requestId) {
               return; // Request was superseded, stop processing
             }
-
-            // Check if request was aborted
-            if (signal.aborted) {
-              return; // Request was cancelled, stop processing
-            }
-
             fullResponse += chunk;
             setState((prev) => ({
               ...prev,
@@ -210,8 +202,7 @@ export const useCompletion = () => {
             }));
           }
         } catch (e: any) {
-          // Only show error if this is still the current request and not aborted
-          if (currentRequestIdRef.current === requestId && !signal.aborted) {
+          if (currentRequestIdRef.current === requestId) {
             setState((prev) => ({
               ...prev,
               isLoading: false,
@@ -221,8 +212,7 @@ export const useCompletion = () => {
           return;
         }
 
-        // Only proceed if this is still the current request
-        if (currentRequestIdRef.current !== requestId || signal.aborted) {
+        if (currentRequestIdRef.current !== requestId) {
           return;
         }
 
@@ -244,8 +234,7 @@ export const useCompletion = () => {
           clearAttachedFiles();
         }
       } catch (error) {
-        // Only show error if not aborted
-        if (!signal?.aborted && currentRequestIdRef.current === requestId) {
+        if (currentRequestIdRef.current === requestId) {
           setState((prev) => ({
             ...prev,
             error: error instanceof Error ? error.message : "An error occurred",
@@ -266,11 +255,11 @@ export const useCompletion = () => {
   );
 
   const cancel = useCallback(() => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
+    const id = currentRequestIdRef.current;
     currentRequestIdRef.current = null;
+    if (id) {
+      cancelChat(id).catch(() => {});
+    }
     setState((prev) => ({ ...prev, isLoading: false }));
   }, []);
 
@@ -473,17 +462,12 @@ export const useCompletion = () => {
             size: base64.length,
           };
 
-          // Generate unique request ID
+          // Cancel any previous in-flight request before starting a new one.
+          if (currentRequestIdRef.current) {
+            cancelChat(currentRequestIdRef.current).catch(() => {});
+          }
           const requestId = generateRequestId();
           currentRequestIdRef.current = requestId;
-
-          // Cancel any existing request
-          if (abortControllerRef.current) {
-            abortControllerRef.current.abort();
-          }
-
-          abortControllerRef.current = new AbortController();
-          const signal = abortControllerRef.current.signal;
 
           try {
             // Prepare message history for the AI
@@ -524,22 +508,41 @@ export const useCompletion = () => {
               response: "",
             }));
 
-            // Use the fetchAIResponse function with image and signal
-            for await (const chunk of fetchAIResponse({
-              provider: usePluelyAPI ? undefined : provider,
-              selectedProvider: selectedAIProvider,
-              systemPrompt: systemPrompt || undefined,
+            const providerInput: ProviderInput = usePluelyAPI
+              ? {
+                  id: "pluely",
+                  curl: "",
+                  responseContentPath: "",
+                  streaming: true,
+                  isPluelyHosted: true,
+                  userVariables: {},
+                }
+              : {
+                  id: provider!.id || "",
+                  curl: provider!.curl,
+                  responseContentPath: provider!.responseContentPath || "",
+                  streaming: provider!.streaming ?? false,
+                  isPluelyHosted: false,
+                  userVariables: Object.fromEntries(
+                    Object.entries(selectedAIProvider.variables || {})
+                      .filter(([, v]) => typeof v === "string" && v !== "")
+                      .map(([k, v]) => [k.toUpperCase(), v as string])
+                  ),
+                };
+
+            for await (const chunk of streamChat({
+              provider: providerInput,
+              message: prompt,
+              systemPrompt: buildEnhancedSystemPrompt(
+                systemPrompt || undefined
+              ),
               history: messageHistory,
-              userMessage: prompt,
-              imagesBase64: [base64],
-              imagesMime: ["image/png"],
-              signal,
+              attachedFiles: [attachedFile],
+              requestId,
             })) {
-              // Only update if this is still the current request
-              if (currentRequestIdRef.current !== requestId || signal.aborted) {
+              if (currentRequestIdRef.current !== requestId) {
                 return; // Request was superseded or cancelled
               }
-
               fullResponse += chunk;
               setState((prev) => ({
                 ...prev,
@@ -547,8 +550,7 @@ export const useCompletion = () => {
               }));
             }
 
-            // Only proceed if this is still the current request
-            if (currentRequestIdRef.current !== requestId || signal.aborted) {
+            if (currentRequestIdRef.current !== requestId) {
               return;
             }
 
@@ -569,16 +571,14 @@ export const useCompletion = () => {
               }));
             }
           } catch (e: any) {
-            // Only show error if this is still the current request and not aborted
-            if (currentRequestIdRef.current === requestId && !signal.aborted) {
+            if (currentRequestIdRef.current === requestId) {
               setState((prev) => ({
                 ...prev,
                 error: e.message || "An error occurred",
               }));
             }
           } finally {
-            // Only update loading state if this is still the current request
-            if (currentRequestIdRef.current === requestId && !signal.aborted) {
+            if (currentRequestIdRef.current === requestId) {
               setState((prev) => ({ ...prev, isLoading: false }));
             }
           }
@@ -845,14 +845,14 @@ export const useCompletion = () => {
     setMicOpen(!micOpen);
   }, [enableVAD, micOpen]);
 
-  // Cleanup abort controller on unmount
+  // Cancel any in-flight stream on unmount.
   useEffect(() => {
     return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
-      }
+      const id = currentRequestIdRef.current;
       currentRequestIdRef.current = null;
+      if (id) {
+        cancelChat(id).catch(() => {});
+      }
     };
   }, []);
 

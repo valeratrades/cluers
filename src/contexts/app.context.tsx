@@ -4,7 +4,13 @@ import {
   SPEECH_TO_TEXT_PROVIDERS,
   STORAGE_KEYS,
 } from "@/config";
-import { getPlatform, safeLocalStorage, trackAppStart } from "@/lib";
+import {
+  getPlatform,
+  safeLocalStorage,
+  trackAppStart,
+  pluelySelectedModelGet,
+  pluelyLicenseStatus,
+} from "@/lib";
 import { getShortcutsConfig } from "@/lib/storage";
 import {
   getCustomizableState,
@@ -254,7 +260,13 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   );
 
   const getActiveLicenseStatus = async () => {
-    setHasActiveLicense(true);
+    try {
+      const hasLicense = await pluelyLicenseStatus();
+      setHasActiveLicense(hasLicense);
+    } catch (error) {
+      console.error("Failed to check license status:", error);
+      setHasActiveLicense(false);
+    }
   };
 
   useEffect(() => {
@@ -422,10 +434,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       // Track app start
       try {
         const appVersion = await invoke<string>("get_app_version");
-        const storage = await invoke<{
-          instance_id: string;
-        }>("secure_storage_get");
-        await trackAppStart(appVersion, storage.instance_id || "");
+        await trackAppStart(appVersion);
       } catch (error) {
         console.debug("Failed to track app start:", error);
       }
@@ -543,12 +552,8 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       if (pluelyApiEnabled) {
         // For Pluely API, check the selected model's modality
         try {
-          const storage = await invoke<{
-            selected_pluely_model?: string;
-          }>("secure_storage_get");
-
-          if (storage.selected_pluely_model) {
-            const model = JSON.parse(storage.selected_pluely_model);
+          const model = await pluelySelectedModelGet();
+          if (model) {
             const hasImageSupport = model.modality?.includes("image") ?? false;
             setSupportsImages(hasImageSupport);
           } else {
@@ -707,12 +712,8 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
 
     if (enabled) {
       try {
-        const storage = await invoke<{
-          selected_pluely_model?: string;
-        }>("secure_storage_get");
-
-        if (storage.selected_pluely_model) {
-          const model = JSON.parse(storage.selected_pluely_model);
+        const model = await pluelySelectedModelGet();
+        if (model) {
           const hasImageSupport = model.modality?.includes("image") ?? false;
           setSupportsImages(hasImageSupport);
         } else {

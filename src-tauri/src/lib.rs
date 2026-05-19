@@ -3,6 +3,7 @@ mod activate;
 mod api;
 mod capture;
 mod db;
+mod llm;
 mod shortcuts;
 mod window;
 use std::sync::{Arc, Mutex};
@@ -38,6 +39,7 @@ pub fn run() {
     let mut builder = tauri::Builder::default()
         .manage(AudioState::default())
         .manage(CaptureState::default())
+        .manage(llm::LlmState::new())
         .manage(shortcuts::WindowVisibility {
             is_hidden: Mutex::new(false),
         })
@@ -47,7 +49,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_http::init())
-        .plugin(tauri_plugin_keychain::init())
         .plugin(tauri_plugin_shell::init()) // Add shell plugin
         .plugin(posthog_init(PostHogConfig {
             api_key: posthog_api_key,
@@ -89,18 +90,24 @@ pub fn run() {
             activate::activate_license_api,
             activate::deactivate_license_api,
             activate::validate_license_api,
-            activate::mask_license_key_cmd,
             activate::get_checkout_url,
-            activate::secure_storage_save,
-            activate::secure_storage_get,
-            activate::secure_storage_remove,
             api::transcribe_audio,
-            api::chat_stream_response,
             api::fetch_models,
             api::fetch_prompts,
             api::generate_system_prompt_via_api,
-            api::check_license_status,
             api::get_activity,
+            llm::commands::stream_chat,
+            llm::commands::cancel_chat,
+            llm::commands::set_provider_secret,
+            llm::commands::list_provider_secret_names,
+            llm::commands::delete_provider_secret,
+            llm::commands::delete_all_provider_secrets,
+            llm::commands::pluely_license_status,
+            llm::commands::pluely_license_set,
+            llm::commands::pluely_license_clear,
+            llm::commands::pluely_selected_model_get,
+            llm::commands::pluely_selected_model_set,
+            llm::commands::mark_secret_migration_complete,
             db::commands::list_conversation_summaries,
             db::commands::load_conversation,
             db::commands::start_conversation,
@@ -135,6 +142,14 @@ pub fn run() {
                 .join("pluely.db");
             let db = db::Db::open(db_path).expect("open pluely.db");
             app.manage(db);
+
+            // One-time secret migration: copy fields from the legacy
+            // `secure_storage.json` into the OS keychain. The plaintext
+            // file is deleted later, after the JS half of the migration
+            // confirms via `mark_secret_migration_complete`.
+            if let Err(e) = llm::secrets::run_legacy_migration(&app.handle()) {
+                eprintln!("Secret migration probe failed: {}", e);
+            }
 
             // Setup main window positioning
             window::setup_main_window(app).expect("Failed to setup main window");

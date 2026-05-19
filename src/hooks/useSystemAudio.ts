@@ -3,7 +3,7 @@ import { useWindowResize, useGlobalShortcuts } from ".";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useApp } from "@/contexts";
-import { fetchSTT, fetchAIResponse, NoTranscriptionError } from "@/lib/functions";
+import { fetchSTT, NoTranscriptionError } from "@/lib/functions";
 import {
   DEFAULT_QUICK_ACTIONS,
   DEFAULT_SYSTEM_PROMPT,
@@ -16,8 +16,13 @@ import {
   startConversation,
   appendMessage,
   CONVERSATION_SAVE_DEBOUNCE_MS,
+  streamChat,
+  cancelChat,
+  generateRequestId,
+  buildEnhancedSystemPrompt,
+  type ProviderInput,
+  type HistoryMessage,
 } from "@/lib";
-import { Message } from "@/types/completion";
 
 // VAD Configuration interface matching Rust
 export interface VadConfig {
@@ -132,7 +137,7 @@ export function useSystemAudio() {
     selectedAudioDevices,
     attachedFiles,
   } = useApp();
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const currentRequestIdRef = useRef<string | null>(null);
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isSavingRef = useRef<boolean>(false);
   // IDs of messages already written to the DB. Diffed against
@@ -527,13 +532,14 @@ export function useSystemAudio() {
     async (
       transcription: string,
       prompt: string,
-      previousMessages: Message[]
+      previousMessages: HistoryMessage[]
     ) => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
+      // Cancel any previous in-flight AI request before starting a new one.
+      if (currentRequestIdRef.current) {
+        cancelChat(currentRequestIdRef.current).catch(() => {});
       }
-
-      abortControllerRef.current = new AbortController();
+      const requestId = generateRequestId();
+      currentRequestIdRef.current = requestId;
 
       try {
         setIsAIProcessing(true);
@@ -556,35 +562,45 @@ export function useSystemAudio() {
           return;
         }
 
-        // Split shared attachments into images and documents (PDFs)
-        const imagesBase64: string[] = [];
-        const imagesMime: string[] = [];
-        const documentsBase64: string[] = [];
-        attachedFiles.forEach((file) => {
-          if (file.type.startsWith("image/")) {
-            imagesBase64.push(file.base64);
-            imagesMime.push(file.type);
-          } else if (file.type === "application/pdf") {
-            documentsBase64.push(file.base64);
-          }
-        });
+        const providerInput: ProviderInput = usePluelyAPI
+          ? {
+              id: "pluely",
+              curl: "",
+              responseContentPath: "",
+              streaming: true,
+              isPluelyHosted: true,
+              userVariables: {},
+            }
+          : {
+              id: provider!.id || "",
+              curl: provider!.curl,
+              responseContentPath: provider!.responseContentPath || "",
+              streaming: provider!.streaming ?? false,
+              isPluelyHosted: false,
+              userVariables: Object.fromEntries(
+                Object.entries(selectedAIProvider.variables || {})
+                  .filter(([, v]) => typeof v === "string" && v !== "")
+                  .map(([k, v]) => [k.toUpperCase(), v as string])
+              ),
+            };
 
         try {
-          for await (const chunk of fetchAIResponse({
-            provider: usePluelyAPI ? undefined : provider,
-            selectedProvider: selectedAIProvider,
-            systemPrompt: prompt,
+          for await (const chunk of streamChat({
+            provider: providerInput,
+            message: transcription,
+            systemPrompt: buildEnhancedSystemPrompt(prompt),
             history: previousMessages,
-            userMessage: transcription,
-            imagesBase64,
-            imagesMime,
-            documentsBase64,
+            attachedFiles,
+            requestId,
           })) {
+            if (currentRequestIdRef.current !== requestId) return;
             fullResponse += chunk;
             setLastAIResponse((prev) => prev + chunk);
           }
         } catch (aiError: any) {
-          setError(aiError.message || "Failed to get AI response");
+          if (currentRequestIdRef.current === requestId) {
+            setError(aiError.message || "Failed to get AI response");
+          }
         }
 
         if (fullResponse) {
@@ -679,10 +695,11 @@ export function useSystemAudio() {
 
   const stopCapture = useCallback(async () => {
     try {
-      // Abort any ongoing AI requests
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
+      // Cancel any in-flight AI streaming request.
+      const id = currentRequestIdRef.current;
+      currentRequestIdRef.current = null;
+      if (id) {
+        cancelChat(id).catch(() => {});
       }
 
       // Stop the audio capture
@@ -784,8 +801,10 @@ export function useSystemAudio() {
 
   useEffect(() => {
     return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
+      const id = currentRequestIdRef.current;
+      currentRequestIdRef.current = null;
+      if (id) {
+        cancelChat(id).catch(() => {});
       }
       invoke("stop_system_audio_capture").catch(() => {});
     };

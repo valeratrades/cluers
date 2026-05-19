@@ -26,12 +26,16 @@ export const captureEvent = async (
 };
 
 /**
- * Track app initialization
+ * Track app initialization.
+ *
+ * Pluely's per-install instance_id used to be attached here, but it lives
+ * in the OS keychain now and is intentionally not readable from JS (see
+ * `llm/secrets.rs`). If we want it back on this event, the right move is
+ * a small Rust-side capture using the credentials already in scope there.
  */
-export const trackAppStart = async (appVersion: string, instanceId: string) => {
+export const trackAppStart = async (appVersion: string) => {
   await captureEvent(ANALYTICS_EVENTS.APP_STARTED, {
     app_version: appVersion,
     platform: navigator.platform,
-    instance_id: instanceId,
   });
 };

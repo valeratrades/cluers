@@ -3,6 +3,12 @@ import { KeyIcon, TrashIcon, LoaderIcon, ChevronDown } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useApp } from "@/contexts";
 import {
+  pluelyLicenseStatus,
+  pluelyLicenseClear,
+  pluelySelectedModelGet,
+  pluelySelectedModelSet,
+} from "@/lib";
+import {
   Button,
   Header,
   Input,
@@ -30,12 +36,6 @@ interface ActivationResponse {
   is_dev_license?: boolean;
 }
 
-interface StorageResult {
-  license_key?: string;
-  instance_id?: string;
-  selected_pluely_model?: string;
-}
-
 interface Model {
   provider: string;
   name: string;
@@ -46,9 +46,9 @@ interface Model {
   isAvailable: boolean;
 }
 
-const LICENSE_KEY_STORAGE_KEY = "pluely_license_key";
-const INSTANCE_ID_STORAGE_KEY = "pluely_instance_id";
-const SELECTED_PLUELY_MODEL_STORAGE_KEY = "selected_pluely_model";
+// JS never sees the raw license key — secrets live in the OS keychain. We
+// render a fixed placeholder to indicate "a license is stored" instead.
+const STORED_LICENSE_PLACEHOLDER = "••••-••••-••••-••••";
 
 export const PluelyApiSetup = () => {
   const {
@@ -61,8 +61,7 @@ export const PluelyApiSetup = () => {
   } = useApp();
 
   const [licenseKey, setLicenseKey] = useState("");
-  const [storedLicenseKey, setStoredLicenseKey] = useState<string | null>(null);
-  const [maskedLicenseKey, setMaskedLicenseKey] = useState<string | null>(null);
+  const [hasStoredLicense, setHasStoredLicense] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -104,38 +103,15 @@ export const PluelyApiSetup = () => {
 
   const loadLicenseStatus = async () => {
     try {
-      // Get all stored data in one call
-      const storage = await invoke<StorageResult>("secure_storage_get");
-
-      if (storage.license_key) {
-        setStoredLicenseKey(storage.license_key);
-
-        // Get masked version from Tauri command
-        const masked = await invoke<string>("mask_license_key_cmd", {
-          licenseKey: storage.license_key,
-        });
-        setMaskedLicenseKey(masked);
-      } else {
-        setStoredLicenseKey(null);
-        setMaskedLicenseKey(null);
-      }
-
-      if (storage.selected_pluely_model) {
-        try {
-          const storedModel = JSON.parse(storage.selected_pluely_model);
-          setSelectedModel(storedModel);
-        } catch (e) {
-          console.error("Failed to parse stored model:", e);
-          setSelectedModel(null);
-        }
-      } else {
-        setSelectedModel(null);
-      }
+      const [hasLicense, model] = await Promise.all([
+        pluelyLicenseStatus(),
+        pluelySelectedModelGet(),
+      ]);
+      setHasStoredLicense(hasLicense);
+      setSelectedModel((model as Model | null) ?? null);
     } catch (err) {
       console.error("Failed to load license status:", err);
-      // If we can't read from storage, assume no license is stored
-      setStoredLicenseKey(null);
-      setMaskedLicenseKey(null);
+      setHasStoredLicense(false);
       setSelectedModel(null);
     }
   };
@@ -159,20 +135,9 @@ export const PluelyApiSetup = () => {
       );
 
       if (response.activated && response.instance) {
-        // Store the license data securely in one call
-        await invoke("secure_storage_save", {
-          items: [
-            {
-              key: LICENSE_KEY_STORAGE_KEY,
-              value: licenseKey.trim(),
-            },
-            {
-              key: INSTANCE_ID_STORAGE_KEY,
-              value: response.instance.id,
-            },
-          ],
-        });
-
+        // The Rust `activate_license_api` command already wrote the
+        // license key and instance id into the keychain on success — JS
+        // does not (and cannot) re-persist secrets from here.
         setSuccess("License activated successfully!");
         setLicenseKey(""); // Clear the input
 
@@ -201,14 +166,9 @@ export const PluelyApiSetup = () => {
     setSuccess(null);
     setHasActiveLicense(false);
     try {
-      // Remove all license data from secure storage in one call
-      await invoke("secure_storage_remove", {
-        keys: [
-          LICENSE_KEY_STORAGE_KEY,
-          INSTANCE_ID_STORAGE_KEY,
-          SELECTED_PLUELY_MODEL_STORAGE_KEY,
-        ],
-      });
+      // Clears license_key, instance_id, and selected_pluely_model from
+      // the keychain in one shot (see `secrets::pluely_license_clear`).
+      await pluelyLicenseClear();
 
       setSuccess("License removed successfully!");
 
@@ -238,14 +198,7 @@ export const PluelyApiSetup = () => {
     }
 
     try {
-      await invoke("secure_storage_save", {
-        items: [
-          {
-            key: SELECTED_PLUELY_MODEL_STORAGE_KEY,
-            value: JSON.stringify(model),
-          },
-        ],
-      });
+      await pluelySelectedModelSet(model);
     } catch (error) {
       console.error("Failed to save model selection:", error);
       setError("Failed to save model selection.");
@@ -260,7 +213,7 @@ export const PluelyApiSetup = () => {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter" && !storedLicenseKey) {
+    if (e.key === "Enter" && !hasStoredLicense) {
       handleActivateLicense();
     }
   };
@@ -397,7 +350,7 @@ export const PluelyApiSetup = () => {
         )}
         {/* License Key Input or Display */}
         <div className="space-y-2">
-          {!storedLicenseKey ? (
+          {!hasStoredLicense ? (
             <>
               <div className="space-y-1">
                 <label className="text-sm font-medium">License Key</label>
@@ -445,7 +398,7 @@ export const PluelyApiSetup = () => {
               <div className="flex gap-2">
                 <Input
                   type="text"
-                  value={maskedLicenseKey || ""}
+                  value={STORED_LICENSE_PLACEHOLDER}
                   disabled={true}
                   className="flex-1 h-11 border-1 border-input/50 bg-muted/50"
                 />
@@ -464,7 +417,7 @@ export const PluelyApiSetup = () => {
                   )}
                 </Button>
               </div>
-              {storedLicenseKey ? (
+              {hasStoredLicense ? (
                 <div className="-mt-1">
                   <p className="text-sm font-medium text-muted-foreground select-auto">
                     If you need any help or any assistance, contact
@@ -480,7 +433,7 @@ export const PluelyApiSetup = () => {
         <Header
           title={`${pluelyApiEnabled ? "Disable" : "Enable"} Pluely API`}
           description={
-            storedLicenseKey
+            hasStoredLicense
               ? pluelyApiEnabled
                 ? "Using all pluely APIs for audio, and chat."
                 : "Using all your own AI Providers for audio, and chat."
@@ -490,7 +443,7 @@ export const PluelyApiSetup = () => {
         <Switch
           checked={pluelyApiEnabled}
           onCheckedChange={setPluelyApiEnabled}
-          disabled={!storedLicenseKey || !hasActiveLicense} // Disable if no license is stored
+          disabled={!hasStoredLicense || !hasActiveLicense} // Disable if no license is stored
         />
       </div>
     </div>

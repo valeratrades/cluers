@@ -1,5 +1,3 @@
-import { Message } from "@/types";
-
 /**
  * Derive a conversation title from the first user message.
  * Currently a trim; lives here next to other small text helpers.
@@ -17,17 +15,6 @@ export function getByPath(obj: any, path: string): any {
     .reduce((o, k) => (o || {})[k], obj);
 }
 
-export function setByPath(obj: any, path: string, value: any): void {
-  const keys = path.split(".");
-  let current = obj;
-  for (let i = 0; i < keys.length - 1; i++) {
-    const key = keys[i].replace(/\[(\d+)\]/g, ".$1");
-    if (!current[key]) current[key] = /^\d+$/.test(keys[i + 1]) ? [] : {};
-    current = current[key];
-  }
-  current[keys[keys.length - 1].replace(/\[(\d+)\]/g, ".$1")] = value;
-}
-
 export async function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -40,6 +27,12 @@ export async function blobToBase64(blob: Blob): Promise<string> {
   });
 }
 
+/**
+ * Enumerate `{{UPPERCASE}}` placeholders in a curl template. Used by
+ * the settings UI to render the variable input form. `includeAll=true`
+ * returns the well-known reserved tokens too (TEXT/IMAGE/SYSTEM_PROMPT/…)
+ * which the AI request path always supplies itself.
+ */
 export function extractVariables(
   curl: string,
   includeAll = false
@@ -76,127 +69,8 @@ export function extractVariables(
 }
 
 /**
- * Recursively processes a user message template to replace placeholders for text, images and documents.
- * @param template The user message template object.
- * @param userMessage The user's text message.
- * @param imagesBase64 An array of base64 encoded images.
- * @param imagesMime An array of MIME types for the images, parallel to imagesBase64.
- * @param documentsBase64 An array of base64 encoded documents (e.g. PDFs).
- * @returns The processed user message object.
- */
-export function processUserMessageTemplate(
-  template: any,
-  userMessage: string,
-  imagesBase64: string[] = [],
-  imagesMime: string[] = [],
-  documentsBase64: string[] = []
-): any {
-  const escapeForJson = (value: string) =>
-    JSON.stringify(value ?? "").slice(1, -1);
-
-  const templateStr = JSON.stringify(template).replace(
-    /\{\{TEXT\}\}/g,
-    escapeForJson(userMessage)
-  );
-  const result = JSON.parse(templateStr);
-
-  // Expands a single template node containing any of the given tokens into N copies
-  // (one per payload entry); each entry maps token name -> substitution value.
-  // Removes the template node if no payloads are given.
-  const expandTokensInArray = (
-    node: any[],
-    tokens: string[],
-    payloads: Record<string, string>[]
-  ): any[] => {
-    const idx = node.findIndex((item) => {
-      const s = JSON.stringify(item);
-      return tokens.some((t) => s.includes(`{{${t}}}`));
-    });
-    if (idx === -1) return node;
-    const tpl = node[idx];
-    const parts = payloads.map((payload) => {
-      let partStr = JSON.stringify(tpl);
-      for (const token of tokens) {
-        partStr = partStr.replace(
-          new RegExp(`\\{\\{${token}\\}\\}`, "g"),
-          escapeForJson(payload[token] ?? "")
-        );
-      }
-      return JSON.parse(partStr);
-    });
-    return [...node.slice(0, idx), ...parts, ...node.slice(idx + 1)];
-  };
-
-  const imagePayloads = imagesBase64.map((b64, i) => ({
-    IMAGE: b64,
-    IMAGE_MIME: imagesMime[i] ?? "image/png",
-  }));
-  const documentPayloads = documentsBase64.map((b64) => ({ DOCUMENT: b64 }));
-
-  const replacer = (node: any): any => {
-    if (Array.isArray(node)) {
-      let arr = expandTokensInArray(node, ["IMAGE", "IMAGE_MIME"], imagePayloads);
-      arr = expandTokensInArray(arr, ["DOCUMENT"], documentPayloads);
-      return arr.map(replacer);
-    } else if (node && typeof node === "object") {
-      const newNode: { [key: string]: any } = {};
-      for (const key in node) {
-        newNode[key] = replacer(node[key]);
-      }
-      return newNode;
-    }
-    return node;
-  };
-
-  return replacer(result);
-}
-
-/**
- * Builds a dynamic messages array from a template, incorporating history and the current user message.
- * @param messagesTemplate The message template array from the cURL configuration.
- * @param history An array of previous messages in the conversation.
- * @param userMessage The user's current text message.
- * @param imagesBase64 An array of base64 encoded images for the current message.
- * @param imagesMime An array of image MIME types parallel to imagesBase64.
- * @param documentsBase64 An array of base64 encoded documents (e.g. PDFs) for the current message.
- * @returns The fully constructed messages array.
- */
-export function buildDynamicMessages(
-  messagesTemplate: any[],
-  history: Message[],
-  userMessage: string,
-  imagesBase64: string[] = [],
-  imagesMime: string[] = [],
-  documentsBase64: string[] = []
-): any[] {
-  const userMessageTemplateIndex = messagesTemplate.findIndex((m) =>
-    JSON.stringify(m).includes("{{TEXT}}")
-  );
-
-  if (userMessageTemplateIndex === -1) {
-    return [...history, { role: "user", content: userMessage }]; // Fallback
-  }
-
-  const prefixMessages = messagesTemplate.slice(0, userMessageTemplateIndex);
-  const suffixMessages = messagesTemplate.slice(userMessageTemplateIndex + 1);
-  const userMessageTemplate = messagesTemplate[userMessageTemplateIndex];
-
-  const newUserMessage = processUserMessageTemplate(
-    userMessageTemplate,
-    userMessage,
-    imagesBase64,
-    imagesMime,
-    documentsBase64
-  );
-
-  return [...prefixMessages, ...history, newUserMessage, ...suffixMessages];
-}
-
-/**
  * Recursively walks through an object and replaces variable placeholders.
- * @param node The object or value to process.
- * @param variables A key-value map of variables to replace.
- * @returns The processed object.
+ * Used by the STT path (LLM path moved this into Rust).
  */
 export function deepVariableReplacer(
   node: any,
@@ -220,46 +94,4 @@ export function deepVariableReplacer(
     return newNode;
   }
   return node;
-}
-
-/**
- * Extracts content from a streaming API response chunk by trying a series of common JSON paths.
- * This makes the system more resilient to variations in streaming formats.
- * @param chunk The parsed JSON object from a stream line.
- * @param defaultPath The default, non-streaming content path for the provider.
- * @returns The extracted text content, or null if not found.
- */
-export function getStreamingContent(
-  chunk: any,
-  defaultPath: string
-): string | null {
-  // A set of possible paths to check for streaming content.
-  // Using a Set automatically handles duplicates.
-  const possiblePaths = new Set([
-    // 1. First, try a common modification for OpenAI-like providers.
-    defaultPath.replace(".message.", ".delta."),
-    // 2. Then, add other common patterns.
-    "choices[0].delta.content", // OpenAI, Groq, Mistral, Perplexity
-    "candidates[0].content.parts[0].text", // Gemini
-    "delta.text", // Claude
-    "text", // Cohere
-    // 3. Finally, use the original path as a fallback (for Gemini and others).
-    defaultPath,
-  ]);
-
-  for (const path of possiblePaths) {
-    // Skip empty or null paths
-    if (!path) continue;
-
-    const content = getByPath(chunk, path);
-
-    // We only care about non-empty string content.
-    // Some paths might resolve to objects (e.g., `choices[0].delta`), so we check the type.
-    if (typeof content === "string" && content) {
-      return content;
-    }
-  }
-
-  // Return null if no content is found after trying all paths.
-  return null;
 }

@@ -17,7 +17,7 @@ import {
   ClockIcon,
 } from "lucide-react";
 import { useApp } from "@/contexts";
-import { safeLocalStorage } from "@/lib";
+import { safeLocalStorage, pluelySelectedModelSet } from "@/lib";
 import { STORAGE_KEYS } from "@/config";
 import moment from "moment";
 
@@ -44,7 +44,6 @@ interface Model {
   isAvailable: boolean;
 }
 
-const SELECTED_PLUELY_MODEL_STORAGE_KEY = "selected_pluely_model";
 const SELECTED_PLUELY_PROMPT_STORAGE_KEY = "selected_pluely_prompt";
 
 export const PluelyPrompts = () => {
@@ -175,14 +174,7 @@ export const PluelyPrompts = () => {
           setSupportsImages(hasImageSupport);
         }
 
-        await invoke("secure_storage_save", {
-          items: [
-            {
-              key: SELECTED_PLUELY_MODEL_STORAGE_KEY,
-              value: JSON.stringify(matchingModel),
-            },
-          ],
-        });
+        await pluelySelectedModelSet(matchingModel);
       }
     } catch (error) {
       console.error("Failed to select Pluely prompt:", error);

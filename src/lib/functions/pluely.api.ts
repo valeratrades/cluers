@@ -1,18 +1,20 @@
-import { invoke } from "@tauri-apps/api/core";
 import { safeLocalStorage } from "../storage";
 import { STORAGE_KEYS } from "@/config";
+import { pluelyLicenseStatus } from "@/lib/llm";
 
-// Helper function to check if Pluely API should be used
+/**
+ * UI-side gate for "should we treat the user as on the Pluely-hosted
+ * path right now?". Used to render Pluely-specific UI (model picker,
+ * banner, etc.) and to set the `isPluelyHosted` flag on the next
+ * `streamChat` request. The actual transport decision is made inside
+ * Rust based on the same flag.
+ */
 export async function shouldUsePluelyAPI(): Promise<boolean> {
   try {
-    // Check if Pluely API is enabled in localStorage
     const pluelyApiEnabled =
       safeLocalStorage.getItem(STORAGE_KEYS.PLUELY_API_ENABLED) === "true";
     if (!pluelyApiEnabled) return false;
-
-    // Check if license is available
-    const hasLicense = await invoke<boolean>("check_license_status");
-    return hasLicense;
+    return await pluelyLicenseStatus();
   } catch (error) {
     console.warn("Failed to check Pluely API availability:", error);
     return false;
