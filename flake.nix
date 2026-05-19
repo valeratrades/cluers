@@ -31,6 +31,14 @@
             syncFork = true;
           };
 
+          combined = v_flakes.utils.combine [
+            github
+            { shellHook = ''
+                cp -f ${(files.gitattributes) { inherit pkgs; lfs = false; }} ./.gitattributes
+              '';
+            }
+          ];
+
           linuxDeps = with pkgs; [
             # Tauri/WebKit runtime
             webkitgtk_4_1
@@ -100,16 +108,14 @@
               pkgs.nodejs_22
               pkgs.pkg-config
               pkgs.openssl
-            ] ++ systemDeps ++ github.enabledPackages;
+            ] ++ systemDeps ++ combined.enabledPackages;
 
             env = {
               RUST_BACKTRACE = 1;
               RUST_LIB_BACKTRACE = 0;
             };
 
-            shellHook = github.shellHook + ''
-              cp -f ${(files.gitattributes) { inherit pkgs; lfs = false; }} ./.gitattributes
-            '';
+            shellHook = combined.shellHook;
           };
         };
     };

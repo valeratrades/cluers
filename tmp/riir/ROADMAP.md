@@ -29,7 +29,7 @@ For a stealth low-latency assistant, **B** is probably the right destination —
 
 Ordered by **architectural leverage**, not size. Each step ends with a smaller, more honest frontend and is independently shippable.
 
-1. **Database → Rust.** `tauri-plugin-sql` + `src/lib/database/*` (~740 LOC) → `sqlx` or `rusqlite` owned in Rust, exposed as narrow commands (`list_chats`, `append_message`, `delete_chat`, `list_prompts`, …). Migrations already live in `src-tauri/src/db/migrations/`; queries are in TS. Biggest single bug-class deletion in the project.
+1. [x] **Database → Rust.** `tauri-plugin-sql` + `src/lib/database/*` (~740 LOC) → `sqlx` or `rusqlite` owned in Rust, exposed as narrow commands (`list_chats`, `append_message`, `delete_chat`, `list_prompts`, …). Migrations already live in `src-tauri/src/db/migrations/`; queries are in TS. Biggest single bug-class deletion in the project.
 2. **LLM streaming → Rust.** `src/lib/functions/ai-response.function.ts` + `useChatCompletion.ts` (~700 LOC) → finish what `src-tauri/src/api.rs` (1167 LOC) started. `reqwest` + structured concurrency, emit tokens as Tauri events. Keys never enter JS memory.
 3. **STT → Rust.** `src/lib/functions/stt.function.ts` + `useSystemAudio.ts` → move next to `capture.rs` / `speaker/`. Audio bytes currently round-trip through JS for no reason.
 4. **Storage / config → Rust.** `src/lib/storage/*` (~620 LOC) — providers, shortcuts, response settings, prompt config. Rust becomes the source of truth; frontend reads via commands and listens for change events. Kills `customizable.storage.ts`, `helper.ts`, and most of `useSettings`/`useShortcuts`/`useCustomProvider`/`useCustomSttProviders`.
