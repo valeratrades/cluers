@@ -64,7 +64,6 @@ interface SettingsPanelProps {
   isCalibrating: boolean;
   calibrationError: string;
   lastCalibration: VadCalibration | null;
-  isCapturing: boolean;
   // Context settings
   useSystemPrompt: boolean;
   setUseSystemPrompt: (value: boolean) => void;
@@ -79,7 +78,6 @@ export const SettingsPanel = ({
   isCalibrating,
   calibrationError,
   lastCalibration,
-  isCapturing,
   useSystemPrompt,
   setUseSystemPrompt,
   contextContent,
@@ -183,13 +181,9 @@ export const SettingsPanel = ({
                     size="sm"
                     variant="outline"
                     onClick={() => onCalibrate(3)}
-                    disabled={isCalibrating || isCapturing}
+                    disabled={isCalibrating}
                     className="h-7 text-[10px] gap-1.5"
-                    title={
-                      isCapturing
-                        ? "Stop the current capture session to calibrate"
-                        : "Sample 3s of ambient audio and set thresholds"
-                    }
+                    title="Sample 3s of ambient audio and set thresholds"
                   >
                     {isCalibrating ? (
                       <>

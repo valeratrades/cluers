@@ -934,7 +934,21 @@ export function useSystemAudio() {
       if (isCalibrating) return;
       setCalibrationError("");
       setIsCalibrating(true);
+      const wasCapturing = capturing;
       try {
+        // Release the audio device before calibrating.
+        if (wasCapturing) {
+          try {
+            await invoke("stop_system_audio_capture");
+            setCapturing(false);
+          } catch (e) {
+            setCalibrationError(
+              `Failed to pause capture: ${e instanceof Error ? e.message : String(e)}`
+            );
+            return;
+          }
+        }
+
         const deviceId =
           selectedAudioDevices.output.id !== "default"
             ? selectedAudioDevices.output.id
@@ -952,6 +966,26 @@ export function useSystemAudio() {
           peak_threshold: result.peak_threshold,
           noise_gate_threshold: result.noise_gate_threshold,
         });
+
+        // Restart capture if we paused it, picking up the new thresholds.
+        if (wasCapturing) {
+          try {
+            setCapturing(true);
+            await invoke("start_system_audio_capture", {
+              vadConfig: {
+                ...vadConfig,
+                sensitivity_rms: result.sensitivity_rms,
+                peak_threshold: result.peak_threshold,
+                noise_gate_threshold: result.noise_gate_threshold,
+              },
+              deviceId,
+            });
+          } catch (e) {
+            setError(
+              `Calibration applied but restarting capture failed: ${e instanceof Error ? e.message : String(e)}`
+            );
+          }
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setCalibrationError(msg);
@@ -959,7 +993,7 @@ export function useSystemAudio() {
         setIsCalibrating(false);
       }
     },
-    [isCalibrating, selectedAudioDevices.output.id, updateVadConfiguration, vadConfig]
+    [isCalibrating, capturing, selectedAudioDevices.output.id, updateVadConfiguration, vadConfig, setError]
   );
 
   useEffect(() => {

@@ -291,7 +291,6 @@ export const SystemAudio = (props: useSystemAudioType) => {
                       isCalibrating={isCalibrating}
                       calibrationError={calibrationError}
                       lastCalibration={lastCalibration}
-                      isCapturing={capturing}
                       useSystemPrompt={useSystemPrompt}
                       setUseSystemPrompt={setUseSystemPrompt}
                       contextContent={contextContent}
