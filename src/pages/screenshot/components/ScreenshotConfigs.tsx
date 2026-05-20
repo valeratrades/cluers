@@ -15,7 +15,6 @@ export const ScreenshotConfigs = ({
   handleScreenshotModeChange,
   handleScreenshotPromptChange,
   handleScreenshotEnabledChange,
-  hasActiveLicense,
 }: UseSettingsReturn) => {
   return (
     <div id="screenshot" className="space-y-3">

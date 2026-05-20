@@ -267,6 +267,7 @@ const View = () => {
                     setMicOpen={completion.setMicOpen}
                     isRecording={completion.isRecording}
                     setIsRecording={completion.setIsRecording}
+                    disabled={!supportsImages}
                   />
                   <ChatScreenshot
                     screenshotConfiguration={completion.screenshotConfiguration}

@@ -2,7 +2,6 @@ import { useState } from "react";
 import { Button } from "@/components";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ANALYTICS_EVENTS, captureEvent } from "@/lib";
 
 interface CheckoutResponse {
   success?: boolean;
@@ -35,8 +34,6 @@ export const GetLicense = ({
       console.error("Failed to get checkout URL:", err);
     } finally {
       setIsCheckoutLoading(false);
-      // Track get license
-      await captureEvent(ANALYTICS_EVENTS.GET_LICENSE);
     }
   };
 

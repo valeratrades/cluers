@@ -22,18 +22,6 @@ import {
   PopoverTrigger,
 } from "@/components";
 
-interface ActivationResponse {
-  activated: boolean;
-  error?: string;
-  license_key?: string;
-  instance?: {
-    id: string;
-    name: string;
-    created_at: string;
-  };
-  is_dev_license?: boolean;
-}
-
 interface Model {
   provider: string;
   name: string;
