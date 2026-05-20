@@ -1,5 +1,4 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-mod activate;
 mod api;
 mod capture;
 mod db;
@@ -44,7 +43,6 @@ pub fn run() {
             is_hidden: Mutex::new(false),
         })
         .manage(shortcuts::RegisteredShortcuts::default())
-        .manage(shortcuts::LicenseState::default())
         .manage(shortcuts::MoveWindowState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -83,14 +81,9 @@ pub fn run() {
             shortcuts::get_registered_shortcuts,
             shortcuts::update_shortcuts,
             shortcuts::validate_shortcut_key,
-            shortcuts::set_license_status,
             shortcuts::set_app_icon_visibility,
             shortcuts::set_always_on_top,
             shortcuts::exit_app,
-            activate::activate_license_api,
-            activate::deactivate_license_api,
-            activate::validate_license_api,
-            activate::get_checkout_url,
             api::transcribe_audio,
             api::fetch_models,
             api::fetch_prompts,
@@ -102,9 +95,6 @@ pub fn run() {
             llm::commands::list_provider_secret_names,
             llm::commands::delete_provider_secret,
             llm::commands::delete_all_provider_secrets,
-            llm::commands::pluely_license_status,
-            llm::commands::pluely_license_set,
-            llm::commands::pluely_license_clear,
             llm::commands::pluely_selected_model_get,
             llm::commands::pluely_selected_model_set,
             db::commands::list_conversation_summaries,

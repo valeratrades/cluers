@@ -30,8 +30,6 @@ pub struct ApiResponseConfig {
     pub customer_id: Option<i64>,
     pub customer_email: Option<String>,
     pub customer_name: Option<String>,
-    pub license_key: String,
-    pub instance_id: String,
     #[serde(rename = "user_audio")]
     pub user_audio: Option<UserAudioConfig>,
     pub errors: Option<Vec<ApiConfigError>>,
@@ -80,18 +78,11 @@ pub async fn fetch_api_response_config(
         .id
         .ok_or_else(|| LlmError::PluelyConfig("machine_uid empty".to_string()))?;
 
-    let license_key = secrets::pluely_license_key()?
-        .ok_or(LlmError::PluelyUnlicensed)?;
-    let instance_id = secrets::pluely_instance_id()?
-        .ok_or(LlmError::PluelyUnlicensed)?;
-
     let url = format!("{}/api/response", endpoint);
     let mut req = http
         .get(&url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", access_key))
-        .header("license_key", &license_key)
-        .header("instance", &instance_id)
         .header("machine_id", &machine_id);
     if let Some(p) = provider {
         req = req.header("provider", p);
@@ -154,8 +145,6 @@ pub async fn report_api_error(
 ) {
     let Ok(endpoint) = get_app_endpoint() else { return };
     let Ok(access_key) = get_api_access_key() else { return };
-    let Ok(Some(license_key)) = secrets::pluely_license_key() else { return };
-    let Ok(Some(instance_id)) = secrets::pluely_instance_id() else { return };
     let stored_model = secrets::pluely_selected_model_get().ok().flatten();
 
     let machine_id = match app.machine_uid().get_machine_uid() {
@@ -178,8 +167,6 @@ pub async fn report_api_error(
         "machine_id": machine_id,
         "error_message": error_message,
         "app_version": app_version,
-        "instance": instance_id,
-        "license_key": license_key,
         "endpoint": endpoint_path,
         "model": final_model,
         "provider": final_provider,
@@ -206,8 +193,6 @@ async fn user_activity(
 ) {
     let Ok(endpoint) = get_app_endpoint() else { return };
     let Ok(access_key) = get_api_access_key() else { return };
-    let Ok(Some(license_key)) = secrets::pluely_license_key() else { return };
-    let Ok(Some(instance_id)) = secrets::pluely_instance_id() else { return };
     let stored_model = secrets::pluely_selected_model_get().ok().flatten();
     let machine_id = match app.machine_uid().get_machine_uid() {
         Ok(id) => id.id.unwrap_or_default(),
@@ -223,8 +208,6 @@ async fn user_activity(
         .unwrap_or(configured_model);
 
     let mut payload = serde_json::json!({
-        "license": license_key,
-        "instance": instance_id,
         "machine_id": machine_id,
         "app_version": app_version,
         "ai_model": ai_model,
@@ -252,10 +235,6 @@ pub async fn stream_pluely(
     channel: &Channel<StreamEvent>,
     cancel_rx: &mut oneshot::Receiver<()>,
 ) -> Result<String, LlmError> {
-    if !secrets::pluely_license_status()? {
-        return Err(LlmError::PluelyUnlicensed);
-    }
-
     let selected_model = secrets::pluely_selected_model_get()?;
     let (provider_name, model_name) = selected_model
         .as_ref()

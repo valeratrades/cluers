@@ -168,22 +168,7 @@ export function deleteAllProviderSecrets(providerId: string): Promise<void> {
   return invoke("delete_all_provider_secrets", { providerId });
 }
 
-// -- Pluely license + selected model -----------------------------------------
-
-export function pluelyLicenseStatus(): Promise<boolean> {
-  return invoke("pluely_license_status");
-}
-
-export function pluelyLicenseSet(
-  licenseKey: string,
-  instanceId: string
-): Promise<void> {
-  return invoke("pluely_license_set", { licenseKey, instanceId });
-}
-
-export function pluelyLicenseClear(): Promise<void> {
-  return invoke("pluely_license_clear");
-}
+// -- Pluely selected model ---------------------------------------------------
 
 export function pluelySelectedModelGet(): Promise<Model | null> {
   return invoke("pluely_selected_model_get");

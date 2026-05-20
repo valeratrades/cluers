@@ -1,6 +1,5 @@
 import { safeLocalStorage } from "../storage";
 import { STORAGE_KEYS } from "@/config";
-import { pluelyLicenseStatus } from "@/lib/llm";
 
 /**
  * UI-side gate for "should we treat the user as on the Pluely-hosted
@@ -13,8 +12,7 @@ export async function shouldUsePluelyAPI(): Promise<boolean> {
   try {
     const pluelyApiEnabled =
       safeLocalStorage.getItem(STORAGE_KEYS.PLUELY_API_ENABLED) === "true";
-    if (!pluelyApiEnabled) return false;
-    return await pluelyLicenseStatus();
+    return pluelyApiEnabled;
   } catch (error) {
     console.warn("Failed to check Pluely API availability:", error);
     return false;

@@ -9,8 +9,8 @@ const Contribute = () => {
             Contribute to Pluely, Earn Lifetime Access
           </CardTitle>
           <CardDescription className="text-[10px] lg:text-xs">
-            Fix a listed critical issue and earn a lifetime Dev Pro license
-            valued at $120. Only issues on our contribute page qualify. read
+            Fix a listed critical issue and earn recognition. Only issues on
+            our contribute page qualify. Read more
             more at pluely.com/contribute
           </CardDescription>
         </div>

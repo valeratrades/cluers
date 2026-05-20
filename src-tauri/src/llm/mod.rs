@@ -48,8 +48,6 @@ pub enum LlmError {
     MissingVariable(String),
     #[error("invalid curl: {0}")]
     InvalidCurl(&'static str),
-    #[error("pluely unlicensed")]
-    PluelyUnlicensed,
     #[error("pluely config: {0}")]
     PluelyConfig(String),
     #[error("provider api {status}: {body}")]

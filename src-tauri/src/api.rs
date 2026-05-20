@@ -1,8 +1,7 @@
 //! Pluely-backed remote endpoints other than LLM streaming.
 //!
-//! LLM streaming, provider secrets, license credential storage, and the
-//! `/api/response` configuration helper live in `crate::llm`. What
-//! stays here is:
+//! LLM streaming, provider secrets, and the `/api/response` configuration
+//! helper live in `crate::llm`. What stays here is:
 //! - STT (`transcribe_audio`) and its audio-only helpers (Phase 1.3 will
 //!   relocate STT into a dedicated module);
 //! - Pluely-side catalog endpoints: `fetch_models`, `fetch_prompts`,
@@ -260,12 +259,6 @@ pub async fn fetch_models(app: AppHandle) -> Result<Vec<Model>, String> {
     let app_endpoint = get_app_endpoint()?;
     let api_access_key = get_api_access_key()?;
 
-    let license_key = secrets::pluely_license_key()
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    let instance_id = secrets::pluely_instance_id()
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
     let machine_id = app
         .machine_uid()
         .get_machine_uid()
@@ -281,8 +274,6 @@ pub async fn fetch_models(app: AppHandle) -> Result<Vec<Model>, String> {
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_access_key))
-        .header("license_key", &license_key)
-        .header("instance", &instance_id)
         .header("machine_id", &machine_id)
         .header("app_version", &app_version)
         .send()
@@ -361,12 +352,6 @@ pub async fn generate_system_prompt_via_api(
 ) -> Result<SystemPromptResponse, String> {
     let app_endpoint = get_app_endpoint()?;
     let api_access_key = get_api_access_key()?;
-    let license_key = secrets::pluely_license_key()
-        .map_err(|e| e.to_string())?
-        .ok_or("No license found. Please activate your license first.")?;
-    let instance_id = secrets::pluely_instance_id()
-        .map_err(|e| e.to_string())?
-        .ok_or("No license found. Please activate your license first.")?;
     let machine_id: String = app
         .machine_uid()
         .get_machine_uid()
@@ -382,8 +367,6 @@ pub async fn generate_system_prompt_via_api(
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_access_key))
-        .header("license_key", &license_key)
-        .header("instance", &instance_id)
         .header("machine_id", &machine_id)
         .header("app_version", &app_version)
         .json(&serde_json::json!({ "user_prompt": user_prompt }))
@@ -419,12 +402,6 @@ pub async fn generate_system_prompt_via_api(
 pub async fn get_activity(app: AppHandle) -> Result<serde_json::Value, String> {
     let app_endpoint = get_app_endpoint()?;
     let api_access_key = get_api_access_key()?;
-    let license_key = secrets::pluely_license_key()
-        .map_err(|e| e.to_string())?
-        .ok_or("No license found. Please activate your license first.")?;
-    let instance_id = secrets::pluely_instance_id()
-        .map_err(|e| e.to_string())?
-        .ok_or("No license found. Please activate your license first.")?;
 
     let machine_id = match app.machine_uid().get_machine_uid() {
         Ok(id) => id.id.unwrap_or_default(),
@@ -442,8 +419,6 @@ pub async fn get_activity(app: AppHandle) -> Result<serde_json::Value, String> {
     let response = client
         .get(&activity_url)
         .header("Authorization", format!("Bearer {}", api_access_key))
-        .header("license_key", &license_key)
-        .header("instance_name", &instance_id)
         .header("machine_id", machine_id)
         .header("app_version", app_version)
         .send()

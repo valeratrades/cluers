@@ -156,21 +156,6 @@ pub fn delete_all_provider_secrets(provider_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn pluely_license_status() -> Result<bool, String> {
-    secrets::pluely_license_status().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn pluely_license_set(license_key: String, instance_id: String) -> Result<(), String> {
-    secrets::pluely_license_set(&license_key, &instance_id).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn pluely_license_clear() -> Result<(), String> {
-    secrets::pluely_license_clear().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub fn pluely_selected_model_get() -> Result<Option<pluely::Model>, String> {
     secrets::pluely_selected_model_get().map_err(|e| e.to_string())
 }

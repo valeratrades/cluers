@@ -6,8 +6,6 @@
 //! |------------------------|-----------------------------|--------------------|
 //! | Provider secret value  | `pluely.provider.<id>`      | `<variable_name>`  |
 //! | Provider names index   | `pluely.provider.<id>`      | `__names__` (JSON) |
-//! | Pluely license key     | `pluely.license`            | `license_key`      |
-//! | Pluely instance id     | `pluely.license`            | `instance_id`      |
 //! | Pluely selected model  | `pluely.license`            | `selected_model`   |
 //!
 //! `keyring-rs` v3 has no portable "list entries by service" primitive,
@@ -21,8 +19,6 @@ const SVC_PROVIDER_PREFIX: &str = "pluely.provider.";
 const SVC_LICENSE: &str = "pluely.license";
 
 const ACCT_NAMES: &str = "__names__";
-const ACCT_LICENSE_KEY: &str = "license_key";
-const ACCT_INSTANCE_ID: &str = "instance_id";
 const ACCT_SELECTED_MODEL: &str = "selected_model";
 
 fn entry(service: &str, account: &str) -> Result<Entry, LlmError> {
@@ -102,30 +98,6 @@ pub fn delete_all_provider_secrets(provider_id: &str) -> Result<(), LlmError> {
         delete(&svc, n)?;
     }
     delete(&svc, ACCT_NAMES)
-}
-
-pub fn pluely_license_status() -> Result<bool, LlmError> {
-    Ok(read_opt(SVC_LICENSE, ACCT_LICENSE_KEY)?.is_some()
-        && read_opt(SVC_LICENSE, ACCT_INSTANCE_ID)?.is_some())
-}
-
-pub fn pluely_license_key() -> Result<Option<String>, LlmError> {
-    read_opt(SVC_LICENSE, ACCT_LICENSE_KEY)
-}
-
-pub fn pluely_instance_id() -> Result<Option<String>, LlmError> {
-    read_opt(SVC_LICENSE, ACCT_INSTANCE_ID)
-}
-
-pub fn pluely_license_set(license_key: &str, instance_id: &str) -> Result<(), LlmError> {
-    write(SVC_LICENSE, ACCT_LICENSE_KEY, license_key)?;
-    write(SVC_LICENSE, ACCT_INSTANCE_ID, instance_id)
-}
-
-pub fn pluely_license_clear() -> Result<(), LlmError> {
-    delete(SVC_LICENSE, ACCT_LICENSE_KEY)?;
-    delete(SVC_LICENSE, ACCT_INSTANCE_ID)?;
-    delete(SVC_LICENSE, ACCT_SELECTED_MODEL)
 }
 
 pub fn pluely_selected_model_get() -> Result<Option<Model>, LlmError> {

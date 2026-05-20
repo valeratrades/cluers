@@ -3,8 +3,6 @@ import { KeyIcon, TrashIcon, LoaderIcon, ChevronDown } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useApp } from "@/contexts";
 import {
-  pluelyLicenseStatus,
-  pluelyLicenseClear,
   pluelySelectedModelGet,
   pluelySelectedModelSet,
 } from "@/lib";
@@ -54,9 +52,7 @@ export const PluelyApiSetup = () => {
   const {
     pluelyApiEnabled,
     setPluelyApiEnabled,
-    hasActiveLicense,
     setHasActiveLicense,
-    getActiveLicenseStatus,
     setSupportsImages,
   } = useApp();
 
@@ -103,14 +99,11 @@ export const PluelyApiSetup = () => {
 
   const loadLicenseStatus = async () => {
     try {
-      const [hasLicense, model] = await Promise.all([
-        pluelyLicenseStatus(),
-        pluelySelectedModelGet(),
-      ]);
-      setHasStoredLicense(hasLicense);
+      const model = await pluelySelectedModelGet();
+      setHasStoredLicense(true);
       setSelectedModel((model as Model | null) ?? null);
     } catch (err) {
-      console.error("Failed to load license status:", err);
+      console.error("Failed to load model status:", err);
       setHasStoredLicense(false);
       setSelectedModel(null);
     }
@@ -127,34 +120,14 @@ export const PluelyApiSetup = () => {
     setSuccess(null);
 
     try {
-      const response: ActivationResponse = await invoke(
-        "activate_license_api",
-        {
-          licenseKey: licenseKey.trim(),
-        }
-      );
-
-      if (response.activated && response.instance) {
-        // The Rust `activate_license_api` command already wrote the
-        // license key and instance id into the keychain on success — JS
-        // does not (and cannot) re-persist secrets from here.
-        setSuccess("License activated successfully!");
-        setLicenseKey(""); // Clear the input
-
-        // Auto-enable Pluely API when license is activated
-        if (!response?.is_dev_license) {
-          setPluelyApiEnabled(true);
-        }
-
-        await loadLicenseStatus(); // Reload status
-        await fetchModels();
-        await getActiveLicenseStatus();
-      } else {
-        setError(response.error || "Failed to activate license");
-      }
+      setSuccess("Pluely is now unlicensed — all features are unlocked!");
+      setLicenseKey("");
+      setPluelyApiEnabled(true);
+      await loadLicenseStatus();
+      await fetchModels();
     } catch (err) {
-      console.error("License activation failed:", err);
-      setError(typeof err === "string" ? err : "Failed to activate license");
+      console.error("Operation failed:", err);
+      setError(typeof err === "string" ? err : "Operation failed");
     } finally {
       setIsLoading(false);
     }
@@ -166,23 +139,15 @@ export const PluelyApiSetup = () => {
     setSuccess(null);
     setHasActiveLicense(false);
     try {
-      // Clears license_key, instance_id, and selected_pluely_model from
-      // the keychain in one shot (see `secrets::pluely_license_clear`).
-      await pluelyLicenseClear();
-
-      setSuccess("License removed successfully!");
-
-      // Disable Pluely API when license is removed
+      setSuccess("Model selection cleared!");
       setPluelyApiEnabled(false);
-
       await fetchModels();
-      await loadLicenseStatus(); // Reload status
+      await loadLicenseStatus();
     } catch (err) {
-      console.error("Failed to remove license:", err);
-      setError("Failed to remove license");
+      console.error("Failed to clear:", err);
+      setError("Failed to clear");
     } finally {
       setIsLoading(false);
-      await invoke("deactivate_license_api");
     }
   };
 
@@ -443,7 +408,7 @@ export const PluelyApiSetup = () => {
         <Switch
           checked={pluelyApiEnabled}
           onCheckedChange={setPluelyApiEnabled}
-          disabled={!hasStoredLicense || !hasActiveLicense} // Disable if no license is stored
+          disabled={!hasStoredLicense}
         />
       </div>
     </div>
