@@ -55,6 +55,19 @@ export interface VadCalibration {
   noise_gate_threshold: number;
 }
 
+// Appended to the system prompt for the system-audio listening path.
+// Tells the model to emit literal "SKIP" when the latest transcribed
+// chunk looks like a partial fragment; the UI then keeps the previous
+// response visible instead of overwriting it.
+const SYSTEM_AUDIO_SKIP_INSTRUCTION =
+  "You are receiving live transcribed speech from system audio, which may " +
+  "arrive in incomplete chunks. If the current input is clearly only a " +
+  "partial fragment (cut off mid-sentence, missing the actual question, or " +
+  "otherwise insufficient to give a meaningful answer), reply with exactly " +
+  "the single word SKIP (uppercase, no punctuation, no other text). The UI " +
+  "will keep the previous response displayed and wait for the next chunk. " +
+  "Otherwise respond normally.";
+
 // OPTIMIZED VAD defaults - matches backend exactly for perfect performance
 const DEFAULT_VAD_CONFIG: VadConfig = {
   enabled: true,
@@ -138,12 +151,21 @@ export function useSystemAudio() {
     attachedFiles,
   } = useApp();
   const currentRequestIdRef = useRef<string | null>(null);
+  // Mirrors `lastTranscription` so the speech-detected handler (whose
+  // useEffect intentionally does not depend on it) can snapshot the
+  // previous transcription before overwriting it. Needed to restore
+  // when the model replies with "SKIP".
+  const lastTranscriptionRef = useRef<string>("");
   const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isSavingRef = useRef<boolean>(false);
   // IDs of messages already written to the DB. Diffed against
   // conversation.messages on each debounced sync to append only the new ones.
   const persistedIdsRef = useRef<Set<string>>(new Set());
   const scrollAreaRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    lastTranscriptionRef.current = lastTranscription;
+  }, [lastTranscription]);
 
   // Load context settings and VAD config from localStorage on mount
   useEffect(() => {
@@ -321,6 +343,9 @@ export function useSystemAudio() {
                 timeoutPromise,
               ]);
 
+              // Snapshot before overwriting so we can restore if the model
+              // replies with "SKIP".
+              const previousTranscription = lastTranscriptionRef.current;
               setLastTranscription(transcription);
               setError("");
 
@@ -332,11 +357,14 @@ export function useSystemAudio() {
                 return { role: msg.role, content: msg.content };
               });
 
-              await processWithAI(
+              const wasSkipped = await processWithAI(
                 transcription,
                 effectiveSystemPrompt,
                 previousMessages
               );
+              if (wasSkipped) {
+                setLastTranscription(previousTranscription);
+              }
             } catch (sttError: any) {
               if (sttError instanceof NoTranscriptionError) {
                 // No speech recognized (e.g. keyboard typing, background noise).
@@ -527,13 +555,17 @@ export function useSystemAudio() {
     }
   }, [isContinuousMode, isRecordingInContinuousMode]);
 
-  // AI Processing function
+  // AI Processing function. Returns `true` if the model emitted exactly
+  // "SKIP" (signalling the input was only a partial fragment), in which
+  // case the previously-displayed response has been restored and the
+  // caller should also restore any other state it overwrote (e.g. the
+  // transcription).
   const processWithAI = useCallback(
     async (
       transcription: string,
       prompt: string,
       previousMessages: HistoryMessage[]
-    ) => {
+    ): Promise<boolean> => {
       // Cancel any previous in-flight AI request before starting a new one.
       if (currentRequestIdRef.current) {
         cancelChat(currentRequestIdRef.current).catch(() => {});
@@ -541,9 +573,16 @@ export function useSystemAudio() {
       const requestId = generateRequestId();
       currentRequestIdRef.current = requestId;
 
+      // Snapshotted via the setLastAIResponse functional updater below so
+      // we can restore the previous response if the model emits "SKIP".
+      let previousAIResponse = "";
+
       try {
         setIsAIProcessing(true);
-        setLastAIResponse("");
+        setLastAIResponse((prev) => {
+          previousAIResponse = prev;
+          return "";
+        });
         setError("");
 
         let fullResponse = "";
@@ -551,7 +590,7 @@ export function useSystemAudio() {
         const usePluelyAPI = await shouldUsePluelyAPI();
         if (!selectedAIProvider.provider && !usePluelyAPI) {
           setError("No AI provider selected.");
-          return;
+          return false;
         }
 
         const provider = allAiProviders.find(
@@ -559,7 +598,7 @@ export function useSystemAudio() {
         );
         if (!provider && !usePluelyAPI) {
           setError("AI provider config not found.");
-          return;
+          return false;
         }
 
         const providerInput: ProviderInput = usePluelyAPI
@@ -588,12 +627,14 @@ export function useSystemAudio() {
           for await (const chunk of streamChat({
             provider: providerInput,
             message: transcription,
-            systemPrompt: buildEnhancedSystemPrompt(prompt),
+            systemPrompt: buildEnhancedSystemPrompt(
+              `${prompt}\n\n${SYSTEM_AUDIO_SKIP_INSTRUCTION}`
+            ),
             history: previousMessages,
             attachedFiles,
             requestId,
           })) {
-            if (currentRequestIdRef.current !== requestId) return;
+            if (currentRequestIdRef.current !== requestId) return false;
             fullResponse += chunk;
             setLastAIResponse((prev) => prev + chunk);
           }
@@ -601,6 +642,15 @@ export function useSystemAudio() {
           if (currentRequestIdRef.current === requestId) {
             setError(aiError.message || "Failed to get AI response");
           }
+        }
+
+        // The model has signalled the current input was only a partial
+        // fragment - restore the previously-displayed response and skip
+        // saving anything to the conversation. The caller is responsible
+        // for restoring the transcription it set.
+        if (fullResponse.trim() === "SKIP") {
+          setLastAIResponse(previousAIResponse);
+          return true;
         }
 
         if (fullResponse) {
@@ -632,6 +682,7 @@ export function useSystemAudio() {
         setIsAIProcessing(false);
         // No auto-restart - user manually controls when to start next recording
       }
+      return false;
     },
     [selectedAIProvider, allAiProviders, conversation.messages, attachedFiles]
   );
