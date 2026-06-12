@@ -53,7 +53,7 @@ export const Files = ({
             className="cursor-pointer"
             title={
               supportsImages
-                ? "Attach images or PDFs"
+                ? "Attach images, PDFs or text files"
                 : "File upload not supported by current AI provider"
             }
           >
@@ -167,7 +167,7 @@ export const Files = ({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf"
+        accept="image/*,application/pdf,text/*,.md,.markdown,.txt"
         onChange={handleFileSelect}
         className="hidden"
       />

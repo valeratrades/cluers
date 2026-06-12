@@ -6,7 +6,7 @@ export const AI_PROVIDERS = [
   -H "Authorization: Bearer {{API_KEY}}" \\
   -d '{
     "model": "{{MODEL}}",
-    "messages": [{"role": "system", "content": "{{SYSTEM_PROMPT}}"}, {"role": "user", "content": [{"type": "text", "text": "{{TEXT}}"}, {"type": "image_url", "image_url": {"url": "data:{{IMAGE_MIME}};base64,{{IMAGE}}"}}]}]
+    "messages": [{"role": "system", "content": "{{SYSTEM_PROMPT}}"}, {"role": "user", "content": [{"type": "text", "text": "{{TEXT}}"}, {"type": "image_url", "image_url": {"url": "data:{{IMAGE_MIME}};base64,{{IMAGE}}"}}, {"type": "file", "file": {"filename": "{{DOCUMENT_NAME}}", "file_data": "data:application/pdf;base64,{{DOCUMENT}}"}}]}]
   }'`,
     responseContentPath: "choices[0].message.content",
     streaming: true,
@@ -58,7 +58,7 @@ export const AI_PROVIDERS = [
   -H "Authorization: Bearer {{API_KEY}}" \\
   -d '{
     "model": "{{MODEL}}",
-    "messages": [{"role": "system", "content": "{{SYSTEM_PROMPT}}"}, {"role": "user", "content": [{"type": "text", "text": "{{TEXT}}"}, {"type": "image_url", "image_url": "data:{{IMAGE_MIME}};base64,{{IMAGE}}"}]}]
+    "messages": [{"role": "system", "content": "{{SYSTEM_PROMPT}}"}, {"role": "user", "content": [{"type": "text", "text": "{{TEXT}}"}, {"type": "image_url", "image_url": "data:{{IMAGE_MIME}};base64,{{IMAGE}}"}, {"type": "document_url", "document_url": "data:application/pdf;base64,{{DOCUMENT}}"}]}]
   }'`,
     responseContentPath: "choices[0].message.content",
     streaming: true,
@@ -113,7 +113,7 @@ export const AI_PROVIDERS = [
   -H "Authorization: Bearer {{API_KEY}}" \
   -d '{
     "model": "{{MODEL}}",
-    "messages": [{"role": "system", "content": "{{SYSTEM_PROMPT}}"}, {"role": "user", "content": [{"type": "text", "text": "{{TEXT}}"}, {"type": "image_url", "image_url": {"url": "data:{{IMAGE_MIME}};base64,{{IMAGE}}"}}]}]
+    "messages": [{"role": "system", "content": "{{SYSTEM_PROMPT}}"}, {"role": "user", "content": [{"type": "text", "text": "{{TEXT}}"}, {"type": "image_url", "image_url": {"url": "data:{{IMAGE_MIME}};base64,{{IMAGE}}"}}, {"type": "file", "file": {"filename": "{{DOCUMENT_NAME}}", "file_data": "data:application/pdf;base64,{{DOCUMENT}}"}}]}]
   }'`,
     responseContentPath: "choices[0].message.content",
     streaming: true,

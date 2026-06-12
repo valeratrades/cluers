@@ -64,10 +64,41 @@ pub async fn stream_chat(
 
     let http = state.http.clone();
     let is_pluely = request.provider.is_pluely_hosted;
-    let result = if is_pluely {
-        pluely::stream_pluely(&app, &http, request, &channel, &mut cancel_rx).await
-    } else {
-        provider::stream_custom(&http, &state.secrets, request, &channel, &mut cancel_rx).await
+
+    // Text attachments are inlined into the message here so both streaming
+    // paths see them uniformly; only images and PDFs survive as structured
+    // attachments. Errors must flow through `result` — an early return
+    // would leave the JS-side generator waiting on the channel forever.
+    let mut request = request;
+    let (binary, text): (Vec<_>, Vec<_>) = request
+        .attached_files
+        .drain(..)
+        .partition(|f| f.mime.starts_with("image/") || f.mime == "application/pdf");
+    request.attached_files = binary;
+    let inlined = text.iter().try_for_each(|f| {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&f.base64)
+            .map_err(|e| LlmError::TextAttachment(f.name.clone(), e.to_string()))?;
+        let content = String::from_utf8(bytes)
+            .map_err(|_| LlmError::TextAttachment(f.name.clone(), "not valid UTF-8".into()))?;
+        request.message = format!(
+            "{}\n\n--- attached file: {} ---\n{}",
+            request.message, f.name, content
+        );
+        Ok(())
+    });
+
+    let result = match inlined {
+        Err(e) => Err(e),
+        Ok(()) => {
+            if is_pluely {
+                pluely::stream_pluely(&app, &http, request, &channel, &mut cancel_rx).await
+            } else {
+                provider::stream_custom(&http, &state.secrets, request, &channel, &mut cancel_rx)
+                    .await
+            }
+        }
     };
 
     {

@@ -131,6 +131,11 @@ export function useSystemAudio() {
   const [calibrationError, setCalibrationError] = useState<string>("");
   const [discardedNotice, setDiscardedNotice] = useState<string>("");
   const discardedTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  // The input was received and understood, but the model explicitly decided
+  // not to answer (SKIP/COPY). Distinct from `discardedNotice`, which means
+  // the input never made it to the model at all.
+  const [skippedNotice, setSkippedNotice] = useState<string>("");
+  const skippedTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [recordingProgress, setRecordingProgress] = useState<number>(0); // For continuous mode
   const [isContinuousMode, setIsContinuousMode] = useState<boolean>(false);
   const [isRecordingInContinuousMode, setIsRecordingInContinuousMode] =
@@ -173,6 +178,7 @@ export function useSystemAudio() {
   useEffect(() => {
     lastTranscriptionRef.current = lastTranscription;
   }, [lastTranscription]);
+
 
   // Load context settings and VAD config from localStorage on mount
   useEffect(() => {
@@ -258,9 +264,13 @@ export function useSystemAudio() {
           setIsRecordingInContinuousMode(false);
         });
 
-        // Speech discarded (too short) - surface so the user can see "almost worked"
+        // Speech discarded (too short / silent) - surface so the user can
+        // see "almost worked"
         discardedUnlisten = await listen("speech-discarded", (event) => {
           const reason = event.payload as string;
+          // A manual stop optimistically enters the processing state; a
+          // discarded recording produces no speech-detected event to leave it.
+          setIsProcessing(false);
           setDiscardedNotice(reason);
           if (discardedTimeoutRef.current) {
             clearTimeout(discardedTimeoutRef.current);
@@ -291,126 +301,156 @@ export function useSystemAudio() {
       if (discardedTimeoutRef.current) {
         clearTimeout(discardedTimeoutRef.current);
       }
+      if (skippedTimeoutRef.current) {
+        clearTimeout(skippedTimeoutRef.current);
+      }
     };
   }, []);
 
-  // Handle single speech detection event (both VAD and continuous modes)
+  // Handle single speech detection event (both VAD and continuous modes).
+  // The Tauri subscription itself is mount-once; the handler is kept fresh
+  // through this ref. A dep-driven resubscribe is racy: `listen` resolves
+  // asynchronously, so a cleanup that runs before it resolves has nothing
+  // to unlisten and leaks a duplicate listener that double-processes every
+  // utterance from then on.
+  const onSpeechDetectedRef = useRef<(base64Audio: string) => Promise<void>>(
+    async () => {}
+  );
+  onSpeechDetectedRef.current = async (base64Audio: string) => {
+    try {
+      if (!capturing) return;
+
+      // Convert to blob
+      const binaryString = atob(base64Audio);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      const audioBlob = new Blob([bytes], { type: "audio/wav" });
+
+      const usePluelyAPI = await shouldUsePluelyAPI();
+      if (!selectedSttProvider.provider && !usePluelyAPI) {
+        setError("No speech provider selected.");
+        return;
+      }
+
+      const providerConfig = allSttProviders.find(
+        (p) => p.id === selectedSttProvider.provider
+      );
+
+      if (!providerConfig && !usePluelyAPI) {
+        setError("Speech provider config not found.");
+        return;
+      }
+
+      setIsProcessing(true);
+
+      // Add timeout wrapper for STT request (30 seconds)
+      const sttPromise = fetchSTT({
+        provider: providerConfig,
+        selectedProvider: selectedSttProvider,
+        audio: audioBlob,
+      });
+
+      const timeoutPromise = new Promise<string>((_, reject) => {
+        setTimeout(
+          () => reject(new Error("Speech transcription timed out (30s)")),
+          30000
+        );
+      });
+
+      try {
+        const transcription = await Promise.race([
+          sttPromise,
+          timeoutPromise,
+        ]);
+
+        // Snapshot before overwriting so we can restore if the model
+        // replies with "SKIP".
+        const previousTranscription = lastTranscriptionRef.current;
+        setLastTranscription(transcription);
+        setError("");
+
+        const effectiveSystemPrompt = useSystemPrompt
+          ? systemPrompt || DEFAULT_SYSTEM_PROMPT
+          : contextContent || DEFAULT_SYSTEM_PROMPT;
+
+        const previousMessages = conversation.messages.map((msg) => {
+          return { role: msg.role, content: msg.content };
+        });
+
+        const skipWord = await processWithAI(
+          transcription,
+          effectiveSystemPrompt,
+          previousMessages
+        );
+        if (skipWord) {
+          setLastTranscription(previousTranscription);
+          // Make the non-answer visibly deliberate: the input WAS
+          // heard and transcribed; the model chose not to reply.
+          setSkippedNotice(
+            `heard "${transcription.slice(0, 120)}" - ${
+              skipWord === "SKIP"
+                ? "judged an incomplete fragment, waiting for the rest"
+                : "judged to need no reply"
+            }`
+          );
+          if (skippedTimeoutRef.current) {
+            clearTimeout(skippedTimeoutRef.current);
+          }
+          skippedTimeoutRef.current = setTimeout(() => {
+            setSkippedNotice("");
+          }, 6000);
+        }
+      } catch (sttError: any) {
+        if (sttError instanceof NoTranscriptionError) {
+          // No speech recognized (e.g. keyboard typing, background noise).
+          // Surface the same way as a too-short segment and skip AI.
+          setDiscardedNotice("no speech recognized");
+          if (discardedTimeoutRef.current) {
+            clearTimeout(discardedTimeoutRef.current);
+          }
+          discardedTimeoutRef.current = setTimeout(() => {
+            setDiscardedNotice("");
+          }, 3500);
+        } else {
+          console.error("STT Error:", sttError);
+          setError(sttError.message || "Failed to transcribe audio");
+          setIsPopoverOpen(true);
+        }
+      }
+    } catch (err) {
+      setError("Failed to process speech");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   useEffect(() => {
+    let disposed = false;
     let speechUnlisten: (() => void) | undefined;
 
-    const setupEventListener = async () => {
-      try {
-        speechUnlisten = await listen("speech-detected", async (event) => {
-          try {
-            if (!capturing) return;
-
-            const base64Audio = event.payload as string;
-            // Convert to blob
-            const binaryString = atob(base64Audio);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-              bytes[i] = binaryString.charCodeAt(i);
-            }
-            const audioBlob = new Blob([bytes], { type: "audio/wav" });
-
-            const usePluelyAPI = await shouldUsePluelyAPI();
-            if (!selectedSttProvider.provider && !usePluelyAPI) {
-              setError("No speech provider selected.");
-              return;
-            }
-
-            const providerConfig = allSttProviders.find(
-              (p) => p.id === selectedSttProvider.provider
-            );
-
-            if (!providerConfig && !usePluelyAPI) {
-              setError("Speech provider config not found.");
-              return;
-            }
-
-            setIsProcessing(true);
-
-            // Add timeout wrapper for STT request (30 seconds)
-            const sttPromise = fetchSTT({
-              provider: providerConfig,
-              selectedProvider: selectedSttProvider,
-              audio: audioBlob,
-            });
-
-            const timeoutPromise = new Promise<string>((_, reject) => {
-              setTimeout(
-                () => reject(new Error("Speech transcription timed out (30s)")),
-                30000
-              );
-            });
-
-            try {
-              const transcription = await Promise.race([
-                sttPromise,
-                timeoutPromise,
-              ]);
-
-              // Snapshot before overwriting so we can restore if the model
-              // replies with "SKIP".
-              const previousTranscription = lastTranscriptionRef.current;
-              setLastTranscription(transcription);
-              setError("");
-
-              const effectiveSystemPrompt = useSystemPrompt
-                ? systemPrompt || DEFAULT_SYSTEM_PROMPT
-                : contextContent || DEFAULT_SYSTEM_PROMPT;
-
-              const previousMessages = conversation.messages.map((msg) => {
-                return { role: msg.role, content: msg.content };
-              });
-
-              const wasSkipped = await processWithAI(
-                transcription,
-                effectiveSystemPrompt,
-                previousMessages
-              );
-              if (wasSkipped) {
-                setLastTranscription(previousTranscription);
-              }
-            } catch (sttError: any) {
-              if (sttError instanceof NoTranscriptionError) {
-                // No speech recognized (e.g. keyboard typing, background noise).
-                // Surface the same way as a too-short segment and skip AI.
-                setDiscardedNotice("no speech recognized");
-                if (discardedTimeoutRef.current) {
-                  clearTimeout(discardedTimeoutRef.current);
-                }
-                discardedTimeoutRef.current = setTimeout(() => {
-                  setDiscardedNotice("");
-                }, 3500);
-              } else {
-                console.error("STT Error:", sttError);
-                setError(sttError.message || "Failed to transcribe audio");
-                setIsPopoverOpen(true);
-              }
-            }
-          } catch (err) {
-            setError("Failed to process speech");
-          } finally {
-            setIsProcessing(false);
-          }
-        });
-      } catch (err) {
+    listen("speech-detected", (event) => {
+      void onSpeechDetectedRef.current(event.payload as string);
+    })
+      .then((unlisten) => {
+        // The subscription may resolve after the effect was already cleaned
+        // up; unlisten immediately instead of leaking it.
+        if (disposed) {
+          unlisten();
+        } else {
+          speechUnlisten = unlisten;
+        }
+      })
+      .catch(() => {
         setError("Failed to setup speech listener");
-      }
-    };
-
-    setupEventListener();
+      });
 
     return () => {
+      disposed = true;
       if (speechUnlisten) speechUnlisten();
     };
-  }, [
-    capturing,
-    selectedSttProvider,
-    allSttProviders,
-    conversation.messages.length,
-  ]);
+  }, []);
 
   // Context management functions
   const saveContextSettings = useCallback(
@@ -562,17 +602,17 @@ export function useSystemAudio() {
     }
   }, [isContinuousMode, isRecordingInContinuousMode]);
 
-  // AI Processing function. Returns `true` if the model emitted exactly
-  // "SKIP" (signalling the input was only a partial fragment), in which
-  // case the previously-displayed response was never overwritten and the
-  // caller should restore any other state it overwrote (e.g. the
-  // transcription).
+  // AI Processing function. Returns the skip word ("SKIP"/"COPY") if the
+  // model explicitly declined to answer, in which case the
+  // previously-displayed response was never overwritten and the caller
+  // should restore any other state it overwrote (e.g. the transcription).
+  // Returns null when a normal answer was produced (or on error).
   const processWithAI = useCallback(
     async (
       transcription: string,
       prompt: string,
       previousMessages: HistoryMessage[]
-    ): Promise<boolean> => {
+    ): Promise<string | null> => {
       // Cancel any previous in-flight AI request before starting a new one.
       if (currentRequestIdRef.current) {
         cancelChat(currentRequestIdRef.current).catch(() => {});
@@ -594,7 +634,7 @@ export function useSystemAudio() {
         const usePluelyAPI = await shouldUsePluelyAPI();
         if (!selectedAIProvider.provider && !usePluelyAPI) {
           setError("No AI provider selected.");
-          return false;
+          return null;
         }
 
         const provider = allAiProviders.find(
@@ -602,7 +642,7 @@ export function useSystemAudio() {
         );
         if (!provider && !usePluelyAPI) {
           setError("AI provider config not found.");
-          return false;
+          return null;
         }
 
         const providerInput: ProviderInput = usePluelyAPI
@@ -638,7 +678,7 @@ export function useSystemAudio() {
             attachedFiles,
             requestId,
           })) {
-            if (currentRequestIdRef.current !== requestId) return false;
+            if (currentRequestIdRef.current !== requestId) return null;
             fullResponse += chunk;
             if (displaying) {
               setLastAIResponse((prev) => prev + chunk);
@@ -658,7 +698,7 @@ export function useSystemAudio() {
         // is still displayed; skip saving anything to the conversation. The
         // caller is responsible for restoring the transcription it set.
         if (SKIP_WORDS.includes(fullResponse.trim())) {
-          return true;
+          return fullResponse.trim();
         }
 
         // Flush a still-buffered response (a prefix of a skip word, but not one).
@@ -695,7 +735,7 @@ export function useSystemAudio() {
         setIsAIProcessing(false);
         // No auto-restart - user manually controls when to start next recording
       }
-      return false;
+      return null;
     },
     [selectedAIProvider, allAiProviders, conversation.messages, attachedFiles]
   );
@@ -980,15 +1020,38 @@ export function useSystemAudio() {
   }, []);
 
   // Update VAD configuration
-  const updateVadConfiguration = useCallback(async (config: VadConfig) => {
-    try {
-      setVadConfig(config);
-      safeLocalStorage.setItem("vad_config", JSON.stringify(config));
-      await invoke("update_vad_config", { config });
-    } catch (error) {
-      console.error("Failed to update VAD config:", error);
-    }
-  }, []);
+  const updateVadConfiguration = useCallback(
+    async (config: VadConfig) => {
+      try {
+        const modeChanged = config.enabled !== vadConfig.enabled;
+        setVadConfig(config);
+        safeLocalStorage.setItem("vad_config", JSON.stringify(config));
+        await invoke("update_vad_config", { config });
+
+        // Switching modes mid-session must also switch the backend capture:
+        // the running VAD loop keeps listening (and auto-transcribing) until
+        // explicitly stopped, so Manual mode would otherwise stay hot.
+        if (modeChanged && capturing) {
+          await invoke("stop_system_audio_capture");
+          setIsRecordingInContinuousMode(false);
+          setVadMetrics(null);
+          if (config.enabled) {
+            const deviceId =
+              selectedAudioDevices.output.id !== "default"
+                ? selectedAudioDevices.output.id
+                : null;
+            await invoke("start_system_audio_capture", {
+              vadConfig: config,
+              deviceId,
+            });
+          }
+        }
+      } catch (error) {
+        console.error("Failed to update VAD config:", error);
+      }
+    },
+    [vadConfig.enabled, capturing, selectedAudioDevices.output.id]
+  );
 
   // Explicit calibration: stop capturing if needed, sample ambient audio,
   // bake the resulting thresholds into vadConfig (which persists via the
@@ -1146,6 +1209,7 @@ export function useSystemAudio() {
     ignoreContinuousRecording,
   ]);
 
+
   return {
     capturing,
     isProcessing,
@@ -1186,6 +1250,7 @@ export function useSystemAudio() {
     // Live VAD telemetry
     vadMetrics,
     discardedNotice,
+    skippedNotice,
     // Calibration
     calibrateVad,
     isCalibrating,

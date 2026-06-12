@@ -421,30 +421,46 @@ async fn run_continuous_capture(
     app.unlisten(stop_listener);
 
     // Process and emit audio
-    if !audio_buffer.is_empty() {
-        // let duration = start_time.elapsed().as_secs_f32();
-
-        // Apply noise gate
-        let cleaned_audio = apply_noise_gate(&audio_buffer, config.noise_gate_threshold);
-        let cleaned_audio = normalize_audio_level(&cleaned_audio, 0.1);
-
-        match samples_to_wav_b64(sr, &cleaned_audio) {
-            Ok(b64) => {
-                if let Err(e) = app.emit("speech-detected", b64) {
-                    error!("Failed to emit speech-detected (continuous): {}", e);
-                }
-            }
-            Err(e) => {
-                error!("Failed to encode continuous audio: {}", e);
-                if let Err(emit_err) = app.emit("audio-encoding-error", e) {
-                    error!("Failed to emit audio-encoding-error: {}", emit_err);
-                }
-            }
-        }
-    } else {
+    if audio_buffer.is_empty() {
         warn!("No audio captured in continuous mode");
         if let Err(e) = app.emit("audio-encoding-error", "No audio recorded") {
             error!("Failed to emit audio-encoding-error: {}", e);
+        }
+    } else {
+        let (_, raw_peak) = calculate_audio_metrics(&audio_buffer);
+        if raw_peak < config.noise_gate_threshold {
+            // Nothing in the recording rises above the noise floor (e.g. the
+            // monitored sink received no signal at all). Sending it to STT
+            // would only produce an empty transcript; tell the user what
+            // happened instead.
+            warn!(
+                "Continuous recording contained no audible signal (peak {:.6}, gate {:.6})",
+                raw_peak, config.noise_gate_threshold
+            );
+            if let Err(e) = app.emit(
+                "speech-discarded",
+                "recording was silent - check that audio is routed to the captured device",
+            ) {
+                error!("Failed to emit speech-discarded (silent): {}", e);
+            }
+        } else {
+            // Apply noise gate
+            let cleaned_audio = apply_noise_gate(&audio_buffer, config.noise_gate_threshold);
+            let cleaned_audio = normalize_audio_level(&cleaned_audio, 0.1);
+
+            match samples_to_wav_b64(sr, &cleaned_audio) {
+                Ok(b64) => {
+                    if let Err(e) = app.emit("speech-detected", b64) {
+                        error!("Failed to emit speech-detected (continuous): {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to encode continuous audio: {}", e);
+                    if let Err(emit_err) = app.emit("audio-encoding-error", e) {
+                        error!("Failed to emit audio-encoding-error: {}", emit_err);
+                    }
+                }
+            }
         }
     }
 

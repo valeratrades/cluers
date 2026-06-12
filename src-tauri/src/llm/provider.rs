@@ -9,9 +9,10 @@
 //! - `--url <url>` and the bare positional URL
 //!
 //! Variable templates use `{{UPPER_SNAKE}}` placeholders. Reserved names
-//! (`TEXT`, `IMAGE`, `IMAGE_MIME`, `AUDIO`, `DOCUMENT`, `SYSTEM_PROMPT`)
-//! are handled by `build_messages` / `substitute_value`; everything else
-//! comes from `Secrets`-cached keychain entries ∪ user_variables.
+//! (`TEXT`, `IMAGE`, `IMAGE_MIME`, `AUDIO`, `DOCUMENT`, `DOCUMENT_NAME`,
+//! `SYSTEM_PROMPT`) are handled by `build_messages` / `substitute_value`;
+//! everything else comes from `Secrets`-cached keychain entries ∪
+//! user_variables.
 
 use crate::db::schema::AttachedFile;
 use crate::llm::{
@@ -300,12 +301,16 @@ fn expand_user_template(
             m
         })
         .collect();
+    // Text attachments were already inlined into the message by
+    // `stream_chat`; the `{{DOCUMENT}}` slot is base64 PDF data only
+    // (provider templates hardcode the application/pdf media type).
     let docs: Vec<HashMap<String, String>> = attached
         .iter()
-        .filter(|f| !f.mime.starts_with("image/"))
+        .filter(|f| f.mime == "application/pdf")
         .map(|f| {
             let mut m = HashMap::new();
             m.insert("DOCUMENT".to_string(), f.base64.clone());
+            m.insert("DOCUMENT_NAME".to_string(), f.name.clone());
             m
         })
         .collect();
@@ -321,7 +326,7 @@ fn replacer(
     match node {
         serde_json::Value::Array(arr) => {
             let arr = expand_one_array(arr, &["IMAGE", "IMAGE_MIME"], images);
-            let arr = expand_one_array(arr, &["DOCUMENT"], docs);
+            let arr = expand_one_array(arr, &["DOCUMENT", "DOCUMENT_NAME"], docs);
             serde_json::Value::Array(
                 arr.into_iter()
                     .map(|v| replacer(v, images, docs))
@@ -376,6 +381,106 @@ fn expand_one_array(
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(
+        template: &str,
+        files: &[(&str, &str, &str)],
+        expected: serde_json::Value,
+    ) {
+        let mut body: serde_json::Value = serde_json::from_str(template).unwrap();
+        let attached: Vec<AttachedFile> = files
+            .iter()
+            .map(|(name, mime, base64)| AttachedFile {
+                id: "t".into(),
+                name: (*name).into(),
+                mime: (*mime).into(),
+                base64: (*base64).into(),
+                size: 0,
+            })
+            .collect();
+        build_messages(&mut body, &[], "hello", &attached);
+        assert_eq!(body, expected);
+    }
+
+    // The user-content shapes below mirror src/config/ai-providers.constants.ts.
+    const OPENAI: &str = r#"{
+        "messages": [
+            {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "{{TEXT}}"},
+                {"type": "image_url", "image_url": {"url": "data:{{IMAGE_MIME}};base64,{{IMAGE}}"}},
+                {"type": "file", "file": {"filename": "{{DOCUMENT_NAME}}", "file_data": "data:application/pdf;base64,{{DOCUMENT}}"}}
+            ]}
+        ]
+    }"#;
+
+    const CLAUDE: &str = r#"{
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "{{TEXT}}"},
+                {"type": "image", "source": {"type": "base64", "media_type": "{{IMAGE_MIME}}", "data": "{{IMAGE}}"}},
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "{{DOCUMENT}}"}}
+            ]}
+        ]
+    }"#;
+
+    #[test]
+    fn no_attachments_drops_attachment_slots() {
+        check(
+            OPENAI,
+            &[],
+            serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
+                    {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+                ]
+            }),
+        );
+    }
+
+    #[test]
+    fn openai_pdf_expands_file_part() {
+        check(
+            OPENAI,
+            &[("report.pdf", "application/pdf", "UERG")],
+            serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "hello"},
+                        {"type": "file", "file": {"filename": "report.pdf", "file_data": "data:application/pdf;base64,UERG"}}
+                    ]}
+                ]
+            }),
+        );
+    }
+
+    #[test]
+    fn claude_pdf_and_image_expand() {
+        check(
+            CLAUDE,
+            &[
+                ("shot.png", "image/png", "SU1H"),
+                ("a.pdf", "application/pdf", "UERG"),
+                ("b.pdf", "application/pdf", "UERHMg=="),
+            ],
+            serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "hello"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "SU1H"}},
+                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "UERG"}},
+                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "UERHMg=="}}
+                    ]}
+                ]
+            }),
+        );
+    }
+}
+
 /// Custom-provider stream entrypoint (the non-Pluely path).
 pub async fn stream_custom(
     http: &reqwest::Client,
@@ -384,6 +489,20 @@ pub async fn stream_custom(
     channel: &Channel<StreamEvent>,
     cancel_rx: &mut oneshot::Receiver<()>,
 ) -> Result<String, LlmError> {
+    // An attachment the template has no slot for would be silently
+    // dropped by `expand_one_array` — reject it up front instead, like
+    // the pre-rewrite JS did ("does not support document input").
+    for f in &request.attached_files {
+        let token = if f.mime.starts_with("image/") {
+            "IMAGE"
+        } else {
+            "DOCUMENT"
+        };
+        if !request.provider.curl.contains(&format!("{{{{{token}}}}}")) {
+            return Err(LlmError::UnsupportedAttachment(token));
+        }
+    }
+
     let p = &request.provider;
     let parsed = parse_curl(&p.curl)?;
 
@@ -406,6 +525,7 @@ pub async fn stream_custom(
         if matches!(
             v.as_str(),
             "SYSTEM_PROMPT" | "TEXT" | "IMAGE" | "IMAGE_MIME" | "AUDIO" | "DOCUMENT"
+                | "DOCUMENT_NAME"
         ) {
             continue;
         }

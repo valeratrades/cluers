@@ -9,6 +9,8 @@ import {
 import {
   HeadphonesIcon,
   AlertCircleIcon,
+  AlertTriangleIcon,
+  InfoIcon,
   LoaderIcon,
   AudioLinesIcon,
   PaperclipIcon,
@@ -64,6 +66,7 @@ export const SystemAudio = (props: useSystemAudioType) => {
     ignoreContinuousRecording,
     vadMetrics,
     discardedNotice,
+    skippedNotice,
     calibrateVad,
     isCalibrating,
     calibrationError,
@@ -271,6 +274,30 @@ export const SystemAudio = (props: useSystemAudioType) => {
                         metrics={vadMetrics}
                         discardedNotice={discardedNotice}
                       />
+                    )}
+
+                    {/* In manual mode the VAD monitor isn't shown, so a
+                        discarded recording (e.g. STT heard no speech) would
+                        otherwise vanish without any feedback. */}
+                    {!isVadMode && discardedNotice && (
+                      <div className="flex items-start gap-1.5 p-2.5 rounded-lg bg-amber-50 border border-amber-200">
+                        <AlertTriangleIcon className="w-3.5 h-3.5 text-amber-500 mt-0.5 flex-shrink-0" />
+                        <p className="text-[10px] text-amber-700 leading-snug">
+                          Recording discarded: {discardedNotice}
+                        </p>
+                      </div>
+                    )}
+
+                    {/* The input was transcribed fine; not answering was the
+                        model's explicit decision (SKIP/COPY). */}
+                    {skippedNotice && (
+                      <div className="flex items-start gap-1.5 p-2.5 rounded-lg bg-blue-50 border border-blue-200">
+                        <InfoIcon className="w-3.5 h-3.5 text-blue-500 mt-0.5 flex-shrink-0" />
+                        <p className="text-[10px] text-blue-700 leading-snug">
+                          Input received, deliberately not answering:{" "}
+                          {skippedNotice}
+                        </p>
+                      </div>
                     )}
 
                     {/* AI Response */}

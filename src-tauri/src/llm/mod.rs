@@ -62,6 +62,10 @@ pub enum LlmError {
     Json(#[from] serde_json::Error),
     #[error("channel: {0}")]
     Channel(String),
+    #[error("text attachment {0}: {1}")]
+    TextAttachment(String, String),
+    #[error("provider template has no {{{{{0}}}}} slot — add one to the curl template to enable this attachment type")]
+    UnsupportedAttachment(&'static str),
     #[error("cancelled")]
     Cancelled,
 }

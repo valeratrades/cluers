@@ -277,6 +277,21 @@ pub async fn stream_pluely(
                 "type": "image_url",
                 "image_url": { "url": format!("data:{};base64,{}", f.mime, f.base64) }
             }));
+        } else {
+            // OpenAI-compatible `file` part. Providers that can't take
+            // PDFs reject the request visibly instead of us silently
+            // dropping the attachment.
+            assert_eq!(
+                f.mime, "application/pdf",
+                "stream_chat forwards only image/* and PDF attachments"
+            );
+            content_parts.push(serde_json::json!({
+                "type": "file",
+                "file": {
+                    "filename": f.name,
+                    "file_data": format!("data:{};base64,{}", f.mime, f.base64)
+                }
+            }));
         }
     }
     messages.push(serde_json::json!({ "role": "user", "content": content_parts }));

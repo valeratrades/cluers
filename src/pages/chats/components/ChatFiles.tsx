@@ -66,7 +66,7 @@ export const ChatFiles = ({
             className="size-7 lg:size-9 rounded-lg lg:rounded-xl"
             title={
               supportsImages
-                ? "Attach images or PDFs"
+                ? "Attach images, PDFs or text files"
                 : "File upload not supported by current AI provider"
             }
           >
@@ -180,7 +180,7 @@ export const ChatFiles = ({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf"
+        accept="image/*,application/pdf,text/*,.md,.markdown,.txt"
         onChange={handleFileSelect}
         className="hidden"
       />

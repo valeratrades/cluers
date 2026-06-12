@@ -219,8 +219,13 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     (e: ChangeEvent<HTMLInputElement>) => {
       const files = Array.from(e.target.files || []);
       files.forEach((file) => {
+        // .md/.txt fall back to extension match — some platforms report an
+        // empty mime for them.
         const accepted =
-          file.type.startsWith("image/") || file.type === "application/pdf";
+          file.type.startsWith("image/") ||
+          file.type === "application/pdf" ||
+          file.type.startsWith("text/") ||
+          /\.(md|markdown|txt)$/i.test(file.name);
         if (accepted && attachedFiles.length < MAX_FILES) {
           addAttachedFile(file);
         }

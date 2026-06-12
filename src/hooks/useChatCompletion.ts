@@ -383,8 +383,13 @@ export const useChatCompletion = (
     const files = Array.from(e.target.files || []);
 
     files.forEach((file) => {
+      // .md/.txt fall back to extension match — some platforms report an
+      // empty mime for them.
       const isAccepted =
-        file.type.startsWith("image/") || file.type === "application/pdf";
+        file.type.startsWith("image/") ||
+        file.type === "application/pdf" ||
+        file.type.startsWith("text/") ||
+        /\.(md|markdown|txt)$/i.test(file.name);
       if (isAccepted && state.attachedFiles.length < MAX_FILES) {
         addFile(file);
       }
