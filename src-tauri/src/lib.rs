@@ -31,8 +31,24 @@ fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+// Frontend log sink: the webview console is invisible when the app is
+// launched from a terminal, so the JS side forwards diagnostics here.
+#[tauri::command]
+fn js_log(msg: String) {
+    tracing::info!(target: "js", "{msg}");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Without a subscriber every tracing::error!/warn! in the codebase is
+    // silently dropped. RUST_LOG overrides the default level.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     // Get PostHog API key
     let posthog_api_key = option_env!("POSTHOG_API_KEY").unwrap_or("").to_string();
     let mut builder = tauri::Builder::default()
@@ -69,6 +85,7 @@ pub fn run() {
     let mut builder = builder
         .invoke_handler(tauri::generate_handler![
             get_app_version,
+            js_log,
             window::set_window_height,
             window::open_dashboard,
             window::toggle_dashboard,

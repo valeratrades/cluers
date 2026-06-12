@@ -223,6 +223,11 @@ export async function fetchSTT(params: STTParams): Promise<string> {
     }
 
     const responseText = await response.text();
+    // Forward to the Rust log: distinguishes "provider returned nothing"
+    // from "we failed to extract the transcript".
+    invoke("js_log", {
+      msg: `STT response (status=${response.status}): ${responseText.slice(0, 600)}`,
+    }).catch(() => {});
     let data: any;
     try {
       data = JSON.parse(responseText);

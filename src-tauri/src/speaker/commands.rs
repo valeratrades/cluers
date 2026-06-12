@@ -427,7 +427,15 @@ async fn run_continuous_capture(
             error!("Failed to emit audio-encoding-error: {}", e);
         }
     } else {
-        let (_, raw_peak) = calculate_audio_metrics(&audio_buffer);
+        let (raw_rms, raw_peak) = calculate_audio_metrics(&audio_buffer);
+        tracing::info!(
+            "continuous capture: sr={} samples={} dur={:.2}s rms={:.5} peak={:.5}",
+            sr,
+            audio_buffer.len(),
+            audio_buffer.len() as f32 / sr as f32,
+            raw_rms,
+            raw_peak
+        );
         if raw_peak < config.noise_gate_threshold {
             // Nothing in the recording rises above the noise floor (e.g. the
             // monitored sink received no signal at all). Sending it to STT

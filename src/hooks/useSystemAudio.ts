@@ -107,6 +107,12 @@ export interface ChatConversation {
 
 export type useSystemAudioType = ReturnType<typeof useSystemAudio>;
 
+// Forward diagnostics to the Rust log (the webview console is invisible in
+// normal terminal launches).
+const dbg = (msg: string) => {
+  invoke("js_log", { msg }).catch(() => {});
+};
+
 export function useSystemAudio() {
   const { resizeWindow } = useWindowResize();
   const globalShortcuts = useGlobalShortcuts();
@@ -179,6 +185,28 @@ export function useSystemAudio() {
     lastTranscriptionRef.current = lastTranscription;
   }, [lastTranscription]);
 
+  // State-transition log. Cheap (fires only on changes) and has repeatedly
+  // been the difference between guessing and knowing during UI-state bugs.
+  useEffect(() => { dbg(`capturing=${capturing}`); }, [capturing]);
+  useEffect(() => { dbg(`isPopoverOpen=${isPopoverOpen}`); }, [isPopoverOpen]);
+  useEffect(() => { dbg(`isProcessing=${isProcessing}`); }, [isProcessing]);
+  useEffect(() => { dbg(`isAIProcessing=${isAIProcessing}`); }, [isAIProcessing]);
+  useEffect(() => {
+    dbg(`lastAIResponse(len=${lastAIResponse.length})="${lastAIResponse.slice(0, 40).replace(/\n/g, "\\n")}"`);
+  }, [lastAIResponse]);
+  useEffect(() => {
+    dbg(`lastTranscription="${lastTranscription.slice(0, 60)}"`);
+  }, [lastTranscription]);
+  useEffect(() => { dbg(`error="${error}"`); }, [error]);
+  useEffect(() => { dbg(`discardedNotice="${discardedNotice}"`); }, [discardedNotice]);
+  useEffect(() => { dbg(`skippedNotice="${skippedNotice}"`); }, [skippedNotice]);
+  useEffect(() => { dbg(`setupRequired=${setupRequired}`); }, [setupRequired]);
+  useEffect(() => {
+    dbg(`isRecordingInContinuousMode=${isRecordingInContinuousMode}`);
+  }, [isRecordingInContinuousMode]);
+  useEffect(() => {
+    dbg(`conversation: id=${conversation.id} msgs=${conversation.messages.length}`);
+  }, [conversation]);
 
   // Load context settings and VAD config from localStorage on mount
   useEffect(() => {
@@ -317,6 +345,7 @@ export function useSystemAudio() {
     async () => {}
   );
   onSpeechDetectedRef.current = async (base64Audio: string) => {
+    dbg(`speech-detected (capturing=${capturing}, payloadLen=${base64Audio.length})`);
     try {
       if (!capturing) return;
 
@@ -403,6 +432,7 @@ export function useSystemAudio() {
           }, 6000);
         }
       } catch (sttError: any) {
+        dbg(`STT failed: ${sttError?.name}: ${sttError?.message}`);
         if (sttError instanceof NoTranscriptionError) {
           // No speech recognized (e.g. keyboard typing, background noise).
           // Surface the same way as a too-short segment and skip AI.
@@ -615,10 +645,14 @@ export function useSystemAudio() {
     ): Promise<string | null> => {
       // Cancel any previous in-flight AI request before starting a new one.
       if (currentRequestIdRef.current) {
+        dbg(`processWithAI: cancelling previous ${currentRequestIdRef.current}`);
         cancelChat(currentRequestIdRef.current).catch(() => {});
       }
       const requestId = generateRequestId();
       currentRequestIdRef.current = requestId;
+      dbg(
+        `processWithAI start req=${requestId} input="${transcription.slice(0, 60)}" history=${previousMessages.length}`
+      );
 
       try {
         setIsAIProcessing(true);
@@ -688,10 +722,14 @@ export function useSystemAudio() {
             }
           }
         } catch (aiError: any) {
+          dbg(`processWithAI stream error req=${requestId}: ${aiError?.message}`);
           if (currentRequestIdRef.current === requestId) {
             setError(aiError.message || "Failed to get AI response");
           }
         }
+        dbg(
+          `processWithAI stream end req=${requestId} full(len=${fullResponse.length})="${fullResponse.slice(0, 60).replace(/\n/g, "\\n")}" displaying=${displaying}`
+        );
 
         // The model has signalled the current input warrants no new answer
         // (partial fragment or nothing to reply to) - the previous response
@@ -798,6 +836,9 @@ export function useSystemAudio() {
   }, [vadConfig, selectedAudioDevices.output.id]);
 
   const stopCapture = useCallback(async () => {
+    // Resets all listen-mode state; the stack identifies which of the many
+    // possible triggers (button, shortcut, effect) wiped the screen.
+    dbg(`stopCapture called\n${new Error().stack}`);
     try {
       // Cancel any in-flight AI streaming request.
       const id = currentRequestIdRef.current;
@@ -882,6 +923,7 @@ export function useSystemAudio() {
       isAIProcessing ||
       !!lastAIResponse ||
       !!error;
+    dbg(`shouldOpenPopover=${shouldOpenPopover}`);
     setIsPopoverOpen(shouldOpenPopover);
     resizeWindow(shouldOpenPopover);
   }, [
@@ -1001,6 +1043,7 @@ export function useSystemAudio() {
   ]);
 
   const startNewConversation = useCallback(() => {
+    dbg(`startNewConversation called\n${new Error().stack}`);
     persistedIdsRef.current = new Set();
     setConversation({
       id: "",
