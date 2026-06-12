@@ -17,7 +17,6 @@ use tauri_plugin_machine_uid::MachineUidExt;
 use crate::llm::pluely::{
     fetch_api_response_config, report_api_error, Model, UserAudioHeader,
 };
-use crate::llm::secrets;
 
 pub fn get_app_endpoint() -> Result<String, String> {
     if let Ok(endpoint) = env::var("APP_ENDPOINT") {
@@ -80,7 +79,9 @@ pub async fn transcribe_audio(
     app: AppHandle,
     audio_base64: String,
 ) -> Result<AudioResponse, String> {
-    let selected_model = secrets::pluely_selected_model_get().map_err(|e| e.to_string())?;
+    let selected_model = crate::llm::pluely::selected_model_get(&app)
+        .await
+        .map_err(|e| e.to_string())?;
     let provider = selected_model.as_ref().map(|m| m.provider.clone());
     let model = selected_model.as_ref().map(|m| m.model.clone());
 

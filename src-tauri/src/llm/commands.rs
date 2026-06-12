@@ -6,8 +6,9 @@
 //! via the `cancel_chat` command and a `oneshot::Sender` stored in
 //! `LlmState`.
 
+use crate::db::Db;
 use crate::db::schema::AttachedFile;
-use crate::llm::{pluely, provider, secrets, LlmError, LlmState, StreamEvent};
+use crate::llm::{pluely, provider, LlmError, LlmState, StreamEvent};
 use serde::Deserialize;
 use std::collections::HashMap;
 use tauri::ipc::Channel;
@@ -66,7 +67,7 @@ pub async fn stream_chat(
     let result = if is_pluely {
         pluely::stream_pluely(&app, &http, request, &channel, &mut cancel_rx).await
     } else {
-        provider::stream_custom(&http, request, &channel, &mut cancel_rx).await
+        provider::stream_custom(&http, &state.secrets, request, &channel, &mut cancel_rx).await
     };
 
     {
@@ -129,7 +130,8 @@ pub fn cancel_chat(state: State<'_, LlmState>, request_id: String) {
 }
 
 #[tauri::command]
-pub fn set_provider_secret(
+pub async fn set_provider_secret(
+    state: State<'_, LlmState>,
     provider_id: String,
     name: String,
     value: String,
@@ -137,30 +139,70 @@ pub fn set_provider_secret(
     if value.is_empty() {
         return Err("value must be non-empty".to_string());
     }
-    secrets::set_provider_secret(&provider_id, &name, &value).map_err(|e| e.to_string())
+    state
+        .secrets
+        .set(&provider_id, &name, &value)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn list_provider_secret_names(provider_id: String) -> Result<Vec<String>, String> {
-    secrets::list_provider_secret_names(&provider_id).map_err(|e| e.to_string())
+pub async fn list_provider_secret_names(
+    state: State<'_, LlmState>,
+    provider_id: String,
+) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = state
+        .secrets
+        .provider(&provider_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_keys()
+        .collect();
+    names.sort();
+    Ok(names)
 }
 
 #[tauri::command]
-pub fn delete_provider_secret(provider_id: String, name: String) -> Result<(), String> {
-    secrets::delete_provider_secret(&provider_id, &name).map_err(|e| e.to_string())
+pub async fn delete_provider_secret(
+    state: State<'_, LlmState>,
+    provider_id: String,
+    name: String,
+) -> Result<(), String> {
+    state
+        .secrets
+        .delete(&provider_id, &name)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn delete_all_provider_secrets(provider_id: String) -> Result<(), String> {
-    secrets::delete_all_provider_secrets(&provider_id).map_err(|e| e.to_string())
+pub async fn delete_all_provider_secrets(
+    state: State<'_, LlmState>,
+    provider_id: String,
+) -> Result<(), String> {
+    state
+        .secrets
+        .delete_all(&provider_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn pluely_selected_model_get() -> Result<Option<pluely::Model>, String> {
-    secrets::pluely_selected_model_get().map_err(|e| e.to_string())
+pub async fn pluely_selected_model_get(
+    app: AppHandle,
+) -> Result<Option<pluely::Model>, String> {
+    pluely::selected_model_get(&app).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn pluely_selected_model_set(model: pluely::Model) -> Result<(), String> {
-    secrets::pluely_selected_model_set(&model).map_err(|e| e.to_string())
+pub async fn pluely_selected_model_set(
+    db: State<'_, Db>,
+    model: pluely::Model,
+) -> Result<(), String> {
+    let json = serde_json::to_string(&model).map_err(|e| e.to_string())?;
+    db.with_conn(move |c| {
+        crate::db::queries::setting_set(c, pluely::SETTING_SELECTED_MODEL, &json)
+    })
+    .await
+    .map_err(|e| e.to_string())
 }

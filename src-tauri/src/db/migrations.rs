@@ -16,27 +16,35 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         sql: include_str!("migrations/chat-history.sql"),
     },
+    Migration {
+        version: 3,
+        sql: include_str!("migrations/settings.sql"),
+    },
 ];
+
+/// Highest schema version managed by `tauri-plugin-sql` before we took
+/// over migrations. Legacy DBs have these tables already; we stamp this
+/// then fall through to the loop so newer migrations still apply.
+const LEGACY_STAMP_VERSION: i64 = 2;
 
 /// Runs all pending migrations, tracked via `PRAGMA user_version`.
 ///
 /// On first launch with a database previously managed by `tauri-plugin-sql`
 /// (which records its state in `_sqlx_migrations` instead of `user_version`),
-/// we detect that table and stamp `user_version` to the highest schema
-/// version we know about. The schema is already there; we just need the
-/// counter to match so subsequent runs do nothing.
+/// we detect that table and stamp `user_version` to the last version that
+/// plugin managed. The schema for those versions is already there; we set
+/// the counter then fall through to the loop so any migration we added on
+/// top (v3+) still runs.
 pub fn run_migrations(conn: &mut Connection) -> Result<(), DbError> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
     if user_version(conn)? == 0 && has_sqlx_migrations(conn)? {
-        let latest = MIGRATIONS.last().map(|m| m.version).unwrap_or(0);
         tracing::info!(
             target = "pluely::db",
             "detected tauri-plugin-sql legacy schema; stamping user_version={}",
-            latest,
+            LEGACY_STAMP_VERSION,
         );
-        set_user_version(conn, latest)?;
-        return Ok(());
+        set_user_version(conn, LEGACY_STAMP_VERSION)?;
     }
 
     let current = user_version(conn)?;

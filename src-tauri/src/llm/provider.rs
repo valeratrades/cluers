@@ -11,10 +11,12 @@
 //! Variable templates use `{{UPPER_SNAKE}}` placeholders. Reserved names
 //! (`TEXT`, `IMAGE`, `IMAGE_MIME`, `AUDIO`, `DOCUMENT`, `SYSTEM_PROMPT`)
 //! are handled by `build_messages` / `substitute_value`; everything else
-//! comes from keychain-stored secrets ∪ user_variables.
+//! comes from `Secrets`-cached keychain entries ∪ user_variables.
 
 use crate::db::schema::AttachedFile;
-use crate::llm::{commands::StreamChatRequest, secrets, stream, LlmError, StreamEvent};
+use crate::llm::{
+    commands::StreamChatRequest, secrets::Secrets, stream, LlmError, StreamEvent,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::ipc::Channel;
@@ -377,6 +379,7 @@ fn expand_one_array(
 /// Custom-provider stream entrypoint (the non-Pluely path).
 pub async fn stream_custom(
     http: &reqwest::Client,
+    secrets: &Secrets,
     request: StreamChatRequest,
     channel: &Channel<StreamEvent>,
     cancel_rx: &mut oneshot::Receiver<()>,
@@ -390,10 +393,8 @@ pub async fn stream_custom(
         .iter()
         .map(|(k, v)| (k.to_ascii_uppercase(), v.clone()))
         .collect();
-    for name in secrets::list_provider_secret_names(&p.id)? {
-        if let Some(v) = secrets::get_provider_secret(&p.id, &name)? {
-            vars.insert(name, v);
-        }
+    for (name, v) in secrets.provider(&p.id).await? {
+        vars.insert(name, v);
     }
     vars.insert(
         "SYSTEM_PROMPT".to_string(),

@@ -56,7 +56,20 @@ impl Db {
         })
     }
 
-    pub(crate) fn arc(&self) -> Arc<Mutex<Connection>> {
-        Arc::clone(&self.inner)
+    /// Run `f` against the single connection inside `spawn_blocking` so the
+    /// async runtime stays free. Mutex poisoning panics by design (fail fast
+    /// — see CLAUDE.md).
+    pub(crate) async fn with_conn<F, T>(&self, f: F) -> Result<T, DbError>
+    where
+        F: FnOnce(&mut Connection) -> Result<T, DbError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let arc = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = arc.lock().expect("db mutex poisoned");
+            f(&mut guard)
+        })
+        .await
+        .expect("db spawn_blocking join")
     }
 }

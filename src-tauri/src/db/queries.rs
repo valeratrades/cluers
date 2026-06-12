@@ -295,6 +295,27 @@ pub fn delete_system_prompt(conn: &Connection, id: i64) -> Result<(), DbError> {
     Ok(())
 }
 
+// -- settings ------------------------------------------------------------
+
+pub fn setting_get(conn: &Connection, key: &str) -> Result<Option<String>, DbError> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?",
+        params![key],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(DbError::from)
+}
+
+pub fn setting_set(conn: &Connection, key: &str, value: &str) -> Result<(), DbError> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
 fn fetch_system_prompt(conn: &Connection, id: i64) -> Result<SystemPrompt, DbError> {
     conn.query_row(
         "SELECT id, name, prompt, created_at, updated_at FROM system_prompts WHERE id = ?",
@@ -487,6 +508,19 @@ mod tests {
     }
 
     #[test]
+    fn setting_get_set_upsert() {
+        let conn = fresh();
+        assert_eq!(setting_get(&conn, "k").unwrap(), None);
+
+        setting_set(&conn, "k", "v1").unwrap();
+        assert_eq!(setting_get(&conn, "k").unwrap(), Some("v1".to_string()));
+
+        // Upsert overwrites in place (no duplicate-key error).
+        setting_set(&conn, "k", "v2").unwrap();
+        assert_eq!(setting_get(&conn, "k").unwrap(), Some("v2".to_string()));
+    }
+
+    #[test]
     fn legacy_bridge() {
         let mut conn = Connection::open_in_memory().unwrap();
         // Simulate tauri-plugin-sql shape: schema present, _sqlx_migrations
@@ -516,10 +550,21 @@ mod tests {
 
         run_migrations(&mut conn).unwrap();
 
+        // Legacy stamp (v2) then fall through, so the v3 `settings` migration
+        // still runs: user_version lands at 3 and `settings` exists.
         let v: i64 = conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
+
+        let settings_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='settings'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(settings_tables, 1);
 
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM conversations WHERE id='pre-id'", [], |r| {

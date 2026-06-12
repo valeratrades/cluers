@@ -109,3 +109,51 @@ Not currently configured — we don't use `connect_with_max_prompt_timeout`. If 
 3. **Linux specifically**: On macOS, `apple-native` uses the Security framework directly (no D-Bus). On Windows, `windows-native` uses the Credential Store API (no D-Bus). Only Linux hits this D-Bus path. A Linux-only fix could use `linux-native` (kernel key retention service via `keyctl`) which requires no D-Bus and no daemon.
 
 4. **`set_provider_secret` does 3 DBus connections**: One `write()` + one `read_names()` + one `write_names()`. These could be done in a single connection if we move the names-list logic into an atomic write or use a different storage scheme.
+
+---
+
+## Why it fires "constantly" in automatic listening mode
+
+In auto-detect (VAD) mode, each detected speech segment triggers this call chain:
+
+```
+speech-detected event (useSystemAudio.ts:296)
+  │
+  ├─1. fetchSTT() → fetchPluelySTT() → invoke("transcribe_audio")
+  │     └─ api.rs:83: secrets::pluely_selected_model_get()    ← KEYCHAIN #1
+  │
+  └─2. processWithAI() → streamChat() → invoke("stream_chat")
+        └─ pluely.rs:238: secrets::pluely_selected_model_get() ← KEYCHAIN #2
+           │
+           ├─ (success) pluely.rs:196: user_activity()
+           │     └─ secrets::pluely_selected_model_get()        ← KEYCHAIN #3
+           │
+           └─ (error) pluely.rs:148: report_api_error()
+                 └─ secrets::pluely_selected_model_get()        ← KEYCHAIN #3 alt
+```
+
+**2–3 keychain calls per speech segment.** In a meeting with frequent speech, VAD can fire multiple times per minute. Each segment creates 2–3 new D-Bus connections. If the secret service is broken (e.g. no `gnome-keyring-daemon`), every single one produces the `keychain:` error.
+
+The STT path (`transcribe_audio` at `api.rs:83`) was the additional call site not obvious from just reading the LLM code — it hits the keychain before the chat request even starts, to determine which Pluely model/provider to use for transcription. This means even *failed* STT attempts (noise, partial fragments) still trigger a keychain error.
+
+If using a custom STT provider instead of Pluely-hosted, `fetchSTT` takes the `curl2Json` path and does NOT hit the keychain for STT. But `processWithAI` still does (KEYCHAIN #2 and #3). So Pluely-hosted STT is the worst case (3 hits), custom STT is 2 hits.
+
+### Most likely root cause on this system
+
+Given NixOS (per `nix develop` in CLAUDE.md), the most likely cause is **no Secret Service provider running**. NixOS doesn't start `gnome-keyring-daemon` by default outside of GNOME. The `pam_gnome_keyring` module that auto-unlocks the login keyring is also GNOME-only. A minimal NixOS setup with a non-GNOME WM/DE will have:
+
+- `$DBUS_SESSION_BUS_ADDRESS` set (if using a display manager or `dbus-run-session`)
+- But `org.freedesktop.secrets` NOT owned on the bus
+
+This means every keychain call fails immediately with `ServiceUnknown` (failure mode #2), and since auto-detect mode fires keychain calls on every speech segment, the error appears "constantly."
+
+### Quickest diagnostic command
+
+```sh
+# Check if secret service is available on the session bus
+dbus-send --session --dest=org.freedesktop.DBus --print-reply \
+  /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+  string:org.freedesktop.secrets
+```
+
+If this returns `boolean false`, the secret service is not running — confirming the issue.

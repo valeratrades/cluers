@@ -2,12 +2,28 @@
 //! `/api/error` machinery that used to live in `api.rs`.
 
 use crate::api::{get_api_access_key, get_app_endpoint};
-use crate::llm::{commands::StreamChatRequest, secrets, stream, LlmError, StreamEvent};
+use crate::db::{queries, Db};
+use crate::llm::{commands::StreamChatRequest, stream, LlmError, StreamEvent};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_machine_uid::MachineUidExt;
 use tokio::sync::oneshot;
+
+pub const SETTING_SELECTED_MODEL: &str = "pluely_selected_model";
+
+/// The Pluely-hosted model the user picked, read from the SQLite `settings`
+/// table (not the keychain — a model choice is a preference, not a secret).
+pub async fn selected_model_get(app: &AppHandle) -> Result<Option<Model>, LlmError> {
+    let db = app.state::<Db>();
+    let raw = db
+        .with_conn(|c| queries::setting_get(c, SETTING_SELECTED_MODEL))
+        .await?;
+    match raw {
+        None => Ok(None),
+        Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Model {
@@ -145,7 +161,6 @@ pub async fn report_api_error(
 ) {
     let Ok(endpoint) = get_app_endpoint() else { return };
     let Ok(access_key) = get_api_access_key() else { return };
-    let stored_model = secrets::pluely_selected_model_get().ok().flatten();
 
     let machine_id = match app.machine_uid().get_machine_uid() {
         Ok(id) => id.id.unwrap_or_default(),
@@ -156,12 +171,8 @@ pub async fn report_api_error(
     }
     let app_version = app.package_info().version.to_string();
 
-    let final_model = model
-        .or_else(|| stored_model.as_ref().map(|m| m.model.clone()))
-        .unwrap_or_default();
-    let final_provider = provider
-        .or_else(|| stored_model.as_ref().map(|m| m.provider.clone()))
-        .unwrap_or_default();
+    let final_model = model.unwrap_or_default();
+    let final_provider = provider.unwrap_or_default();
 
     let payload = serde_json::json!({
         "machine_id": machine_id,
@@ -189,11 +200,10 @@ async fn user_activity(
     app: &AppHandle,
     http: &reqwest::Client,
     activity_metrics: Option<serde_json::Value>,
-    configured_model: String,
+    ai_model: String,
 ) {
     let Ok(endpoint) = get_app_endpoint() else { return };
     let Ok(access_key) = get_api_access_key() else { return };
-    let stored_model = secrets::pluely_selected_model_get().ok().flatten();
     let machine_id = match app.machine_uid().get_machine_uid() {
         Ok(id) => id.id.unwrap_or_default(),
         Err(_) => return,
@@ -202,10 +212,6 @@ async fn user_activity(
         return;
     }
     let app_version = app.package_info().version.to_string();
-    let ai_model = stored_model
-        .as_ref()
-        .map(|m| m.model.clone())
-        .unwrap_or(configured_model);
 
     let mut payload = serde_json::json!({
         "machine_id": machine_id,
@@ -235,7 +241,7 @@ pub async fn stream_pluely(
     channel: &Channel<StreamEvent>,
     cancel_rx: &mut oneshot::Receiver<()>,
 ) -> Result<String, LlmError> {
-    let selected_model = secrets::pluely_selected_model_get()?;
+    let selected_model = selected_model_get(app).await?;
     let (provider_name, model_name) = selected_model
         .as_ref()
         .map(|m| (Some(m.provider.clone()), Some(m.model.clone())))
@@ -366,7 +372,8 @@ pub async fn stream_pluely(
     };
 
     if !outcome.full_response.is_empty() {
-        user_activity(app, http, outcome.usage.clone(), api_config.model.clone()).await;
+        let ai_model = model_name.clone().unwrap_or_else(|| api_config.model.clone());
+        user_activity(app, http, outcome.usage.clone(), ai_model).await;
     }
 
     Ok(outcome.full_response)

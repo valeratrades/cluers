@@ -5,8 +5,10 @@
 //!   custom provider templates. Streaming is over a Tauri `Channel<T>`.
 //! - Cancellation is `tokio::select!` against an `oneshot::Receiver`
 //!   whose `Sender` lives in `LlmState` keyed by `request_id`.
-//! - All provider secrets and Pluely credentials live in the OS keychain
-//!   via `secrets.rs`.
+//! - Custom-provider secrets (API keys etc.) live in the OS keychain via
+//!   `secrets.rs`. Non-secret preferences such as the Pluely-hosted
+//!   `selected_model` live in the SQLite `settings` table — the keychain is
+//!   never on the hot path of the Pluely chat/STT flow.
 
 pub mod commands;
 pub mod pluely;
@@ -43,7 +45,9 @@ pub enum LlmError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
     #[error("keychain: {0}")]
-    Keychain(String),
+    Keychain(#[from] keyring::Error),
+    #[error(transparent)]
+    Db(#[from] crate::db::DbError),
     #[error("missing variable: {0}")]
     MissingVariable(String),
     #[error("invalid curl: {0}")]
