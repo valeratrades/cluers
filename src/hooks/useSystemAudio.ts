@@ -56,17 +56,24 @@ export interface VadCalibration {
 }
 
 // Appended to the system prompt for the system-audio listening path.
-// Tells the model to emit literal "SKIP" when the latest transcribed
-// chunk looks like a partial fragment; the UI then keeps the previous
-// response visible instead of overwriting it.
+// Tells the model to emit a literal control word when the latest
+// transcribed chunk doesn't warrant a new answer; the UI then keeps the
+// previous response visible instead of overwriting it.
 const SYSTEM_AUDIO_SKIP_INSTRUCTION =
   "You are receiving live transcribed speech from system audio, which may " +
   "arrive in incomplete chunks. If the current input is clearly only a " +
   "partial fragment (cut off mid-sentence, missing the actual question, or " +
   "otherwise insufficient to give a meaningful answer), reply with exactly " +
-  "the single word SKIP (uppercase, no punctuation, no other text). The UI " +
-  "will keep the previous response displayed and wait for the next chunk. " +
-  "Otherwise respond normally.";
+  "the single word SKIP (uppercase, no punctuation, no other text). If the " +
+  "input is complete and understood but calls for no reply (e.g. a " +
+  "statement not addressed to you, or one that needs no answer), reply " +
+  "with exactly the single word COPY. In both cases the UI will keep the " +
+  "previous response displayed and wait for the next chunk. Otherwise " +
+  "respond normally.";
+
+// Replies consisting of exactly one of these words never reach the screen
+// or the conversation - the previous response stays displayed.
+const SKIP_WORDS = ["SKIP", "COPY"];
 
 // OPTIMIZED VAD defaults - matches backend exactly for perfect performance
 const DEFAULT_VAD_CONFIG: VadConfig = {
@@ -579,8 +586,8 @@ export function useSystemAudio() {
 
         // Keep the previous response on screen until the new one actually
         // starts arriving: chunks are buffered while the accumulated text is
-        // still a prefix of "SKIP", so a skip (or an error before any output)
-        // never wipes what the user is reading.
+        // still a prefix of a skip word, so a skip (or an error before any
+        // output) never wipes what the user is reading.
         let fullResponse = "";
         let displaying = false;
 
@@ -635,7 +642,7 @@ export function useSystemAudio() {
             fullResponse += chunk;
             if (displaying) {
               setLastAIResponse((prev) => prev + chunk);
-            } else if (!"SKIP".startsWith(fullResponse.trim())) {
+            } else if (!SKIP_WORDS.some((w) => w.startsWith(fullResponse.trim()))) {
               displaying = true;
               setLastAIResponse(fullResponse);
             }
@@ -646,15 +653,15 @@ export function useSystemAudio() {
           }
         }
 
-        // The model has signalled the current input was only a partial
-        // fragment - the previous response is still displayed; skip saving
-        // anything to the conversation. The caller is responsible for
-        // restoring the transcription it set.
-        if (fullResponse.trim() === "SKIP") {
+        // The model has signalled the current input warrants no new answer
+        // (partial fragment or nothing to reply to) - the previous response
+        // is still displayed; skip saving anything to the conversation. The
+        // caller is responsible for restoring the transcription it set.
+        if (SKIP_WORDS.includes(fullResponse.trim())) {
           return true;
         }
 
-        // Flush a still-buffered response (shorter than "SKIP" but not it).
+        // Flush a still-buffered response (a prefix of a skip word, but not one).
         if (!displaying && fullResponse) {
           setLastAIResponse(fullResponse);
         }
