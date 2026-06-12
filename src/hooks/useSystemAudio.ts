@@ -557,8 +557,8 @@ export function useSystemAudio() {
 
   // AI Processing function. Returns `true` if the model emitted exactly
   // "SKIP" (signalling the input was only a partial fragment), in which
-  // case the previously-displayed response has been restored and the
-  // caller should also restore any other state it overwrote (e.g. the
+  // case the previously-displayed response was never overwritten and the
+  // caller should restore any other state it overwrote (e.g. the
   // transcription).
   const processWithAI = useCallback(
     async (
@@ -573,19 +573,16 @@ export function useSystemAudio() {
       const requestId = generateRequestId();
       currentRequestIdRef.current = requestId;
 
-      // Snapshotted via the setLastAIResponse functional updater below so
-      // we can restore the previous response if the model emits "SKIP".
-      let previousAIResponse = "";
-
       try {
         setIsAIProcessing(true);
-        setLastAIResponse((prev) => {
-          previousAIResponse = prev;
-          return "";
-        });
         setError("");
 
+        // Keep the previous response on screen until the new one actually
+        // starts arriving: chunks are buffered while the accumulated text is
+        // still a prefix of "SKIP", so a skip (or an error before any output)
+        // never wipes what the user is reading.
         let fullResponse = "";
+        let displaying = false;
 
         const usePluelyAPI = await shouldUsePluelyAPI();
         if (!selectedAIProvider.provider && !usePluelyAPI) {
@@ -636,7 +633,12 @@ export function useSystemAudio() {
           })) {
             if (currentRequestIdRef.current !== requestId) return false;
             fullResponse += chunk;
-            setLastAIResponse((prev) => prev + chunk);
+            if (displaying) {
+              setLastAIResponse((prev) => prev + chunk);
+            } else if (!"SKIP".startsWith(fullResponse.trim())) {
+              displaying = true;
+              setLastAIResponse(fullResponse);
+            }
           }
         } catch (aiError: any) {
           if (currentRequestIdRef.current === requestId) {
@@ -645,12 +647,16 @@ export function useSystemAudio() {
         }
 
         // The model has signalled the current input was only a partial
-        // fragment - restore the previously-displayed response and skip
-        // saving anything to the conversation. The caller is responsible
-        // for restoring the transcription it set.
+        // fragment - the previous response is still displayed; skip saving
+        // anything to the conversation. The caller is responsible for
+        // restoring the transcription it set.
         if (fullResponse.trim() === "SKIP") {
-          setLastAIResponse(previousAIResponse);
           return true;
+        }
+
+        // Flush a still-buffered response (shorter than "SKIP" but not it).
+        if (!displaying && fullResponse) {
+          setLastAIResponse(fullResponse);
         }
 
         if (fullResponse) {
