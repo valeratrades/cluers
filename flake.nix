@@ -57,9 +57,26 @@
           ];
 
           systemDeps = lib.optionals pkgs.stdenv.isLinux linuxDeps;
+
+          dev = pkgs.writeShellApplication {
+            name = "pluely-dev";
+            runtimeInputs = [ rust pkgs.nodejs_22 pkgs.pkg-config pkgs.openssl ] ++ systemDeps;
+            text = ''
+              export LD_LIBRARY_PATH="${lib.makeLibraryPath systemDeps}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export RUST_BACKTRACE=1
+              npm install --legacy-peer-deps
+              exec npm run tauri dev "$@"
+            '';
+          };
         in
         {
           _module.args.pkgs = pkgs;
+
+          # `nix run .#dev` — npm install + tauri dev with runtime libs on LD_LIBRARY_PATH
+          apps.dev = {
+            type = "app";
+            program = "${dev}/bin/pluely-dev";
+          };
 
           # `nix build` — runs npm install then tauri build
           packages.default = pkgs.stdenv.mkDerivation {
@@ -78,7 +95,7 @@
             npmFlags = [ "--legacy-peer-deps" ];
             cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
               src = ./src-tauri;
-              hash = "sha256-5ebJPRXMhCXkemkeXWtW0AmwPrefXLi7HrC3vwGw+ic=";
+              hash = "sha256-fl5sJud2Dic1spafCX8U6ypLJsfP1nSh51kld1MyeQ4=";
             };
 
             nativeBuildInputs = [
