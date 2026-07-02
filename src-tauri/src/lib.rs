@@ -6,9 +6,9 @@ mod llm;
 mod shortcuts;
 mod window;
 use std::sync::{Arc, Mutex};
+use tauri::Manager;
 #[cfg(target_os = "macos")]
 use tauri::{AppHandle, WebviewWindow};
-use tauri::Manager;
 use tauri_plugin_posthog::{init as posthog_init, PostHogConfig, PostHogOptions};
 use tokio::task::JoinHandle;
 mod speaker;
@@ -51,7 +51,7 @@ pub fn run() {
 
     // Get PostHog API key
     let posthog_api_key = option_env!("POSTHOG_API_KEY").unwrap_or("").to_string();
-    let mut builder = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(AudioState::default())
         .manage(CaptureState::default())
         .manage(llm::LlmState::new())
