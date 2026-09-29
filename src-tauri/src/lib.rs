@@ -4,7 +4,6 @@ mod db;
 mod llm;
 mod shortcuts;
 mod window;
-use std::sync::Mutex;
 use tauri::Manager;
 #[cfg(target_os = "macos")]
 use tauri::{AppHandle, WebviewWindow};
@@ -63,7 +62,7 @@ pub fn run() {
     }));
     #[cfg(target_os = "windows")]
     let builder = builder.manage(shortcuts::WindowVisibility {
-        is_hidden: Mutex::new(false),
+        is_hidden: std::sync::Mutex::new(false),
     });
     let builder = builder
         .manage(AudioState::default())
