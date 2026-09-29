@@ -145,4 +145,13 @@ impl SpeakerStream {
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         0
     }
+
+    /// Why the stream ended on its own, if the backend knows.
+    pub fn error(&self) -> Option<anyhow::Error> {
+        #[cfg(target_os = "linux")]
+        return self.inner.error();
+
+        #[cfg(not(target_os = "linux"))]
+        None // macOS/Windows producers don't report failures yet
+    }
 }
