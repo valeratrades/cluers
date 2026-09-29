@@ -117,6 +117,7 @@ pub fn run() {
             db::commands::load_conversation,
             db::commands::start_conversation,
             db::commands::append_message,
+            db::commands::append_turn,
             db::commands::rename_conversation,
             db::commands::delete_conversation,
             db::commands::delete_all_conversations,

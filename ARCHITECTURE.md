@@ -54,6 +54,9 @@ Commands are named after intent, not SQL CRUD. There is no
 `start_conversation`s once and `append_message`s per turn. The list/detail
 split is enforced — `list_conversation_summaries` returns summaries (no
 message bodies); `load_conversation` returns the full conversation on demand.
+`append_turn` persists a user+assistant pair in one transaction, starting the
+conversation when the id is null; it is the only write path for chat turns
+from the overlay and the chat view.
 
 ### Errors
 
