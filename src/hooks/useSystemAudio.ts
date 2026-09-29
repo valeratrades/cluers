@@ -1,9 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useWindowResize, useGlobalShortcuts } from ".";
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useApp } from "@/contexts";
-import { fetchSTT, NoTranscriptionError } from "@/lib/functions";
 import {
   DEFAULT_QUICK_ACTIONS,
   DEFAULT_SYSTEM_PROMPT,
@@ -11,17 +10,10 @@ import {
 } from "@/config";
 import {
   safeLocalStorage,
-  shouldUsePluelyAPI,
   generateConversationTitle,
-  startConversation,
-  appendMessage,
-  CONVERSATION_SAVE_DEBOUNCE_MS,
-  streamChat,
-  cancelChat,
-  generateRequestId,
+  appendTurn,
+  resolveProviderInput,
   buildEnhancedSystemPrompt,
-  type ProviderInput,
-  type HistoryMessage,
 } from "@/lib";
 
 // VAD Configuration interface matching Rust
@@ -56,25 +48,15 @@ export interface VadCalibration {
   noise_gate_threshold: number;
 }
 
-// Appended to the system prompt for the system-audio listening path.
-// Tells the model to emit a literal control word when the latest
-// transcribed chunk doesn't warrant a new answer; the UI then keeps the
-// previous response visible instead of overwriting it.
-const SYSTEM_AUDIO_SKIP_INSTRUCTION =
-  "You are receiving live transcribed speech from system audio, which may " +
-  "arrive in incomplete chunks. If the current input is clearly only a " +
-  "partial fragment (cut off mid-sentence, missing the actual question, or " +
-  "otherwise insufficient to give a meaningful answer), reply with exactly " +
-  "the single word SKIP (uppercase, no punctuation, no other text). If the " +
-  "input is complete and understood but calls for no reply (e.g. a " +
-  "statement not addressed to you, or one that needs no answer), reply " +
-  "with exactly the single word COPY. In both cases the UI will keep the " +
-  "previous response displayed and wait for the next chunk. Otherwise " +
-  "respond normally.";
-
-// Replies consisting of exactly one of these words never reach the screen
-// or the conversation - the previous response stays displayed.
-const SKIP_WORDS = ["SKIP", "COPY"];
+// Mirrors `TurnEvent` in src-tauri/src/speaker/turn.rs
+type TurnEvent =
+  | { kind: "heard"; text: string }
+  | { kind: "asked"; message: string }
+  | { kind: "delta"; delta: string }
+  | { kind: "answered"; message: string; answer: string }
+  | { kind: "skipped"; message: string; carried: boolean }
+  | { kind: "noSpeech" }
+  | { kind: "failed"; error: string };
 
 // Mirrors `VadConfig::default()` in src-tauri/src/speaker/vad.rs
 const DEFAULT_VAD_CONFIG: VadConfig = {
@@ -106,6 +88,14 @@ export interface ChatConversation {
   createdAt: number;
   updatedAt: number;
 }
+
+const EMPTY_CONVERSATION: ChatConversation = {
+  id: "",
+  title: "",
+  messages: [],
+  createdAt: 0,
+  updatedAt: 0,
+};
 
 export type useSystemAudioType = ReturnType<typeof useSystemAudio>;
 
@@ -149,13 +139,30 @@ export function useSystemAudio() {
   const [isRecordingInContinuousMode, setIsRecordingInContinuousMode] =
     useState<boolean>(false);
 
-  const [conversation, setConversation] = useState<ChatConversation>({
-    id: "",
-    title: "",
-    messages: [],
-    createdAt: 0,
-    updatedAt: 0,
+  const [conversation, setConversation] =
+    useState<ChatConversation>(EMPTY_CONVERSATION);
+  // Source of truth for session memory; Rust is seeded from it on every capture start.
+  const conversationRef = useRef<ChatConversation>(EMPTY_CONVERSATION);
+  const carryRef = useRef<string>("");
+  // One per conversation, so turns persist in order and a reset never appends to the old one.
+  const persistRef = useRef<{ id: string | null; chain: Promise<void> }>({
+    id: null,
+    chain: Promise.resolve(),
   });
+  const answerStartedRef = useRef<boolean>(false);
+  const updateConversation = useCallback(
+    (f: (c: ChatConversation) => ChatConversation) => {
+      conversationRef.current = f(conversationRef.current);
+      setConversation(conversationRef.current);
+    },
+    []
+  );
+  const resetConversation = useCallback(() => {
+    conversationRef.current = EMPTY_CONVERSATION;
+    setConversation(EMPTY_CONVERSATION);
+    carryRef.current = "";
+    persistRef.current = { id: null, chain: Promise.resolve() };
+  }, []);
 
   // Context management states
   const [useSystemPrompt, setUseSystemPrompt] = useState<boolean>(true);
@@ -170,22 +177,7 @@ export function useSystemAudio() {
     selectedAudioDevices,
     attachedFiles,
   } = useApp();
-  const currentRequestIdRef = useRef<string | null>(null);
-  // Mirrors `lastTranscription` so the speech-detected handler (whose
-  // useEffect intentionally does not depend on it) can snapshot the
-  // previous transcription before overwriting it. Needed to restore
-  // when the model replies with "SKIP".
-  const lastTranscriptionRef = useRef<string>("");
-  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const isSavingRef = useRef<boolean>(false);
-  // IDs of messages already written to the DB. Diffed against
-  // conversation.messages on each debounced sync to append only the new ones.
-  const persistedIdsRef = useRef<Set<string>>(new Set());
   const scrollAreaRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    lastTranscriptionRef.current = lastTranscription;
-  }, [lastTranscription]);
 
   // State-transition log. Cheap (fires only on changes) and has repeatedly
   // been the difference between guessing and knowing during UI-state bugs.
@@ -300,7 +292,7 @@ export function useSystemAudio() {
         discardedUnlisten = await listen("speech-discarded", (event) => {
           const reason = event.payload as string;
           // A manual stop optimistically enters the processing state; a
-          // discarded recording produces no speech-detected event to leave it.
+          // discarded recording produces no turn event to leave it.
           setIsProcessing(false);
           setDiscardedNotice(reason);
           if (discardedTimeoutRef.current) {
@@ -352,152 +344,169 @@ export function useSystemAudio() {
     };
   }, []);
 
-  // Handle single speech detection event (both VAD and continuous modes).
-  // The Tauri subscription itself is mount-once; the handler is kept fresh
-  // through this ref. A dep-driven resubscribe is racy: `listen` resolves
-  // asynchronously, so a cleanup that runs before it resolves has nothing
-  // to unlisten and leaks a duplicate listener that double-processes every
-  // utterance from then on.
-  const onSpeechDetectedRef = useRef<(base64Audio: string) => Promise<void>>(
-    async () => {}
-  );
-  onSpeechDetectedRef.current = async (base64Audio: string) => {
-    dbg(`speech-detected (capturing=${capturing}, payloadLen=${base64Audio.length})`);
-    try {
-      if (!capturing) return;
+  const showDiscarded = (notice: string) => {
+    setDiscardedNotice(notice);
+    if (discardedTimeoutRef.current) {
+      clearTimeout(discardedTimeoutRef.current);
+    }
+    discardedTimeoutRef.current = setTimeout(() => {
+      setDiscardedNotice("");
+    }, 3500);
+  };
 
-      // Convert to blob
-      const binaryString = atob(base64Audio);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-      const audioBlob = new Blob([bytes], { type: "audio/wav" });
-
-      const usePluelyAPI = await shouldUsePluelyAPI();
-      if (!selectedSttProvider.provider && !usePluelyAPI) {
-        setError("No speech provider selected.");
+  // Called through a ref so the per-start Channel never holds a stale closure.
+  const onTurnRef = useRef<(e: TurnEvent) => void>(() => {});
+  onTurnRef.current = (e: TurnEvent) => {
+    dbg(`turn ${e.kind}`);
+    switch (e.kind) {
+      case "heard":
+        setLastTranscription(e.text);
         return;
-      }
-
-      const providerConfig = allSttProviders.find(
-        (p) => p.id === selectedSttProvider.provider
-      );
-
-      if (!providerConfig && !usePluelyAPI) {
-        setError("Speech provider config not found.");
-        return;
-      }
-
-      setIsProcessing(true);
-
-      // Add timeout wrapper for STT request (30 seconds)
-      const sttPromise = fetchSTT({
-        provider: providerConfig,
-        selectedProvider: selectedSttProvider,
-        audio: audioBlob,
-      });
-
-      const timeoutPromise = new Promise<string>((_, reject) => {
-        setTimeout(
-          () => reject(new Error("Speech transcription timed out (30s)")),
-          30000
-        );
-      });
-
-      try {
-        const transcription = await Promise.race([
-          sttPromise,
-          timeoutPromise,
-        ]);
-
-        // Snapshot before overwriting so we can restore if the model
-        // replies with "SKIP".
-        const previousTranscription = lastTranscriptionRef.current;
-        setLastTranscription(transcription);
+      case "asked":
+        setLastTranscription(e.message);
         setError("");
-
-        const effectiveSystemPrompt = useSystemPrompt
-          ? systemPrompt || DEFAULT_SYSTEM_PROMPT
-          : contextContent || DEFAULT_SYSTEM_PROMPT;
-
-        const previousMessages = conversation.messages.map((msg) => {
-          return { role: msg.role, content: msg.content };
-        });
-
-        const skipWord = await processWithAI(
-          transcription,
-          effectiveSystemPrompt,
-          previousMessages
-        );
-        if (skipWord) {
-          setLastTranscription(previousTranscription);
-          // Make the non-answer visibly deliberate: the input WAS
-          // heard and transcribed; the model chose not to reply.
-          setSkippedNotice(
-            `heard "${transcription.slice(0, 120)}" - ${
-              skipWord === "SKIP"
-                ? "judged an incomplete fragment, waiting for the rest"
-                : "judged to need no reply"
-            }`
-          );
-          if (skippedTimeoutRef.current) {
-            clearTimeout(skippedTimeoutRef.current);
-          }
-          skippedTimeoutRef.current = setTimeout(() => {
-            setSkippedNotice("");
-          }, 6000);
-        }
-      } catch (sttError: any) {
-        dbg(`STT failed: ${sttError?.name}: ${sttError?.message}`);
-        if (sttError instanceof NoTranscriptionError) {
-          // No speech recognized (e.g. keyboard typing, background noise).
-          // Surface the same way as a too-short segment and skip AI.
-          setDiscardedNotice("no speech recognized");
-          if (discardedTimeoutRef.current) {
-            clearTimeout(discardedTimeoutRef.current);
-          }
-          discardedTimeoutRef.current = setTimeout(() => {
-            setDiscardedNotice("");
-          }, 3500);
+        setIsAIProcessing(true);
+        setIsProcessing(false);
+        carryRef.current = "";
+        answerStartedRef.current = false;
+        return;
+      case "delta":
+        if (answerStartedRef.current) {
+          setLastAIResponse((prev) => prev + e.delta);
         } else {
-          console.error("STT Error:", sttError);
-          setError(sttError.message || "Failed to transcribe audio");
-          setIsPopoverOpen(true);
+          answerStartedRef.current = true;
+          setLastAIResponse(e.delta);
         }
+        return;
+      case "answered": {
+        setIsAIProcessing(false);
+        setLastAIResponse(e.answer);
+        const timestamp = Date.now();
+        updateConversation((c) => ({
+          ...c,
+          messages: [
+            ...c.messages,
+            {
+              id: `local_${timestamp}_user`,
+              role: "user",
+              content: e.message,
+              timestamp,
+            },
+            {
+              id: `local_${timestamp + 1}_assistant`,
+              role: "assistant",
+              content: e.answer,
+              timestamp: timestamp + 1,
+            },
+          ],
+          updatedAt: timestamp,
+          title: c.title || generateConversationTitle(e.message),
+        }));
+        const p = persistRef.current;
+        p.chain = p.chain
+          .then(async () => {
+            const turn = await appendTurn(p.id, {
+              user: e.message,
+              attachedFiles: [],
+              assistant: e.answer,
+            });
+            p.id = turn.conversationId;
+            if (persistRef.current === p) {
+              updateConversation((c) => ({ ...c, id: turn.conversationId }));
+            }
+          })
+          .catch((err) => {
+            setError(`Failed to save conversation: ${err}`);
+          });
+        return;
       }
-    } catch (err) {
-      setError("Failed to process speech");
-    } finally {
-      setIsProcessing(false);
+      case "skipped":
+        setIsAIProcessing(false);
+        carryRef.current = e.carried ? e.message : "";
+        setSkippedNotice(
+          `heard "${e.message.slice(0, 120)}" - ${
+            e.carried
+              ? "judged an incomplete fragment, waiting for the rest"
+              : "judged to need no reply"
+          }`
+        );
+        if (skippedTimeoutRef.current) {
+          clearTimeout(skippedTimeoutRef.current);
+        }
+        skippedTimeoutRef.current = setTimeout(() => {
+          setSkippedNotice("");
+        }, 6000);
+        return;
+      case "noSpeech":
+        setIsProcessing(false);
+        showDiscarded("no speech recognized");
+        return;
+      case "failed":
+        setError(e.error);
+        setIsProcessing(false);
+        setIsAIProcessing(false);
+        setIsPopoverOpen(true);
+        return;
     }
   };
 
-  useEffect(() => {
-    let disposed = false;
-    let speechUnlisten: (() => void) | undefined;
-
-    listen("speech-detected", (event) => {
-      void onSpeechDetectedRef.current(event.payload as string);
-    })
-      .then((unlisten) => {
-        // The subscription may resolve after the effect was already cleaned
-        // up; unlisten immediately instead of leaking it.
-        if (disposed) {
-          unlisten();
-        } else {
-          speechUnlisten = unlisten;
-        }
-      })
-      .catch(() => {
-        setError("Failed to setup speech listener");
-      });
-
-    return () => {
-      disposed = true;
-      if (speechUnlisten) speechUnlisten();
+  const buildSessionConfig = useCallback(async () => {
+    const base = useSystemPrompt
+      ? systemPrompt || DEFAULT_SYSTEM_PROMPT
+      : contextContent || DEFAULT_SYSTEM_PROMPT;
+    return {
+      stt: await resolveProviderInput(selectedSttProvider, allSttProviders),
+      ai: await resolveProviderInput(selectedAIProvider, allAiProviders),
+      systemPrompt: buildEnhancedSystemPrompt(base),
+      attachedFiles,
     };
-  }, []);
+  }, [
+    selectedSttProvider,
+    allSttProviders,
+    selectedAIProvider,
+    allAiProviders,
+    useSystemPrompt,
+    systemPrompt,
+    contextContent,
+    attachedFiles,
+  ]);
+
+  const startBackend = useCallback(
+    async (cfg: VadConfig) => {
+      const events = new Channel<TurnEvent>();
+      events.onmessage = (e) => onTurnRef.current(e);
+      await invoke("start_system_audio_capture", {
+        vadConfig: cfg,
+        deviceId:
+          selectedAudioDevices.output.id !== "default"
+            ? selectedAudioDevices.output.id
+            : null,
+        session: {
+          config: await buildSessionConfig(),
+          history: conversationRef.current.messages.map(({ role, content }) => ({
+            role,
+            content,
+          })),
+          carry: carryRef.current,
+        },
+        events,
+      });
+    },
+    [buildSessionConfig, selectedAudioDevices.output.id]
+  );
+
+  // Continuous mode only has a backend while recording (and answering it).
+  const backendLiveRef = useRef(false);
+  backendLiveRef.current =
+    capturing && (vadConfig.enabled || isRecordingInContinuousMode);
+  useEffect(() => {
+    if (!backendLiveRef.current) return;
+    buildSessionConfig()
+      .then((config) =>
+        invoke("system_audio_control", { control: { kind: "config", config } })
+      )
+      .catch((err) => setError(`Failed to update session: ${err}`));
+  }, [buildSessionConfig]);
 
   // Context management functions
   const saveContextSettings = useCallback(
@@ -568,42 +577,13 @@ export function useSystemAudio() {
 
   const handleQuickActionClick = async (action: string) => {
     setError("");
-
-    const effectiveSystemPrompt = useSystemPrompt
-      ? systemPrompt || DEFAULT_SYSTEM_PROMPT
-      : contextContent || DEFAULT_SYSTEM_PROMPT;
-
-    // Include the most recent transcription in conversation history if it exists
-    let updatedMessages = [...conversation.messages];
-
-    if (lastTranscription && lastTranscription.trim()) {
-      const lastMessage = updatedMessages[updatedMessages.length - 1];
-      // Only add if it's not already the last message
-      if (!lastMessage || lastMessage.content !== lastTranscription) {
-        const timestamp = Date.now();
-        const userMessage = {
-          id: `local_${timestamp}_user`,
-          role: "user" as const,
-          content: lastTranscription,
-          timestamp,
-        };
-        updatedMessages.push(userMessage);
-
-        // Update conversation state with the latest transcription
-        setConversation((prev) => ({
-          ...prev,
-          messages: [userMessage, ...prev.messages],
-          updatedAt: timestamp,
-          title: prev.title || generateConversationTitle(lastTranscription),
-        }));
-      }
+    try {
+      await invoke("system_audio_control", {
+        control: { kind: "prompt", text: action },
+      });
+    } catch (err) {
+      setError(`Quick action failed: ${err}`);
     }
-
-    const previousMessages = updatedMessages.map((msg) => {
-      return { role: msg.role, content: msg.content };
-    });
-
-    await processWithAI(action, effectiveSystemPrompt, previousMessages);
   };
 
   // Start continuous recording manually
@@ -613,23 +593,13 @@ export function useSystemAudio() {
       setError("");
 
       // Stop any existing capture (auto-listen / leftover task) before starting a new one
-      await invoke<string>("stop_system_audio_capture").catch(() => {});
-
-      const deviceId =
-        selectedAudioDevices.output.id !== "default"
-          ? selectedAudioDevices.output.id
-          : null;
-
-      // Start a new continuous recording session
-      await invoke<string>("start_system_audio_capture", {
-        vadConfig: vadConfig,
-        deviceId: deviceId,
-      });
+      await invoke<string>("stop_system_audio_capture");
+      await startBackend(vadConfig);
     } catch (err) {
       console.error("Failed to start continuous recording:", err);
       setError(`Failed to start recording: ${err}`);
     }
-  }, [vadConfig, selectedAudioDevices.output.id]);
+  }, [vadConfig, startBackend]);
 
   // Ignore current recording (stop without transcription)
   const ignoreContinuousRecording = useCallback(async () => {
@@ -649,152 +619,6 @@ export function useSystemAudio() {
     }
   }, [isContinuousMode, isRecordingInContinuousMode]);
 
-  // AI Processing function. Returns the skip word ("SKIP"/"COPY") if the
-  // model explicitly declined to answer, in which case the
-  // previously-displayed response was never overwritten and the caller
-  // should restore any other state it overwrote (e.g. the transcription).
-  // Returns null when a normal answer was produced (or on error).
-  const processWithAI = useCallback(
-    async (
-      transcription: string,
-      prompt: string,
-      previousMessages: HistoryMessage[]
-    ): Promise<string | null> => {
-      // Cancel any previous in-flight AI request before starting a new one.
-      if (currentRequestIdRef.current) {
-        dbg(`processWithAI: cancelling previous ${currentRequestIdRef.current}`);
-        cancelChat(currentRequestIdRef.current).catch(() => {});
-      }
-      const requestId = generateRequestId();
-      currentRequestIdRef.current = requestId;
-      dbg(
-        `processWithAI start req=${requestId} input="${transcription.slice(0, 60)}" history=${previousMessages.length}`
-      );
-
-      try {
-        setIsAIProcessing(true);
-        setError("");
-
-        // Keep the previous response on screen until the new one actually
-        // starts arriving: chunks are buffered while the accumulated text is
-        // still a prefix of a skip word, so a skip (or an error before any
-        // output) never wipes what the user is reading.
-        let fullResponse = "";
-        let displaying = false;
-
-        const usePluelyAPI = await shouldUsePluelyAPI();
-        if (!selectedAIProvider.provider && !usePluelyAPI) {
-          setError("No AI provider selected.");
-          return null;
-        }
-
-        const provider = allAiProviders.find(
-          (p) => p.id === selectedAIProvider.provider
-        );
-        if (!provider && !usePluelyAPI) {
-          setError("AI provider config not found.");
-          return null;
-        }
-
-        const providerInput: ProviderInput = usePluelyAPI
-          ? {
-              id: "pluely",
-              curl: "",
-              responseContentPath: "",
-              streaming: true,
-              isPluelyHosted: true,
-              userVariables: {},
-            }
-          : {
-              id: provider!.id || "",
-              curl: provider!.curl,
-              responseContentPath: provider!.responseContentPath || "",
-              streaming: provider!.streaming ?? false,
-              isPluelyHosted: false,
-              userVariables: Object.fromEntries(
-                Object.entries(selectedAIProvider.variables || {})
-                  .filter(([, v]) => typeof v === "string" && v !== "")
-                  .map(([k, v]) => [k.toUpperCase(), v as string])
-              ),
-            };
-
-        try {
-          for await (const chunk of streamChat({
-            provider: providerInput,
-            message: transcription,
-            systemPrompt: buildEnhancedSystemPrompt(
-              `${prompt}\n\n${SYSTEM_AUDIO_SKIP_INSTRUCTION}`
-            ),
-            history: previousMessages,
-            attachedFiles,
-            requestId,
-          })) {
-            if (currentRequestIdRef.current !== requestId) return null;
-            fullResponse += chunk;
-            if (displaying) {
-              setLastAIResponse((prev) => prev + chunk);
-            } else if (!SKIP_WORDS.some((w) => w.startsWith(fullResponse.trim()))) {
-              displaying = true;
-              setLastAIResponse(fullResponse);
-            }
-          }
-        } catch (aiError: any) {
-          dbg(`processWithAI stream error req=${requestId}: ${aiError?.message}`);
-          if (currentRequestIdRef.current === requestId) {
-            setError(aiError.message || "Failed to get AI response");
-          }
-        }
-        dbg(
-          `processWithAI stream end req=${requestId} full(len=${fullResponse.length})="${fullResponse.slice(0, 60).replace(/\n/g, "\\n")}" displaying=${displaying}`
-        );
-
-        // The model has signalled the current input warrants no new answer
-        // (partial fragment or nothing to reply to) - the previous response
-        // is still displayed; skip saving anything to the conversation. The
-        // caller is responsible for restoring the transcription it set.
-        if (SKIP_WORDS.includes(fullResponse.trim())) {
-          return fullResponse.trim();
-        }
-
-        // Flush a still-buffered response (a prefix of a skip word, but not one).
-        if (!displaying && fullResponse) {
-          setLastAIResponse(fullResponse);
-        }
-
-        if (fullResponse) {
-          const timestamp = Date.now();
-          setConversation((prev) => ({
-            ...prev,
-            messages: [
-              {
-                id: `local_${timestamp}_user`,
-                role: "user" as const,
-                content: transcription,
-                timestamp,
-              },
-              {
-                id: `local_${timestamp + 1}_assistant`,
-                role: "assistant" as const,
-                content: fullResponse,
-                timestamp: timestamp + 1,
-              },
-              ...prev.messages,
-            ],
-            updatedAt: timestamp,
-            title: prev.title || generateConversationTitle(transcription),
-          }));
-        }
-      } catch (err) {
-        setError("Failed to get AI response");
-      } finally {
-        setIsAIProcessing(false);
-        // No auto-restart - user manually controls when to start next recording
-      }
-      return null;
-    },
-    [selectedAIProvider, allAiProviders, conversation.messages, attachedFiles]
-  );
-
   const startCapture = useCallback(async () => {
     try {
       setError("");
@@ -808,15 +632,7 @@ export function useSystemAudio() {
 
       const isContinuous = !vadConfig.enabled;
 
-      // Set up conversation (id assigned by the server on first append).
-      persistedIdsRef.current = new Set();
-      setConversation({
-        id: "",
-        title: "",
-        messages: [],
-        createdAt: 0,
-        updatedAt: 0,
-      });
+      resetConversation();
 
       setCapturing(true);
       setIsPopoverOpen(true);
@@ -831,40 +647,20 @@ export function useSystemAudio() {
         return;
       }
 
-      // VAD mode: Start recording immediately
-      // Stop any existing capture
       await invoke<string>("stop_system_audio_capture");
-
-      const deviceId =
-        selectedAudioDevices.output.id !== "default"
-          ? selectedAudioDevices.output.id
-          : null;
-
-      // Start capture with VAD config
-      await invoke<string>("start_system_audio_capture", {
-        vadConfig: vadConfig,
-        deviceId: deviceId,
-      });
+      await startBackend(vadConfig);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       setError(errorMessage);
       setIsPopoverOpen(true);
     }
-  }, [vadConfig, selectedAudioDevices.output.id]);
+  }, [vadConfig, startBackend, resetConversation]);
 
   const stopCapture = useCallback(async () => {
     // Resets all listen-mode state; the stack identifies which of the many
     // possible triggers (button, shortcut, effect) wiped the screen.
     dbg(`stopCapture called\n${new Error().stack}`);
     try {
-      // Cancel any in-flight AI streaming request.
-      const id = currentRequestIdRef.current;
-      currentRequestIdRef.current = null;
-      if (id) {
-        cancelChat(id).catch(() => {});
-      }
-
-      // Stop the audio capture
       await invoke<string>("stop_system_audio_capture");
 
       // Reset ALL states
@@ -964,111 +760,13 @@ export function useSystemAudio() {
 
   useEffect(() => {
     return () => {
-      const id = currentRequestIdRef.current;
-      currentRequestIdRef.current = null;
-      if (id) {
-        cancelChat(id).catch(() => {});
-      }
       invoke("stop_system_audio_capture").catch(() => {});
     };
   }, []);
 
-  // Debounced sync: diff against persisted IDs and append new messages.
-  // The first append in a fresh session also starts the conversation on the
-  // server (which assigns the conversation id).
-  useEffect(() => {
-    if (saveTimeoutRef.current) {
-      clearTimeout(saveTimeoutRef.current);
-    }
-
-    if (conversation.updatedAt === 0 || conversation.messages.length === 0) {
-      return;
-    }
-
-    saveTimeoutRef.current = setTimeout(async () => {
-      if (isSavingRef.current) return;
-
-      try {
-        isSavingRef.current = true;
-
-        // Append in chronological order so message timestamps remain monotonic.
-        const sortedMessages = [...conversation.messages].sort(
-          (a, b) => a.timestamp - b.timestamp
-        );
-        const unpersisted = sortedMessages.filter(
-          (m) => !persistedIdsRef.current.has(m.id)
-        );
-        if (unpersisted.length === 0) return;
-
-        let convId = conversation.id;
-        if (!convId) {
-          const seedTitle =
-            conversation.title ||
-            generateConversationTitle(unpersisted[0].content);
-          const started = await startConversation(seedTitle);
-          convId = started.id;
-          setConversation((prev) => ({
-            ...prev,
-            id: started.id,
-            title: prev.title || seedTitle,
-            createdAt: started.createdAt,
-          }));
-        }
-
-        const remapping = new Map<
-          string,
-          { newId: string; newTimestamp: number }
-        >();
-        for (const msg of unpersisted) {
-          const appended = await appendMessage(convId, {
-            role: msg.role,
-            content: msg.content,
-          });
-          remapping.set(msg.id, {
-            newId: appended.id,
-            newTimestamp: appended.timestamp,
-          });
-          persistedIdsRef.current.add(appended.id);
-        }
-
-        // Replace the optimistic local IDs with the server-assigned ones.
-        setConversation((prev) => ({
-          ...prev,
-          messages: prev.messages.map((m) => {
-            const r = remapping.get(m.id);
-            if (!r) return m;
-            return { ...m, id: r.newId, timestamp: r.newTimestamp };
-          }),
-        }));
-      } catch (error) {
-        console.error("Failed to save system audio conversation:", error);
-      } finally {
-        isSavingRef.current = false;
-      }
-    }, CONVERSATION_SAVE_DEBOUNCE_MS);
-
-    return () => {
-      if (saveTimeoutRef.current) {
-        clearTimeout(saveTimeoutRef.current);
-      }
-    };
-  }, [
-    conversation.messages,
-    conversation.title,
-    conversation.id,
-    conversation.updatedAt,
-  ]);
-
-  const startNewConversation = useCallback(() => {
+  const startNewConversation = useCallback(async () => {
     dbg(`startNewConversation called\n${new Error().stack}`);
-    persistedIdsRef.current = new Set();
-    setConversation({
-      id: "",
-      title: "",
-      messages: [],
-      createdAt: 0,
-      updatedAt: 0,
-    });
+    resetConversation();
     setLastTranscription("");
     setLastAIResponse("");
     setError("");
@@ -1077,7 +775,16 @@ export function useSystemAudio() {
     setIsAIProcessing(false);
     setIsPopoverOpen(false);
     setUseSystemPrompt(true);
-  }, []);
+    // Rust holds the session memory it was started with.
+    if (capturing && vadConfig.enabled) {
+      try {
+        await invoke("stop_system_audio_capture");
+        await startBackend(vadConfig);
+      } catch (err) {
+        setError(`Failed to restart capture: ${err}`);
+      }
+    }
+  }, [resetConversation, capturing, vadConfig, startBackend]);
 
   // Update VAD configuration
   const updateVadConfiguration = useCallback(
@@ -1096,21 +803,14 @@ export function useSystemAudio() {
           setIsRecordingInContinuousMode(false);
           setVadMetrics(null);
           if (config.enabled) {
-            const deviceId =
-              selectedAudioDevices.output.id !== "default"
-                ? selectedAudioDevices.output.id
-                : null;
-            await invoke("start_system_audio_capture", {
-              vadConfig: config,
-              deviceId,
-            });
+            await startBackend(config);
           }
         }
       } catch (error) {
         console.error("Failed to update VAD config:", error);
       }
     },
-    [vadConfig.enabled, capturing, selectedAudioDevices.output.id]
+    [vadConfig.enabled, capturing, startBackend]
   );
 
   // Explicit calibration: stop capturing if needed, sample ambient audio,
@@ -1158,14 +858,11 @@ export function useSystemAudio() {
         if (wasCapturing) {
           try {
             setCapturing(true);
-            await invoke("start_system_audio_capture", {
-              vadConfig: {
-                ...vadConfig,
-                sensitivity_rms: result.sensitivity_rms,
-                peak_threshold: result.peak_threshold,
-                noise_gate_threshold: result.noise_gate_threshold,
-              },
-              deviceId,
+            await startBackend({
+              ...vadConfig,
+              sensitivity_rms: result.sensitivity_rms,
+              peak_threshold: result.peak_threshold,
+              noise_gate_threshold: result.noise_gate_threshold,
             });
           } catch (e) {
             setError(
@@ -1180,7 +877,7 @@ export function useSystemAudio() {
         setIsCalibrating(false);
       }
     },
-    [isCalibrating, capturing, selectedAudioDevices.output.id, updateVadConfiguration, vadConfig, setError]
+    [isCalibrating, capturing, selectedAudioDevices.output.id, updateVadConfiguration, vadConfig, startBackend]
   );
 
   useEffect(() => {
@@ -1285,9 +982,6 @@ export function useSystemAudio() {
     setIsPopoverOpen,
     // Conversation management
     conversation,
-    setConversation,
-    // AI processing
-    processWithAI,
     // Context management
     useSystemPrompt,
     setUseSystemPrompt: updateUseSystemPrompt,

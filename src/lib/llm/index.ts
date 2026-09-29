@@ -70,7 +70,7 @@ export async function resolveProviderInput(
     };
   }
   if (!selected.provider) {
-    throw new Error("Please select an AI provider in settings");
+    throw new Error("Please select a provider in settings");
   }
   const provider = providers.find((p) => p.id === selected.provider);
   if (!provider) {
