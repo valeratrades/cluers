@@ -1,10 +1,7 @@
 use tauri::State;
 
 use super::queries;
-use super::schema::{
-    AppendedMessage, AppendedTurn, Conversation, ConversationId, ConversationSummary, NewMessage,
-    NewTurn, SystemPrompt,
-};
+use super::schema::{AppendedTurn, Conversation, ConversationSummary, NewTurn, SystemPrompt};
 use super::{Db, DbError};
 
 // -- chat history --------------------------------------------------------
@@ -25,38 +22,12 @@ pub async fn load_conversation(
 }
 
 #[tauri::command]
-pub async fn start_conversation(
-    db: State<'_, Db>,
-    title: String,
-) -> Result<ConversationId, DbError> {
-    db.with_conn(move |c| queries::start_conversation(c, &title)).await
-}
-
-#[tauri::command]
-pub async fn append_message(
-    db: State<'_, Db>,
-    conversation_id: String,
-    message: NewMessage,
-) -> Result<AppendedMessage, DbError> {
-    db.with_conn(move |c| queries::append_message(c, &conversation_id, &message)).await
-}
-
-#[tauri::command]
 pub async fn append_turn(
     db: State<'_, Db>,
     conversation_id: Option<String>,
     turn: NewTurn,
 ) -> Result<AppendedTurn, DbError> {
     db.with_conn(move |c| queries::append_turn(c, conversation_id.as_deref(), turn)).await
-}
-
-#[tauri::command]
-pub async fn rename_conversation(
-    db: State<'_, Db>,
-    id: String,
-    title: String,
-) -> Result<(), DbError> {
-    db.with_conn(move |c| queries::rename_conversation(c, &id, &title)).await
 }
 
 #[tauri::command]

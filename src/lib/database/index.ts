@@ -16,29 +16,18 @@ export interface ConversationSummary {
   messageCount: number;
 }
 
-export interface NewMessage {
-  role: "user" | "assistant" | "system";
-  content: string;
-  attachedFiles?: AttachedFile[];
-}
-
-export interface ConversationIdResponse {
-  id: string;
-  createdAt: number;
-}
-
-export interface AppendedMessageResponse {
+interface AppendedMessageResponse {
   id: string;
   timestamp: number;
 }
 
-export interface NewTurn {
+interface NewTurn {
   user: string;
   attachedFiles: AttachedFile[];
   assistant: string;
 }
 
-export interface AppendedTurn {
+interface AppendedTurn {
   conversationId: string;
   user: AppendedMessageResponse;
   assistant: AppendedMessageResponse;
@@ -54,28 +43,11 @@ export function loadConversation(id: string): Promise<ChatConversation> {
   return invoke("load_conversation", { id });
 }
 
-export function startConversation(
-  title: string
-): Promise<ConversationIdResponse> {
-  return invoke("start_conversation", { title });
-}
-
-export function appendMessage(
-  conversationId: string,
-  message: NewMessage
-): Promise<AppendedMessageResponse> {
-  return invoke("append_message", { conversationId, message });
-}
-
 export function appendTurn(
   conversationId: string | null,
   turn: NewTurn
 ): Promise<AppendedTurn> {
   return invoke("append_turn", { conversationId, turn });
-}
-
-export function renameConversation(id: string, title: string): Promise<void> {
-  return invoke("rename_conversation", { id, title });
 }
 
 export function deleteConversation(id: string): Promise<void> {
