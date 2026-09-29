@@ -1004,9 +1004,9 @@ mod tests {
         const SR: u32 = 44100;
         type Log = Arc<Mutex<Vec<String>>>;
         type Segment = (u64, u64, usize); // (start_ms, end_ms, n_samples)
-        // (script, segments, stopped reasons, progress seconds)
+        type Case = (&'static str, &'static [Step], &'static [Segment], &'static [&'static str], &'static [u64]); // (name, script, segments, stopped reasons, progress seconds)
         #[rustfmt::skip]
-        let cases: &[(&str, &[Step], &[Segment], &[&str], &[u64])] = &[
+        let cases: &[Case] = &[
             ("between start and send", &[Loud(1000), Act(Start), Loud(2000), Act(Send)], &[(1000, 3000, 88200)], &["sent"], &[1, 2]),
             ("discard", &[Act(Start), Loud(1000), Act(Discard)], &[], &["discarded"], &[1]),
             ("limit auto-sends", &[Max(1), Act(Start), Loud(1500), Act(Send)], &[(0, 1000, 44100)], &["limit"], &[1]),
