@@ -2,6 +2,7 @@
 //! Spec: `tests/turn.rs`.
 use crate::db::schema::Role;
 use crate::llm::provider::HistoryMessage;
+use super::vad::VadConfig;
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -14,15 +15,25 @@ If the input is complete and understood but calls for no reply (e.g. a statement
 that needs no answer), reply with exactly the single word COPY. Otherwise respond normally.";
 const TURN_GAP_MS: u64 = 2000; // > natural mid-question pauses (~1.5s); effectively max(this, silence_ms). Stays the no-mic fallback once user speech closes turns (issue 13)
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speaker {
+    Interviewer,
+    User,
+}
+
 pub enum Input {
     SpeechStart {
+        speaker: Speaker,
         at_ms: u64,
     },
     Segment {
-        start_ms: u64, // segment id
+        speaker: Speaker,
+        start_ms: u64, // segment id for Interviewer
         end_ms: u64,
     },
-    Discarded,
+    Discarded {
+        speaker: Speaker,
+    },
     Transcript {
         start_ms: u64,
         text: Result<String, String>,
@@ -78,7 +89,8 @@ pub struct Turns {
 }
 
 impl Turns {
-    pub fn new(history: Vec<HistoryMessage>, carry: String) -> Self {
+    pub fn new(history: Vec<HistoryMessage>, carry: String, vad: &VadConfig) -> Self {
+        let _ = vad;
         Self {
             history,
             carry,
@@ -93,17 +105,37 @@ impl Turns {
     pub fn push(&mut self, input: Input) -> Vec<Output> {
         let mut out = Vec::new();
         match input {
-            Input::SpeechStart { at_ms } => {
+            Input::SpeechStart {
+                speaker: Speaker::User,
+                ..
+            }
+            | Input::Segment {
+                speaker: Speaker::User,
+                ..
+            }
+            | Input::Discarded {
+                speaker: Speaker::User,
+            } => {}
+            Input::SpeechStart {
+                speaker: Speaker::Interviewer,
+                at_ms,
+            } => {
                 self.close_if_due(at_ms);
                 self.speaking = true;
             }
-            Input::Segment { start_ms, end_ms } => {
+            Input::Segment {
+                speaker: Speaker::Interviewer,
+                start_ms,
+                end_ms,
+            } => {
                 let fresh = self.open.insert(start_ms, None).is_none();
                 assert!(fresh, "segment {start_ms} pushed twice");
                 self.speaking = false;
                 self.last_end_ms = end_ms;
             }
-            Input::Discarded => self.speaking = false,
+            Input::Discarded {
+                speaker: Speaker::Interviewer,
+            } => self.speaking = false,
             Input::Transcript { start_ms, text } => {
                 let heard = matches!(&text, Ok(t) if !t.trim().is_empty());
                 let slot = std::iter::once(&mut self.open)

@@ -3,7 +3,7 @@ use crate::db::schema::AttachedFile;
 use crate::llm::commands::{complete, Chat, ProviderInput};
 use crate::llm::provider::HistoryMessage;
 use crate::llm::{stt, LlmError, LlmState};
-use crate::speaker::turn::{Input, Output, TurnEvent, Turns, SKIP_INSTRUCTION, SKIP_WORDS};
+use crate::speaker::turn::{Input, Output, Speaker, TurnEvent, Turns, SKIP_INSTRUCTION, SKIP_WORDS};
 use crate::speaker::vad::{
     apply_noise_gate, calculate_audio_metrics, Segmenter, VadConfig, VadEvent,
 };
@@ -136,7 +136,7 @@ pub async fn start_system_audio_capture(
                         let mut seen = 0u64;
                         let audio = (&mut stream).ready_chunks(4096).map(|c| {
                             seen += c.len() as u64;
-                            (vad.push(&c), seen * 1000 / sr as u64)
+                            (vad.push(&c).into_iter().map(|e| (Speaker::Interviewer, e)).collect(), seen * 1000 / sr as u64)
                         });
                         drive(&app, sr, &vad_config, audio, session, control, events).await;
                         report_stream_error(&app, stream.error());
@@ -151,7 +151,7 @@ pub async fn start_system_audio_capture(
                 if let Some(samples) = recording {
                     let end_ms = samples.len() as u64 * 1000 / sr as u64;
                     let segment = VadEvent::Segment { samples, start_ms: 0, end_ms };
-                    let audio = stream::iter([(vec![segment], end_ms)]);
+                    let audio = stream::iter([(vec![(Speaker::Interviewer, segment)], end_ms)]);
                     drive(&app, sr, &vad_config, audio, session, control, events).await;
                 }
             })
@@ -233,7 +233,7 @@ async fn drive(
     app: &AppHandle,
     sr: u32,
     vad_cfg: &VadConfig,
-    mut audio: impl Stream<Item = (Vec<VadEvent>, u64)> + Unpin,
+    mut audio: impl Stream<Item = (Vec<(Speaker, VadEvent)>, u64)> + Unpin,
     session: Session,
     mut control: mpsc::UnboundedReceiver<Control>,
     events: Channel<TurnEvent>,
@@ -245,7 +245,7 @@ async fn drive(
         history,
         carry,
     } = session;
-    let mut turns = Turns::new(history, carry);
+    let mut turns = Turns::new(history, carry, vad_cfg);
     let mut transcripts = FuturesUnordered::<BoxFuture<'_, (u64, Result<String, String>)>>::new();
     let mut answer: Option<BoxFuture<'_, Result<String, LlmError>>> = None;
     let mut audio_done = false;
@@ -262,40 +262,45 @@ async fn drive(
                 }
                 Some((vad_events, now_ms)) => {
                     let mut inputs = Vec::new();
-                    for ev in vad_events {
+                    for (speaker, ev) in vad_events {
                         match ev {
                             VadEvent::SpeechStart { start_ms } => {
-                                inputs.push(Input::SpeechStart { at_ms: start_ms })
+                                inputs.push(Input::SpeechStart { speaker, at_ms: start_ms })
                             }
                             VadEvent::Segment { samples, start_ms, end_ms } => {
-                                let wav = samples_to_wav(sr, &normalize_audio_level(&samples, 0.1));
-                                let provider = config.stt.clone();
-                                transcripts.push(
-                                    async move {
-                                        let text = match tokio::time::timeout(
-                                            STT_TIMEOUT,
-                                            stt::transcribe(app, llm, &provider, &wav, "audio/wav"),
-                                        )
-                                        .await
-                                        {
-                                            Ok(r) => r.map_err(|e| format!("Transcription failed: {e}")),
-                                            Err(_) => Err("Speech transcription timed out (30s)".to_string()),
-                                        };
-                                        (start_ms, text)
-                                    }
-                                    .boxed(),
-                                );
-                                inputs.push(Input::Segment { start_ms, end_ms });
+                                if speaker == Speaker::Interviewer {
+                                    let wav = samples_to_wav(sr, &normalize_audio_level(&samples, 0.1));
+                                    let provider = config.stt.clone();
+                                    transcripts.push(
+                                        async move {
+                                            let text = match tokio::time::timeout(
+                                                STT_TIMEOUT,
+                                                stt::transcribe(app, llm, &provider, &wav, "audio/wav"),
+                                            )
+                                            .await
+                                            {
+                                                Ok(r) => r.map_err(|e| format!("Transcription failed: {e}")),
+                                                Err(_) => Err("Speech transcription timed out (30s)".to_string()),
+                                            };
+                                            (start_ms, text)
+                                        }
+                                        .boxed(),
+                                    );
+                                }
+                                inputs.push(Input::Segment { speaker, start_ms, end_ms });
                             }
                             VadEvent::Discarded { .. } => {
-                                if let Err(e) = app.emit(
-                                    "speech-discarded",
-                                    "Audio too short (likely background noise)",
-                                ) {
-                                    error!("Failed to emit speech-discarded: {}", e);
+                                if speaker == Speaker::Interviewer {
+                                    if let Err(e) = app.emit(
+                                        "speech-discarded",
+                                        "Audio too short (likely background noise)",
+                                    ) {
+                                        error!("Failed to emit speech-discarded: {}", e);
+                                    }
                                 }
-                                inputs.push(Input::Discarded);
+                                inputs.push(Input::Discarded { speaker });
                             }
+                            VadEvent::Metrics { .. } if speaker == Speaker::User => {} // meters and calibration are about system audio
                             VadEvent::Metrics { rms, peak, in_speech } => {
                                 if let Err(e) = app.emit(
                                     "vad-metrics",
