@@ -78,7 +78,7 @@ fn list_devices(outputs: bool) -> Result<Vec<AudioDevice>> {
         .map(|(name, description)| {
             let id = name.expect("PulseAudio sinks and sources are always named");
             AudioDevice {
-                name: description.unwrap_or_else(|| id.clone()),
+                name: description.unwrap_or_else(|| id.clone()), // Pulse descriptions are optional
                 is_default: default.as_ref() == Some(&id),
                 id,
             }
@@ -327,6 +327,9 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
+    /// Serializes tests that load sinks or open streams: under parallel runs a kill intermittently left the stream running (issue 15).
+    static LIVE_PULSE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Private sink per test, so tests never touch the user's real devices.
     struct NullSink {
         name: String,
@@ -426,6 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn microphone_delivers_samples_from_named_source() {
+        let serial = LIVE_PULSE.lock().await;
         let sink = NullSink::new();
         let mut stream = SpeakerInput::microphone(Some(sink.monitor()))
             .unwrap()
@@ -434,6 +438,9 @@ mod tests {
             .await
             .expect("capture delivers samples")
             .expect("stream alive");
+        drop(stream);
+        drop(sink);
+        drop(serial);
     }
 
     #[test]
@@ -443,6 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_ends_with_error_when_capture_is_killed() {
+        let serial = LIVE_PULSE.lock().await;
         let sink = NullSink::new();
         let mut stream = SpeakerInput::new_with_device(Some(sink.name.clone()))
             .unwrap()
@@ -461,25 +469,47 @@ mod tests {
         .await
         .expect("stream ends after its capture is killed");
         assert!(stream.error().is_some());
+        drop(stream);
+        drop(sink);
+        drop(serial);
     }
 
+    /// Counts waits instead of timing them, so machine load cannot fail it: ~40 per second with the 20ms fragsize, at most ~2 with the ~2s server default.
     #[tokio::test]
-    async fn first_sample_arrives_within_200ms() {
+    async fn delivers_audio_in_small_fragments() {
+        use futures_util::FutureExt;
+        let serial = LIVE_PULSE.lock().await;
         let sink = NullSink::new();
-        let started = std::time::Instant::now();
         let mut stream = SpeakerInput::new_with_device(Some(sink.name.clone()))
             .unwrap()
             .stream();
-        stream.next().await.expect("stream alive");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(200),
-            "first sample after {elapsed:?}"
-        );
+        let hang_guard = Duration::from_secs(5);
+        tokio::time::timeout(hang_guard, stream.next())
+            .await
+            .expect("capture delivers samples")
+            .expect("stream alive");
+        let mut fragments = 0;
+        for _ in 0..44_100 {
+            let sample = match stream.next().now_or_never() {
+                Some(sample) => sample,
+                None => {
+                    fragments += 1;
+                    tokio::time::timeout(hang_guard, stream.next())
+                        .await
+                        .expect("capture keeps delivering")
+                }
+            };
+            sample.expect("stream alive");
+        }
+        assert!(fragments >= 10, "{fragments} fragments in one second of audio");
+        drop(stream);
+        drop(sink);
+        drop(serial);
     }
 
     #[test]
     fn null_sink_listed_as_output_only() {
+        let serial = LIVE_PULSE.blocking_lock();
         let sink = NullSink::new();
         assert!(get_output_devices()
             .unwrap()
@@ -489,5 +519,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|d| d.id == sink.monitor()));
+        drop(sink);
+        drop(serial);
     }
 }

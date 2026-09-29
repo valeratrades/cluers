@@ -1,5 +1,5 @@
 //! Spec for the VAD segmenter. Fixtures: `tests/fixtures/vad/gen.sh`.
-use pluely_lib::vad::{Segmenter, VadConfig, VadEvent};
+use pluely_lib::vad::{Segmenter, VadConfig, VadEvent, HOP_MS};
 use std::f32::consts::TAU;
 
 mod common;
@@ -111,8 +111,8 @@ fn segments_match_ground_truth() {
             for (rate, got) in &per_rate[1..] {
                 let same = got.len() == first.len()
                     && got.iter().zip(first).all(|(a, b)| {
-                        (a.0 as i64 - b.0 as i64).abs() <= config.hop_ms as i64
-                            && (a.1 as i64 - b.1 as i64).abs() <= config.hop_ms as i64
+                        (a.0 as i64 - b.0 as i64).abs() <= HOP_MS as i64
+                            && (a.1 as i64 - b.1 as i64).abs() <= HOP_MS as i64
                     });
                 if !same {
                     failures.push(format!(
@@ -130,13 +130,19 @@ fn config_rejected() {
     type Mutate = fn(&mut VadConfig, &mut u32);
     let cases: &[(&str, Mutate, bool)] = &[
         ("default", |_, _| {}, true),
-        ("hop 0", |c, _| c.hop_ms = 0, false),
-        ("silence < hop", |c, _| c.silence_ms = c.hop_ms - 1, false),
+        ("silence < hop", |c, _| c.silence_ms = HOP_MS - 1, false),
         (
             "cap <= silence",
             |c, _| c.max_segment_ms = c.silence_ms,
             false,
         ),
+        (
+            "min speech >= cap",
+            |c, _| c.min_speech_ms = c.max_segment_ms,
+            false,
+        ),
+        ("pre-speech > 10s", |c, _| c.pre_speech_ms = 10_001, false),
+        ("recording limit 0", |c, _| c.max_recording_duration_secs = 0, false),
         ("NaN threshold", |c, _| c.sensitivity_rms = f32::NAN, false),
         ("sr 4000", |_, sr| *sr = 4000, false),
     ];
@@ -160,5 +166,45 @@ fn max_segment_cap() {
     }
     for w in segs.windows(2) {
         assert_eq!(w[0].1, w[1].0, "capped pieces not contiguous: {segs:?}");
+    }
+}
+
+/// Segments from feeding `pauses` @44.1kHz in 4096-sample chunks, reconfiguring before every chunk from `at`.
+fn run_reconfigured(at: impl Fn(u64) -> VadConfig) -> Vec<(u64, u64)> {
+    let rate = 44100;
+    let mut vad = Segmenter::new(&at(0), rate).unwrap();
+    let mut segs = Vec::new();
+    let mut samples = load("pauses", rate);
+    samples.resize(samples.len() + 3 * rate as usize, 0.0); // the fixture ends 2s after speech, before a 2.5s silence closes it
+    for (i, chunk) in samples.chunks(4096).enumerate() {
+        vad.reconfigure(&at(i as u64 * 4096 * 1000 / rate as u64)).unwrap();
+        for ev in vad.push(chunk) {
+            if let VadEvent::Segment { start_ms, end_ms, .. } = ev {
+                segs.push((start_ms, end_ms));
+            }
+        }
+    }
+    segs
+}
+
+#[test]
+fn reconfigure_is_live() {
+    let truth = truth("pauses");
+    let config = |silence_ms| VadConfig {
+        silence_ms,
+        ..VadConfig::default()
+    };
+    let (plain, _) = run(&load("pauses", 44100), 44100, &VadConfig::default());
+    assert_eq!(run_reconfigured(|_| VadConfig::default()), plain, "same config keeps the stream state");
+
+    // 7500 ms sits inside the 1500 ms pause after the first merged segment, which is still open
+    let switched = run_reconfigured(|t| config(if t < 7500 { 1000 } else { 2500 }));
+    let want = expected(&truth, 2500);
+    assert_eq!(switched.len(), want.len(), "{switched:?} vs {want:?}");
+    for (g, w) in switched.iter().zip(&want) {
+        assert!(
+            (g.0 as i64 - w.0 as i64).abs() <= TOLERANCE_MS && (g.1 as i64 - w.1 as i64).abs() <= TOLERANCE_MS,
+            "{switched:?} vs {want:?}"
+        );
     }
 }

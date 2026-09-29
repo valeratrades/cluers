@@ -170,7 +170,7 @@ export function AudioVisualizer({ stream, isRecording }: AudioVisualizerProps) {
 
       draw();
     } catch (error) {
-      console.error("Error starting visualization:", error);
+      console.error("Error starting visualization:", error); // cosmetic: capture works without it
     }
   };
 

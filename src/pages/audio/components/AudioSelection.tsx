@@ -17,6 +17,7 @@ export const AudioSelection = () => {
   const { selectedAudioDevices, setSelectedAudioDevices } = useApp();
 
   const [isLoadingDevices, setIsLoadingDevices] = useState(false);
+  const [loadError, setLoadError] = useState("");
   const [showSuccess, setShowSuccess] = useState<{
     input: boolean;
     output: boolean;
@@ -31,6 +32,15 @@ export const AudioSelection = () => {
     input: [],
     output: [],
   });
+
+  type Device = { id: string; name: string; is_default: boolean };
+  // "" is the system default; a saved device that is not listed stays selected so capture fails loudly
+  const deviceLabel = (list: Device[], selected: { id: string; name: string }) => {
+    if (!selected.id) return "System default";
+    const d = list.find((d) => d.id === selected.id);
+    if (!d) return `${selected.name || selected.id} (not connected)`;
+    return d.name + (d.is_default ? " (Default)" : "");
+  };
 
   // Save devices to localStorage
   const saveToStorage = (newDevices: typeof selectedAudioDevices) => {
@@ -67,39 +77,9 @@ export const AudioSelection = () => {
             is_default: output?.is_default,
           })) || [],
       });
-
-      // Only update if no device is currently selected or if the selected device doesn't exist
-      const currentInputExists = inputDevices.some(
-        (d) => d.id === selectedAudioDevices.input.id
-      );
-      const currentOutputExists = outputDevices.some(
-        (d) => d.id === selectedAudioDevices.output.id
-      );
-
-      if (!currentInputExists || !currentOutputExists) {
-        const defaultInput = inputDevices?.find((d) => d?.is_default);
-        const defaultOutput = outputDevices?.find((d) => d?.is_default);
-
-        const newDevices = {
-          input: currentInputExists
-            ? selectedAudioDevices.input
-            : {
-                id: defaultInput?.id || inputDevices[0]?.id || "",
-                name: defaultInput?.name || inputDevices[0]?.name || "",
-              },
-          output: currentOutputExists
-            ? selectedAudioDevices.output
-            : {
-                id: defaultOutput?.id || outputDevices[0]?.id || "",
-                name: defaultOutput?.name || outputDevices[0]?.name || "",
-              },
-        };
-
-        setSelectedAudioDevices(newDevices);
-        saveToStorage(newDevices);
-      }
+      setLoadError("");
     } catch (error) {
-      console.error("Error loading audio devices:", error);
+      setLoadError(`Failed to list audio devices: ${error}`);
     } finally {
       setIsLoadingDevices(false);
     }
@@ -132,6 +112,11 @@ export const AudioSelection = () => {
 
   return (
     <div id="audio" className="space-y-1 flex flex-col gap-4">
+      {loadError && (
+        <div className="text-xs text-red-500 bg-red-500/10 p-3 rounded-md">
+          {loadError}
+        </div>
+      )}
       {/* Microphone Input Section */}
       <div className="space-y-3">
         <Header
@@ -156,14 +141,7 @@ export const AudioSelection = () => {
                         ? "Loading microphones..."
                         : devices?.input?.length === 0
                         ? "No microphones found"
-                        : devices?.input?.find(
-                            (mic) => mic?.id === selectedAudioDevices.input.id
-                          )?.name +
-                            (devices?.input?.find(
-                              (mic) => mic?.id === selectedAudioDevices.input.id
-                            )?.is_default
-                              ? " (Default)"
-                              : "") || "Select a microphone"}
+                        : deviceLabel(devices.input, selectedAudioDevices.input)}
                     </div>
                   </div>
                 </SelectTrigger>
@@ -252,16 +230,7 @@ export const AudioSelection = () => {
                         ? "Loading output devices..."
                         : devices?.output?.length === 0
                         ? "No output devices found"
-                        : devices?.output?.find(
-                            (output) =>
-                              output?.id === selectedAudioDevices.output.id
-                          )?.name +
-                            (devices?.output?.find(
-                              (output) =>
-                                output?.id === selectedAudioDevices.output.id
-                            )?.is_default
-                              ? " (Default)"
-                              : "") || "Select an output device"}
+                        : deviceLabel(devices.output, selectedAudioDevices.output)}
                     </div>
                   </div>
                 </SelectTrigger>
