@@ -21,9 +21,8 @@ use tauri_nspanel::{cocoa::appkit::NSWindowCollectionBehavior, panel_delegate, W
 
 #[derive(Default)]
 pub struct AudioState {
-    stream_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    capture: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     vad_config: Arc<Mutex<VadConfig>>,
-    is_capturing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[tauri::command]
@@ -133,8 +132,6 @@ pub fn run() {
             speaker::get_vad_config,
             speaker::update_vad_config,
             speaker::calibrate_vad_thresholds,
-            speaker::get_capture_status,
-            speaker::get_audio_sample_rate,
             speaker::get_input_devices,
             speaker::get_output_devices,
         ])
