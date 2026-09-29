@@ -21,6 +21,7 @@ export const AudioRecorder = ({
   const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [duration, setDuration] = useState(0);
+  const [error, setError] = useState("");
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -46,7 +47,7 @@ export const AudioRecorder = ({
       try {
         mediaRecorderRef.current.stop();
       } catch (e) {
-        // Ignore errors when stopping
+        // teardown: the tracks are stopped below either way
       }
     }
     mediaRecorderRef.current = null;
@@ -124,9 +125,8 @@ export const AudioRecorder = ({
         }
       }, MAX_DURATION);
     } catch (error) {
-      console.error("Failed to start recording:", error);
       cleanup();
-      onCancel();
+      setError(`Failed to start recording: ${error}`);
     }
   };
 
@@ -162,8 +162,8 @@ export const AudioRecorder = ({
 
       onTranscriptionComplete(text);
     } catch (error) {
-      console.error("Transcription failed:", error);
-      onCancel();
+      setIsTranscribing(false);
+      setError(`Transcription failed: ${error}`);
     }
   };
 
@@ -177,7 +177,11 @@ export const AudioRecorder = ({
   return (
     <div className="border bg-background rounded-lg overflow-hidden">
       <div className="h-12 relative bg-muted/20">
-        {audioStream ? (
+        {error ? (
+          <div className="h-full flex items-center justify-center px-4 text-xs text-red-500 truncate" title={error}>
+            {error}
+          </div>
+        ) : audioStream ? (
           <div className="h-full w-full pt-3">
             <AudioVisualizer stream={audioStream} isRecording={true} />
           </div>
