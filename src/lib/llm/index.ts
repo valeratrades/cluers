@@ -3,7 +3,7 @@
 // polling. Cancellation is by per-request UUID via `cancelChat`.
 
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { AttachedFile } from "@/types";
+import type { AttachedFile, ProviderKind } from "@/types";
 import { MARKDOWN_FORMATTING_INSTRUCTIONS } from "@/config/constants";
 import {
   RESPONSE_LENGTHS,
@@ -143,28 +143,34 @@ export function cancelChat(requestId: string): Promise<void> {
 // -- Provider secrets --------------------------------------------------------
 
 export function setProviderSecret(
+  kind: ProviderKind,
   providerId: string,
   name: string,
   value: string
 ): Promise<void> {
-  return invoke("set_provider_secret", { providerId, name, value });
+  return invoke("set_provider_secret", { kind, providerId, name, value });
 }
 
 export function listProviderSecretNames(
+  kind: ProviderKind,
   providerId: string
 ): Promise<string[]> {
-  return invoke("list_provider_secret_names", { providerId });
+  return invoke("list_provider_secret_names", { kind, providerId });
 }
 
 export function deleteProviderSecret(
+  kind: ProviderKind,
   providerId: string,
   name: string
 ): Promise<void> {
-  return invoke("delete_provider_secret", { providerId, name });
+  return invoke("delete_provider_secret", { kind, providerId, name });
 }
 
-export function deleteAllProviderSecrets(providerId: string): Promise<void> {
-  return invoke("delete_all_provider_secrets", { providerId });
+export function deleteAllProviderSecrets(
+  kind: ProviderKind,
+  providerId: string
+): Promise<void> {
+  return invoke("delete_all_provider_secrets", { kind, providerId });
 }
 
 // -- Pluely selected model ---------------------------------------------------

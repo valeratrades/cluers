@@ -40,6 +40,7 @@ export type IContextType = {
   toggleAlwaysOnTop: (isEnabled: boolean) => Promise<void>;
   toggleAutostart: (isEnabled: boolean) => Promise<void>;
   loadData: () => void;
+  sttMigrationError: string | null;
   pluelyApiEnabled: boolean;
   setPluelyApiEnabled: (enabled: boolean) => Promise<void>;
   hasActiveLicense: boolean;

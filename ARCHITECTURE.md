@@ -84,6 +84,7 @@ src-tauri/src/llm/
 ├── secrets.rs       keyring-rs wrappers + `Secrets` write-through cache
 ├── provider.rs      curl parsing, variable substitution, message builder
 ├── stream.rs        SSE chunking and `responseContentPath` extraction
+├── stt.rs           `transcribe`: Pluely-hosted or custom curl template (-F / --data-binary / -d)
 └── pluely.rs        Pluely-hosted path: /api/response config, user activity
 ```
 
@@ -107,29 +108,32 @@ src-tauri/src/llm/
   extracted with the provider's `response_content_path` JSON path.
 - **One command for both paths.** Pluely-hosted vs custom is an
   internal branch on `provider.is_pluely_hosted`; the renderer doesn't
-  pick a transport.
+  pick a transport. STT mirrors this: `transcribe` (non-streaming) routes
+  through `stt::transcribe`, which in-process callers use directly.
 
 ### Secret storage
 
 `keyring-rs` v3 (Keychain on macOS, Credential Manager on Windows,
-libsecret on Linux). One entry per provider:
+libsecret on Linux). One entry per (kind, provider) — built-in ids such as
+`groq` exist in both kinds:
 
-| Domain           | Service                         | Account   | Value                    |
-|------------------|---------------------------------|-----------|--------------------------|
-| Provider secrets | `pluely.provider.<provider_id>` | `secrets` | JSON map `{name: value}` |
+| Domain               | Service                             | Account   | Value                    |
+|----------------------|-------------------------------------|-----------|--------------------------|
+| AI provider secrets  | `pluely.provider.<provider_id>`     | `secrets` | JSON map `{name: value}` |
+| STT provider secrets | `pluely.stt-provider.<provider_id>` | `secrets` | JSON map `{name: value}` |
 
 `Secrets` (in `LlmState`) is a write-through cache, so the keychain is read
 at most once per provider per run. The Pluely `selected_model` is a
 preference and lives in the SQLite `settings` table. The JS surface is
-set / list-names / delete / delete-all; secret values are never exposed to
-the renderer.
+set / list-names / delete / delete-all, each scoped by `kind: "ai" | "stt"`;
+secret values are never exposed to the renderer.
 
 ### Errors
 
 `LlmError` is a `thiserror` enum (`Reqwest`, `Keychain`,
 `MissingVariable`, `InvalidCurl`, `PluelyUnlicensed`, `PluelyConfig`,
-`ProviderApi { status, body }`, `CurlParse`, `Json`, `DuplicateRequestId`,
-`Cancelled`) with
+`ProviderApi { status, body }`, `CurlParse`, `Json`, `PluelyStt`,
+`SttResponse`, `DuplicateRequestId`, `Cancelled`) with
 a manual `serde::Serialize` impl emitting `self.to_string()`. The
 previous fire-and-forget `report_api_error` spawns are awaited inline.
 

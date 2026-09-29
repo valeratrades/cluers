@@ -2,12 +2,10 @@
 //!
 //! LLM streaming, provider secrets, and the `/api/response` configuration
 //! helper live in `crate::llm`. What stays here is:
-//! - STT (`transcribe_audio`) and its audio-only helpers (Phase 1.3 will
-//!   relocate STT into a dedicated module);
+//! - Pluely-hosted STT (`transcribe_pluely`), called from `crate::llm::stt`;
 //! - Pluely-side catalog endpoints: `fetch_models`, `fetch_prompts`,
 //!   `generate_system_prompt_via_api`, `get_activity`.
 
-use base64::{engine::general_purpose, Engine as _};
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -39,13 +37,6 @@ pub fn get_api_access_key() -> Result<String, String> {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AudioResponse {
-    success: bool,
-    transcription: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ModelsResponse {
     models: Vec<Model>,
 }
@@ -74,19 +65,18 @@ pub struct PluelyPromptsResponse {
     last_updated: Option<String>,
 }
 
-#[tauri::command]
-pub async fn transcribe_audio(
-    app: AppHandle,
-    audio_base64: String,
-) -> Result<AudioResponse, String> {
-    let selected_model = crate::llm::pluely::selected_model_get(&app)
+pub(crate) async fn transcribe_pluely(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    audio_bytes: &[u8],
+) -> Result<String, String> {
+    let selected_model = crate::llm::pluely::selected_model_get(app)
         .await
         .map_err(|e| e.to_string())?;
     let provider = selected_model.as_ref().map(|m| m.provider.clone());
     let model = selected_model.as_ref().map(|m| m.model.clone());
 
-    let client = reqwest::Client::new();
-    let api_config = fetch_api_response_config(&app, &client, provider.clone(), model.clone())
+    let api_config = fetch_api_response_config(app, client, provider.clone(), model.clone())
         .await
         .map_err(|e| e.to_string())?;
     let user_audio_config = api_config.user_audio.as_ref().ok_or_else(|| {
@@ -94,24 +84,19 @@ pub async fn transcribe_audio(
             .to_string()
     })?;
 
-    let audio_bytes = decode_audio_base64(&audio_base64)?;
     let error_provider = provider.clone();
     let error_model = model.clone();
     match perform_user_audio_transcription(
-        &client,
+        client,
         &user_audio_config.url,
         &user_audio_config.user_token,
         &user_audio_config.model,
         user_audio_config.headers.as_ref(),
-        &audio_bytes,
+        audio_bytes,
     )
     .await
     {
-        Ok(transcription) => Ok(AudioResponse {
-            success: true,
-            transcription: Some(transcription),
-            error: None,
-        }),
+        Ok(transcription) => Ok(transcription),
         Err(primary_error) => {
             let fallback_error_message = if let (Some(fallback_url), Some(fallback_token)) = (
                 user_audio_config.fallback_url.as_ref(),
@@ -123,22 +108,16 @@ pub async fn transcribe_audio(
                     .unwrap_or(&user_audio_config.model);
 
                 match perform_user_audio_transcription(
-                    &client,
+                    client,
                     fallback_url,
                     fallback_token,
                     fallback_model,
                     user_audio_config.headers.as_ref(),
-                    &audio_bytes,
+                    audio_bytes,
                 )
                 .await
                 {
-                    Ok(transcription) => {
-                        return Ok(AudioResponse {
-                            success: true,
-                            transcription: Some(transcription),
-                            error: None,
-                        });
-                    }
+                    Ok(transcription) => return Ok(transcription),
                     Err(fallback_error) => Some(fallback_error),
                 }
             } else {
@@ -157,8 +136,8 @@ pub async fn transcribe_audio(
                 None => primary_error.clone(),
             };
             report_api_error(
-                &app,
-                &client,
+                app,
+                client,
                 error_msg,
                 "/api/transcribe".to_string(),
                 error_model,
@@ -168,18 +147,6 @@ pub async fn transcribe_audio(
             Err("Transcription failed. Please try again.".to_string())
         }
     }
-}
-
-fn decode_audio_base64(audio_base64: &str) -> Result<Vec<u8>, String> {
-    let trimmed = audio_base64.trim();
-    let base64_str = if let Some(idx) = trimmed.find(',') {
-        &trimmed[idx + 1..]
-    } else {
-        trimmed
-    };
-    general_purpose::STANDARD
-        .decode(base64_str)
-        .map_err(|e| format!("Failed to decode audio data: {}", e))
 }
 
 async fn perform_user_audio_transcription(

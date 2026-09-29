@@ -6,6 +6,7 @@
 //! - `-X METHOD` / `--request METHOD`
 //! - `-H 'K: V'` / `--header 'K: V'` (quoted, double-quoted, or bare)
 //! - `-d <data>` / `--data <data>` / `--data-raw <data>` / `--data-binary <data>`
+//! - `-F k=v` / `--form k=v`
 //! - `--url <url>` and the bare positional URL
 //!
 //! Variable templates use `{{UPPER_SNAKE}}` placeholders. Reserved names
@@ -16,7 +17,9 @@
 
 use crate::db::schema::AttachedFile;
 use crate::llm::{
-    commands::StreamChatRequest, secrets::Secrets, stream, LlmError, StreamEvent,
+    commands::{ProviderInput, StreamChatRequest},
+    secrets::{ProviderKind, Secrets},
+    stream, LlmError, StreamEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,7 +38,8 @@ pub struct ParsedCurl {
     pub url: String,
     pub method: String,
     pub headers: HashMap<String, String>,
-    pub body: Option<serde_json::Value>,
+    pub data: Option<String>,
+    pub form: Vec<(String, String)>,
 }
 
 pub fn parse_curl(input: &str) -> Result<ParsedCurl, LlmError> {
@@ -47,7 +51,8 @@ pub fn parse_curl(input: &str) -> Result<ParsedCurl, LlmError> {
     let mut url: Option<String> = None;
     let mut method: Option<String> = None;
     let mut headers: HashMap<String, String> = HashMap::new();
-    let mut body: Option<String> = None;
+    let mut data: Option<String> = None;
+    let mut form: Vec<(String, String)> = Vec::new();
 
     while let Some(tok) = iter.next() {
         match tok.as_str() {
@@ -60,7 +65,12 @@ pub fn parse_curl(input: &str) -> Result<ParsedCurl, LlmError> {
                 headers.insert(k.trim().to_string(), val.trim().to_string());
             }
             "-d" | "--data" | "--data-raw" | "--data-binary" => {
-                body = Some(iter.next().ok_or(LlmError::InvalidCurl("missing -d value"))?);
+                data = Some(iter.next().ok_or(LlmError::InvalidCurl("missing -d value"))?);
+            }
+            "-F" | "--form" => {
+                let v = iter.next().ok_or(LlmError::InvalidCurl("missing -F value"))?;
+                let (k, val) = v.split_once('=').ok_or(LlmError::InvalidCurl("bad -F"))?;
+                form.push((k.to_string(), val.to_string()));
             }
             "--url" => {
                 url = Some(iter.next().ok_or(LlmError::InvalidCurl("missing --url value"))?);
@@ -76,24 +86,18 @@ pub fn parse_curl(input: &str) -> Result<ParsedCurl, LlmError> {
 
     let url = url.ok_or(LlmError::InvalidCurl("missing URL"))?;
     let method = method.unwrap_or_else(|| {
-        if body.is_some() {
+        if data.is_some() || !form.is_empty() {
             "POST".to_string()
         } else {
             "GET".to_string()
         }
     });
-    let body_json = match body {
-        None => None,
-        Some(s) => Some(
-            serde_json::from_str(&s)
-                .map_err(|e| LlmError::CurlParse(format!("body json: {e}")))?,
-        ),
-    };
     Ok(ParsedCurl {
         url,
         method,
         headers,
-        body: body_json,
+        data,
+        form,
     })
 }
 
@@ -380,6 +384,45 @@ fn expand_one_array(
     out
 }
 
+/// user_variables (uppercased) ∪ keychain secrets of `kind`; keychain wins.
+/// Every non-reserved `{{VAR}}` in the template must resolve to a non-blank value.
+pub(crate) async fn resolve_vars(
+    secrets: &Secrets,
+    kind: ProviderKind,
+    p: &ProviderInput,
+) -> Result<HashMap<String, String>, LlmError> {
+    let mut vars: HashMap<String, String> = p
+        .user_variables
+        .iter()
+        .map(|(k, v)| (k.to_ascii_uppercase(), v.clone()))
+        .collect();
+    vars.extend(secrets.provider(kind, &p.id).await?);
+    for v in extract_variables(&p.curl) {
+        if matches!(
+            v.as_str(),
+            "SYSTEM_PROMPT" | "TEXT" | "IMAGE" | "IMAGE_MIME" | "AUDIO" | "DOCUMENT"
+                | "DOCUMENT_NAME"
+        ) {
+            continue;
+        }
+        if vars.get(&v).is_none_or(|s| s.trim().is_empty()) {
+            return Err(LlmError::MissingVariable(v));
+        }
+    }
+    Ok(vars)
+}
+
+pub(crate) fn method(s: &str) -> Result<reqwest::Method, LlmError> {
+    Ok(match s.to_ascii_uppercase().as_str() {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "PATCH" => reqwest::Method::PATCH,
+        "DELETE" => reqwest::Method::DELETE,
+        other => return Err(LlmError::CurlParse(format!("unsupported method: {other}"))),
+    })
+}
+
 /// Custom-provider stream entrypoint (the non-Pluely path).
 pub async fn stream_custom(
     http: &reqwest::Client,
@@ -405,40 +448,17 @@ pub async fn stream_custom(
     let p = &request.provider;
     let parsed = parse_curl(&p.curl)?;
 
-    // Merge keychain secrets + non-secret user_variables. Keychain wins.
-    let mut vars: HashMap<String, String> = p
-        .user_variables
-        .iter()
-        .map(|(k, v)| (k.to_ascii_uppercase(), v.clone()))
-        .collect();
-    for (name, v) in secrets.provider(&p.id).await? {
-        vars.insert(name, v);
-    }
+    let mut vars = resolve_vars(secrets, ProviderKind::Ai, p).await?;
     vars.insert(
         "SYSTEM_PROMPT".to_string(),
         request.system_prompt.clone().unwrap_or_default(),
     );
 
-    // Required-variable check (excludes reserved per-message tokens).
-    for v in extract_variables(&p.curl) {
-        if matches!(
-            v.as_str(),
-            "SYSTEM_PROMPT" | "TEXT" | "IMAGE" | "IMAGE_MIME" | "AUDIO" | "DOCUMENT"
-                | "DOCUMENT_NAME"
-        ) {
-            continue;
-        }
-        if vars
-            .get(&v)
-            .map(|s| s.trim().is_empty())
-            .unwrap_or(true)
-        {
-            return Err(LlmError::MissingVariable(v));
-        }
-    }
-
-    // Build body (messages + attachments + variable subs).
-    let mut body = parsed.body.unwrap_or_else(|| serde_json::json!({}));
+    let mut body = match parsed.data {
+        None => serde_json::json!({}),
+        Some(s) => serde_json::from_str(&s)
+            .map_err(|e| LlmError::CurlParse(format!("body json: {e}")))?,
+    };
     build_messages(
         &mut body,
         &request.history,
@@ -462,16 +482,7 @@ pub async fn stream_custom(
     }
 
     let url = substitute_string(&parsed.url, &vars);
-    let method = match parsed.method.to_ascii_uppercase().as_str() {
-        "GET" => reqwest::Method::GET,
-        "POST" => reqwest::Method::POST,
-        "PUT" => reqwest::Method::PUT,
-        "PATCH" => reqwest::Method::PATCH,
-        "DELETE" => reqwest::Method::DELETE,
-        other => {
-            return Err(LlmError::CurlParse(format!("unsupported method: {other}")))
-        }
-    };
+    let method = method(&parsed.method)?;
 
     let mut req_builder = http.request(method.clone(), url);
     for (k, v) in &parsed.headers {
@@ -564,6 +575,26 @@ mod tests {
             ]}
         ]
     }"#;
+
+    #[test]
+    fn parse_curl_shapes() {
+        let ai = parse_curl(r#"curl https://x/v1 -H 'Authorization: Bearer {{API_KEY}}' -d '{"model":"m","messages":[]}'"#).unwrap();
+        assert_eq!(ai.method, "POST");
+        let body: serde_json::Value = serde_json::from_str(ai.data.as_deref().unwrap()).unwrap();
+        assert_eq!(body["model"], "m");
+        assert!(ai.form.is_empty());
+
+        let stt = parse_curl(r#"curl https://x/t -F "file={{AUDIO}}" -F model=whisper-1"#).unwrap();
+        assert_eq!(stt.method, "POST");
+        assert_eq!(stt.data, None);
+        assert_eq!(
+            stt.form,
+            vec![("file".into(), "{{AUDIO}}".into()), ("model".into(), "whisper-1".into())]
+        );
+
+        let bin = parse_curl("curl https://x/l --data-binary {{AUDIO}}").unwrap();
+        assert_eq!(bin.data.as_deref(), Some("{{AUDIO}}"));
+    }
 
     #[test]
     fn no_attachments_drops_attachment_slots() {

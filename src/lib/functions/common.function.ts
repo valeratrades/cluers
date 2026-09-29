@@ -6,15 +6,6 @@ export function generateConversationTitle(userMessage: string): string {
   return userMessage.trim();
 }
 
-export function getByPath(obj: any, path: string): any {
-  if (!path) return obj;
-  return path
-    .replace(/\[/g, ".")
-    .replace(/\]/g, "")
-    .split(".")
-    .reduce((o, k) => (o || {})[k], obj);
-}
-
 export async function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -66,32 +57,4 @@ export function extractVariables(
     key: variable?.toLowerCase()?.replace(/_/g, "_") || "",
     value: variable,
   }));
-}
-
-/**
- * Recursively walks through an object and replaces variable placeholders.
- * Used by the STT path (LLM path moved this into Rust).
- */
-export function deepVariableReplacer(
-  node: any,
-  variables: Record<string, string>
-): any {
-  if (typeof node === "string") {
-    let result = node;
-    for (const [key, value] of Object.entries(variables)) {
-      result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, "g"), value);
-    }
-    return result;
-  }
-  if (Array.isArray(node)) {
-    return node.map((item) => deepVariableReplacer(item, variables));
-  }
-  if (node && typeof node === "object") {
-    const newNode: { [key: string]: any } = {};
-    for (const key in node) {
-      newNode[key] = deepVariableReplacer(node[key], variables);
-    }
-    return newNode;
-  }
-  return node;
 }

@@ -1,3 +1,5 @@
+export type ProviderKind = "ai" | "stt";
+
 export interface TYPE_PROVIDER {
   id?: string;
   streaming?: boolean;
