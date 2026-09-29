@@ -144,3 +144,8 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
 - The capture task is the one sanctioned `tokio::spawn`: it outlives the
   command, but its handle is owned by `AudioState` and always joined.
 - Calibration holds the slot while sampling, so a concurrent start waits.
+- `vad.rs` is a pure segmenter (no Tauri, no clocks): samples + sample rate in,
+  `VadEvent`s out. `VadConfig` durations are in ms and validated before use, so
+  behaviour is identical across sample rates. `run_vad_capture` only forwards
+  events to IPC. The spec is `tests/vad.rs` plus the fixtures, regenerated with
+  `nix develop -c src-tauri/tests/fixtures/vad/gen.sh`.

@@ -123,12 +123,13 @@ export const SettingsPanel = ({
   const handleResetDefaults = () => {
     const defaultConfig: VadConfig = {
       enabled: vadConfig.enabled, // Keep current mode
-      hop_size: 1024,
+      hop_ms: 20,
       sensitivity_rms: 0.012,
       peak_threshold: 0.035,
-      silence_chunks: 45,
-      min_speech_chunks: 7,
-      pre_speech_chunks: 12,
+      silence_ms: 1000,
+      min_speech_ms: 160,
+      pre_speech_ms: 300,
+      max_segment_ms: 30000,
       noise_gate_threshold: 0.003,
       max_recording_duration_secs: 180,
     };
@@ -401,24 +402,21 @@ export const SettingsPanel = ({
                       <Label className="text-xs font-medium flex items-center justify-between">
                         <span>Silence Duration</span>
                         <span className="text-muted-foreground font-normal">
-                          {(
-                            (vadConfig.silence_chunks * vadConfig.hop_size) /
-                            44100
-                          ).toFixed(1)}
+                          {(vadConfig.silence_ms / 1000).toFixed(1)}
                           s
                         </span>
                       </Label>
                       <Slider
-                        value={[vadConfig.silence_chunks]}
+                        value={[vadConfig.silence_ms]}
                         onValueChange={([value]) =>
                           onUpdateVadConfig({
                             ...vadConfig,
-                            silence_chunks: Math.round(value),
+                            silence_ms: Math.round(value),
                           })
                         }
-                        min={20}
-                        max={180}
-                        step={5}
+                        min={500}
+                        max={4000}
+                        step={100}
                         className="w-full"
                       />
                       <p className="text-[10px] text-muted-foreground">

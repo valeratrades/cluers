@@ -27,12 +27,13 @@ import {
 // VAD Configuration interface matching Rust
 export interface VadConfig {
   enabled: boolean;
-  hop_size: number;
+  hop_ms: number;
   sensitivity_rms: number;
   peak_threshold: number;
-  silence_chunks: number;
-  min_speech_chunks: number;
-  pre_speech_chunks: number;
+  silence_ms: number;
+  min_speech_ms: number;
+  pre_speech_ms: number;
+  max_segment_ms: number;
   noise_gate_threshold: number;
   max_recording_duration_secs: number;
 }
@@ -75,17 +76,18 @@ const SYSTEM_AUDIO_SKIP_INSTRUCTION =
 // or the conversation - the previous response stays displayed.
 const SKIP_WORDS = ["SKIP", "COPY"];
 
-// OPTIMIZED VAD defaults - matches backend exactly for perfect performance
+// Mirrors `VadConfig::default()` in src-tauri/src/speaker/vad.rs
 const DEFAULT_VAD_CONFIG: VadConfig = {
   enabled: true,
-  hop_size: 1024,
-  sensitivity_rms: 0.012, // Much less sensitive - only real speech
-  peak_threshold: 0.035, // Higher threshold - filters clicks/noise
-  silence_chunks: 45, // ~1.0s of required silence
-  min_speech_chunks: 7, // ~0.16s - captures short answers
-  pre_speech_chunks: 12, // ~0.27s - enough to catch word start
-  noise_gate_threshold: 0.003, // Stronger noise filtering
-  max_recording_duration_secs: 180, // 3 minutes default
+  hop_ms: 20,
+  sensitivity_rms: 0.012,
+  peak_threshold: 0.035,
+  silence_ms: 1000,
+  min_speech_ms: 160,
+  pre_speech_ms: 300,
+  max_segment_ms: 30000,
+  noise_gate_threshold: 0.003,
+  max_recording_duration_secs: 180,
 };
 
 // Chat message interface (reusing from useCompletion)
@@ -224,7 +226,7 @@ export function useSystemAudio() {
     }
 
     // Load VAD config
-    const savedVadConfig = safeLocalStorage.getItem("vad_config");
+    const savedVadConfig = safeLocalStorage.getItem("vad_config_v2");
     if (savedVadConfig) {
       try {
         const parsed = JSON.parse(savedVadConfig);
@@ -1083,7 +1085,7 @@ export function useSystemAudio() {
       try {
         const modeChanged = config.enabled !== vadConfig.enabled;
         setVadConfig(config);
-        safeLocalStorage.setItem("vad_config", JSON.stringify(config));
+        safeLocalStorage.setItem("vad_config_v2", JSON.stringify(config));
         await invoke("update_vad_config", { config });
 
         // Switching modes mid-session must also switch the backend capture:

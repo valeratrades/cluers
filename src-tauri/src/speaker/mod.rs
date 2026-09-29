@@ -19,6 +19,7 @@ mod linux;
 use linux::{SpeakerInput as PlatformSpeakerInput, SpeakerStream as PlatformSpeakerStream};
 
 mod commands;
+pub mod vad;
 
 // Re-export commands for tauri handler
 pub use commands::*;

@@ -13,7 +13,8 @@ use tauri_plugin_posthog::{init as posthog_init, PostHogConfig, PostHogOptions};
 use tokio::task::JoinHandle;
 mod speaker;
 use capture::CaptureState;
-use speaker::VadConfig;
+pub use speaker::vad;
+use speaker::vad::VadConfig;
 
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]

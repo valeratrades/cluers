@@ -1,49 +1,22 @@
 // Pluely AI Speech Detection, and capture system audio (speaker output) as a stream of f32 samples.
+use crate::speaker::vad::{
+    apply_noise_gate, calculate_audio_metrics, Segmenter, VadConfig, VadEvent,
+};
 use crate::speaker::{AudioDevice, SpeakerInput};
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::StreamExt;
 use hound::{WavSpec, WavWriter};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::task::JoinHandle;
 use tauri::{AppHandle, Emitter, Listener, Manager};
 use tauri_plugin_shell::ShellExt;
+use tokio::task::JoinHandle;
 use tracing::{error, warn};
-
-// VAD Configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VadConfig {
-    pub enabled: bool,
-    pub hop_size: usize,
-    pub sensitivity_rms: f32,
-    pub peak_threshold: f32,
-    pub silence_chunks: usize,
-    pub min_speech_chunks: usize,
-    pub pre_speech_chunks: usize,
-    pub noise_gate_threshold: f32,
-    pub max_recording_duration_secs: u64,
-}
-
-impl Default for VadConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            hop_size: 1024,
-            sensitivity_rms: 0.012, // Much less sensitive - only real speech
-            peak_threshold: 0.035,  // Higher threshold - filters clicks/noise
-            silence_chunks: 45,     // ~1.0s of silence before stopping
-            min_speech_chunks: 7,   // ~0.16s - captures short answers
-            pre_speech_chunks: 12,  // ~0.27s - enough to catch word start
-            noise_gate_threshold: 0.003, // Stronger noise filtering
-            max_recording_duration_secs: 180, // 3 minutes default
-        }
-    }
-}
 
 /// Live per-chunk metrics emitted to the UI so users can see why VAD does or
 /// does not trigger on their setup.
@@ -78,6 +51,7 @@ pub async fn start_system_audio_capture(
     state
         .start(|| {
             if let Some(config) = vad_config {
+                config.validate()?;
                 let mut vad_cfg = state
                     .vad_config
                     .lock()
@@ -107,10 +81,15 @@ pub async fn start_system_audio_capture(
                 .map_err(|e| format!("Failed to read VAD config: {}", e))?
                 .clone();
 
+            let segmenter = vad_config
+                .enabled
+                .then(|| Segmenter::new(&vad_config, sr))
+                .transpose()?;
+
             Ok(async move {
                 let mut stream = stream;
-                if vad_config.enabled {
-                    run_vad_capture(app_clone.clone(), &mut stream, sr, vad_config).await;
+                if let Some(vad) = segmenter {
+                    run_vad_capture(app_clone.clone(), &mut stream, sr, vad, &vad_config).await;
                 } else {
                     run_continuous_capture(app_clone.clone(), &mut stream, sr, vad_config).await;
                 }
@@ -167,52 +146,36 @@ async fn reap(task: JoinHandle<()>) {
     }
 }
 
-// VAD-enabled capture - OPTIMIZED for real-time speech detection
 async fn run_vad_capture(
     app: AppHandle,
     stream: impl StreamExt<Item = f32> + Unpin,
     sr: u32,
-    config: VadConfig,
+    mut vad: Segmenter,
+    config: &VadConfig,
 ) {
-    let mut stream = stream;
-    let mut buffer: VecDeque<f32> = VecDeque::new();
-    let mut pre_speech: VecDeque<f32> =
-        VecDeque::with_capacity(config.pre_speech_chunks * config.hop_size);
-    let mut speech_buffer = Vec::new();
-    let mut in_speech = false;
-    let mut silence_chunks = 0;
-    let mut speech_chunks = 0;
-    let max_samples = sr as usize * 30; // 30s safety cap per utterance
-
-    // Throttle metrics emission to ~10 Hz regardless of sample rate / hop size.
-    let metrics_interval = Duration::from_millis(100);
-    let mut last_metrics_emit = Instant::now()
-        .checked_sub(metrics_interval)
-        .unwrap_or_else(Instant::now);
-
-    while let Some(sample) = stream.next().await {
-        buffer.push_back(sample);
-
-        // Process in fixed chunks for VAD analysis
-        while buffer.len() >= config.hop_size {
-            let mut mono = Vec::with_capacity(config.hop_size);
-            for _ in 0..config.hop_size {
-                if let Some(v) = buffer.pop_front() {
-                    mono.push(v);
+    let mut chunks = stream.ready_chunks(4096);
+    while let Some(chunk) = chunks.next().await {
+        for ev in vad.push(&chunk) {
+            let emitted = match ev {
+                VadEvent::SpeechStart { .. } => app.emit("speech-start", ()),
+                VadEvent::Segment { samples, .. } => {
+                    match samples_to_wav_b64(sr, &normalize_audio_level(&samples, 0.1)) {
+                        Ok(b64) => app.emit("speech-detected", b64),
+                        Err(e) => {
+                            error!("Failed to encode speech to WAV: {}", e);
+                            app.emit("audio-encoding-error", "Failed to encode speech")
+                        }
+                    }
                 }
-            }
-
-            // Apply noise gate BEFORE VAD (critical for accuracy)
-            let mono = apply_noise_gate(&mono, config.noise_gate_threshold);
-
-            let (rms, peak) = calculate_audio_metrics(&mono);
-            let is_speech =
-                rms > config.sensitivity_rms || peak > config.peak_threshold;
-
-            // Throttled metrics emission so the UI can render a live meter.
-            if last_metrics_emit.elapsed() >= metrics_interval {
-                last_metrics_emit = Instant::now();
-                if let Err(e) = app.emit(
+                VadEvent::Discarded { .. } => app.emit(
+                    "speech-discarded",
+                    "Audio too short (likely background noise)",
+                ),
+                VadEvent::Metrics {
+                    rms,
+                    peak,
+                    in_speech,
+                } => app.emit(
                     "vad-metrics",
                     VadMetrics {
                         rms,
@@ -222,113 +185,10 @@ async fn run_vad_capture(
                         noise_gate_threshold: config.noise_gate_threshold,
                         in_speech,
                     },
-                ) {
-                    error!("Failed to emit vad-metrics: {}", e);
-                }
-            }
-
-            if is_speech {
-                if !in_speech {
-                    // Speech START detected
-                    in_speech = true;
-                    speech_chunks = 0;
-
-                    // Include pre-speech buffer for natural sound
-                    speech_buffer.extend(pre_speech.drain(..));
-
-                    if let Err(e) = app.emit("speech-start", ()) {
-                        error!("Failed to emit speech-start: {}", e);
-                    }
-                }
-
-                speech_chunks += 1;
-                speech_buffer.extend_from_slice(&mono);
-                silence_chunks = 0; // Reset silence counter on any speech
-
-                // Safety cap: force emit if exceeds 30s
-                if speech_buffer.len() > max_samples {
-                    let normalized_buffer = normalize_audio_level(&speech_buffer, 0.1);
-                    match samples_to_wav_b64(sr, &normalized_buffer) {
-                        Ok(b64) => {
-                            if let Err(e) = app.emit("speech-detected", b64) {
-                                error!("Failed to emit speech-detected (max-samples cap): {}", e);
-                            }
-                        }
-                        Err(e) => error!("Failed to encode speech (max-samples cap): {}", e),
-                    }
-                    speech_buffer.clear();
-                    in_speech = false;
-                    speech_chunks = 0;
-                }
-            } else {
-                // Silence detected
-                if in_speech {
-                    silence_chunks += 1;
-
-                    // Continue collecting during silence (important for natural speech)
-                    speech_buffer.extend_from_slice(&mono);
-
-                    // Check if silence duration exceeds threshold
-                    if silence_chunks >= config.silence_chunks {
-                        // Verify minimum speech duration
-                        if speech_chunks >= config.min_speech_chunks && !speech_buffer.is_empty() {
-                            // Trim trailing silence (keep ~0.15s for natural ending)
-                            let silence_duration_samples = silence_chunks * config.hop_size;
-                            let keep_silence_samples = (sr as usize) * 15 / 100; // 0.15s
-                            let trim_amount =
-                                silence_duration_samples.saturating_sub(keep_silence_samples);
-
-                            if speech_buffer.len() > trim_amount {
-                                speech_buffer.truncate(speech_buffer.len() - trim_amount);
-                            }
-
-                            // Emit complete speech segment
-                            let normalized_buffer = normalize_audio_level(&speech_buffer, 0.1);
-                            match samples_to_wav_b64(sr, &normalized_buffer) {
-                                Ok(b64) => {
-                                    if let Err(e) = app.emit("speech-detected", b64) {
-                                        error!("Failed to emit speech-detected: {}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to encode speech to WAV: {}", e);
-                                    if let Err(emit_err) =
-                                        app.emit("audio-encoding-error", "Failed to encode speech")
-                                    {
-                                        error!(
-                                            "Failed to emit audio-encoding-error: {}",
-                                            emit_err
-                                        );
-                                    }
-                                }
-                            }
-                        } else if let Err(e) = app.emit(
-                            "speech-discarded",
-                            "Audio too short (likely background noise)",
-                        ) {
-                            error!("Failed to emit speech-discarded: {}", e);
-                        }
-
-                        // Reset for next speech detection
-                        speech_buffer.clear();
-                        in_speech = false;
-                        silence_chunks = 0;
-                        speech_chunks = 0;
-                    }
-                } else {
-                    // Not in speech yet - maintain rolling pre-speech buffer
-                    pre_speech.extend(mono);
-
-                    // Trim excess (maintain fixed size)
-                    while pre_speech.len() > config.pre_speech_chunks * config.hop_size {
-                        pre_speech.pop_front();
-                    }
-
-                    // Periodically shrink capacity to prevent memory bloat
-                    if pre_speech.len() == config.pre_speech_chunks * config.hop_size {
-                        pre_speech.shrink_to_fit();
-                    }
-                }
+                ),
+            };
+            if let Err(e) = emitted {
+                error!("Failed to emit VAD event: {}", e);
             }
         }
     }
@@ -471,38 +331,6 @@ async fn run_continuous_capture(
     if let Err(e) = app.emit("continuous-recording-stopped", ()) {
         error!("Failed to emit continuous-recording-stopped: {}", e);
     }
-}
-
-// Apply noise gate
-fn apply_noise_gate(samples: &[f32], threshold: f32) -> Vec<f32> {
-    const KNEE_RATIO: f32 = 3.0; // Compression ratio for soft knee
-
-    samples
-        .iter()
-        .map(|&s| {
-            let abs = s.abs();
-            if abs < threshold {
-                s * (abs / threshold).powf(1.0 / KNEE_RATIO)
-            } else {
-                s
-            }
-        })
-        .collect()
-}
-
-// Calculate RMS and peak (optimized)
-fn calculate_audio_metrics(chunk: &[f32]) -> (f32, f32) {
-    let mut sumsq = 0.0f32;
-    let mut peak = 0.0f32;
-
-    for &v in chunk {
-        let a = v.abs();
-        peak = peak.max(a);
-        sumsq += v * v;
-    }
-
-    let rms = (sumsq / chunk.len() as f32).sqrt();
-    (rms, peak)
 }
 
 fn normalize_audio_level(samples: &[f32], target_rms: f32) -> Vec<f32> {
@@ -758,13 +586,7 @@ pub async fn calibrate_vad_thresholds(
 
 #[tauri::command]
 pub async fn update_vad_config(app: AppHandle, config: VadConfig) -> Result<(), String> {
-    // Validate config
-    if config.sensitivity_rms < 0.0 || config.sensitivity_rms > 1.0 {
-        return Err("Invalid sensitivity_rms: must be 0.0-1.0".to_string());
-    }
-    if config.max_recording_duration_secs > 3600 {
-        return Err("Invalid max_recording_duration_secs: must be <= 3600 (1 hour)".to_string());
-    }
+    config.validate()?;
 
     let state = app.state::<crate::AudioState>();
     *state
@@ -869,7 +691,12 @@ mod tests {
             (&[Start, Stop, Start], &[true, true, true], 1, 1),
             (&[Start, Start], &[true, false], 1, 1),
             (&[Stop, Stop], &[true, true], 0, 0),
-            (&[StartFinite(10), WaitFinished, Start], &[true, true, true], 1, 1),
+            (
+                &[StartFinite(10), WaitFinished, Start],
+                &[true, true, true],
+                1,
+                1,
+            ),
             (&[Start, Stop], &[true, true], 0, 1),
         ];
         for (ops, expected, now, max) in cases {
@@ -893,7 +720,11 @@ mod tests {
                 });
             }
             assert_eq!(&got[..], *expected, "{ops:?}");
-            assert_eq!(live.now.load(Ordering::SeqCst), *now, "{ops:?} live streams");
+            assert_eq!(
+                live.now.load(Ordering::SeqCst),
+                *now,
+                "{ops:?} live streams"
+            );
             assert_eq!(live.max.load(Ordering::SeqCst), *max, "{ops:?} max streams");
             state.stop().await;
         }
@@ -918,7 +749,14 @@ mod tests {
             start.await.unwrap();
         }
         state.stop().await;
-        assert_eq!(live.now.load(Ordering::SeqCst), 0, "orphaned capture still live");
-        assert!(live.max.load(Ordering::SeqCst) <= 1, "two captures ran at once");
+        assert_eq!(
+            live.now.load(Ordering::SeqCst),
+            0,
+            "orphaned capture still live"
+        );
+        assert!(
+            live.max.load(Ordering::SeqCst) <= 1,
+            "two captures ran at once"
+        );
     }
 }
