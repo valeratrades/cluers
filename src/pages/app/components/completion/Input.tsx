@@ -12,6 +12,7 @@ import {
 } from "@/components";
 import { UseCompletionReturn } from "@/types";
 import { MessageHistory } from "./MessageHistory";
+import { MessageBubble } from "../MessageBubble";
 
 export const Input = ({
   isPopoverOpen,
@@ -69,7 +70,6 @@ export const Input = ({
                 <div className="absolute select-none right-1 top-1/2 -translate-y-1/2 flex items-center gap-1">
                   <MessageHistory
                     conversationHistory={conversationHistory}
-                    currentConversationId={currentConversationId}
                     onStartNewConversation={startNewConversation}
                     messageHistoryOpen={messageHistoryOpen}
                     setMessageHistoryOpen={setMessageHistoryOpen}
@@ -178,30 +178,11 @@ export const Input = ({
                         return null;
                       }
                       return (
-                        <div
+                        <MessageBubble
                           key={message.id}
-                          className={`p-3 rounded-lg text-sm ${
-                            message.role === "user"
-                              ? "bg-primary/10 border-l-4 border-primary"
-                              : "bg-muted/50"
-                          }`}
-                        >
-                          <div className="flex items-center gap-2 mb-2">
-                            <span className="text-xs font-medium text-muted-foreground uppercase">
-                              {message.role === "user" ? "You" : "AI"}
-                            </span>
-                            <span className="text-xs text-muted-foreground">
-                              {new Date(message.timestamp).toLocaleTimeString(
-                                [],
-                                {
-                                  hour: "2-digit",
-                                  minute: "2-digit",
-                                }
-                              )}
-                            </span>
-                          </div>
-                          <Markdown>{message.content}</Markdown>
-                        </div>
+                          message={message}
+                          userLabel="You"
+                        />
                       );
                     })}
                 </div>

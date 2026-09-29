@@ -1,7 +1,7 @@
 import { ChatConversation } from "@/types";
 import { Markdown, Switch, CopyButton } from "@/components";
 import { BotIcon, HeadphonesIcon, Loader2, SparklesIcon } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { MessageBubble } from "../MessageBubble";
 
 type Props = {
   lastTranscription: string;
@@ -139,23 +139,12 @@ export const ResultsSection = ({
                 {conversation.messages
                   .slice(0, -2)
                   .reverse()
-                  .map((message, index) => (
-                    <div
-                      key={message.id || index}
-                      className={cn(
-                        "p-2 rounded-md text-[11px]",
-                        message.role === "user"
-                          ? "bg-primary/5 border-l-2 border-primary/30"
-                          : "bg-background/50"
-                      )}
-                    >
-                      <span className="text-[8px] font-medium text-muted-foreground uppercase">
-                        {message.role === "user" ? "System" : "AI"}
-                      </span>
-                      <div className="text-muted-foreground leading-relaxed mt-0.5">
-                        <Markdown>{message.content}</Markdown>
-                      </div>
-                    </div>
+                  .map((message) => (
+                    <MessageBubble
+                      key={message.id}
+                      message={message}
+                      userLabel="System"
+                    />
                   ))}
               </div>
             </div>
