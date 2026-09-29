@@ -130,6 +130,7 @@
             env = {
               RUST_BACKTRACE = 1;
               RUST_LIB_BACKTRACE = 0;
+              RUSTUP_TOOLCHAIN = "${rust}"; # ~/.cargo/bin rustup proxies shadow PATH for cargo subcommands
             };
 
             shellHook = combined.shellHook;
