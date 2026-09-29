@@ -45,7 +45,7 @@ fn list_devices(outputs: bool) -> Result<Vec<AudioDevice>> {
         *d.borrow_mut() = name.as_deref().map(str::to_owned);
     }))?;
 
-    let entries: Rc<RefCell<Vec<(Option<String>, Option<String>)>>> = Rc::default();
+    let entries = Rc::new(RefCell::new(Vec::new()));
     let failed = Rc::new(Cell::new(false));
     let (e, f) = (entries.clone(), failed.clone());
     if outputs {
