@@ -14,11 +14,13 @@ use tracing::{error, warn};
 use psimple::Simple;
 use pulse::callbacks::ListResult;
 use pulse::context::Context;
+use pulse::def::BufferAttr;
 use pulse::error::PAErr;
 use pulse::mainloop::standard::{IterateResult, Mainloop};
 use pulse::operation::{Operation, State as OperationState};
 use pulse::sample::{Format, Spec};
 use pulse::stream::Direction;
+use pulse::time::MicroSeconds;
 
 pub fn get_input_devices() -> Result<Vec<AudioDevice>> {
     list_devices(false)
@@ -118,6 +120,13 @@ impl SpeakerInput {
             channels: 1,
             rate: 44_100,
         };
+        let attr = BufferAttr {
+            maxlength: u32::MAX,
+            tlength: u32::MAX,
+            prebuf: u32::MAX,
+            minreq: u32::MAX,
+            fragsize: spec.usec_to_bytes(MicroSeconds(20_000)).try_into().unwrap(), // server default (~2s) lags VAD behind speech
+        };
         let simple = Simple::new(
             None,
             "pluely",
@@ -126,7 +135,7 @@ impl SpeakerInput {
             "System Audio Capture",
             &spec,
             None,
-            None,
+            Some(&attr),
         )
         .map_err(|e| anyhow!("Failed to open PulseAudio source {source}: {e}"))?;
         Ok(Self {
@@ -409,7 +418,6 @@ mod tests {
             .unwrap()
             .stream();
 
-        // default pa_simple fragsize delivers the first fragment after ~2s
         tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .expect("capture delivers samples")
@@ -423,6 +431,21 @@ mod tests {
         .await
         .expect("stream ends after its capture is killed");
         assert!(stream.error().is_some());
+    }
+
+    #[tokio::test]
+    async fn first_sample_arrives_within_200ms() {
+        let sink = NullSink::new();
+        let started = std::time::Instant::now();
+        let mut stream = SpeakerInput::new_with_device(Some(sink.name.clone()))
+            .unwrap()
+            .stream();
+        stream.next().await.expect("stream alive");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "first sample after {elapsed:?}"
+        );
     }
 
     #[test]
