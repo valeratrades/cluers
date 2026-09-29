@@ -145,9 +145,18 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
 ## `src-tauri/src/speaker/` — capture lifecycle
 
 - `AudioState.capture: tokio::sync::Mutex<Option<Capture>>` is the single
-  lifecycle state; `Capture` is `{task, control}`. Live capture = unfinished
-  task; a task that ends on its own reads as idle. No separate flag.
-  `system_audio_control` sends `Config`/`Prompt` into the live task.
+  lifecycle state; `Capture` is `{task, control, record}`. Live capture =
+  unfinished task; a task that ends on its own reads as idle. No separate flag.
+  `system_audio_control` goes through `AudioState::control`: `Config`/`Prompt`
+  into the live task, `Record` to the continuous recorder (`Err` in VAD mode).
+- A capture lives for the whole session in both modes. In continuous mode
+  `Record` start/send/discard only drive the recorder inside it; each recording
+  is one turn (`Flush`), and the limit auto-sends. Stop drops everything:
+  the recording and any in-flight STT/LLM.
+- The VAD config is a `watch` in `AudioState`; `update_vad_config` reaches the
+  live segmenters and `Turns`. `default_vad_config` is the only source of
+  defaults. The hop is the constant `vad::HOP_MS`, so a live change never
+  touches the stream state.
 - `start` while live is `Err("Capture already running")`; `stop` is idempotent
   and aborts *and awaits* the task, so the stream is dropped and the device
   released before it returns. No sleep-based sequencing.
