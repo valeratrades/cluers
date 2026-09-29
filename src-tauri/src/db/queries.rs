@@ -2,10 +2,16 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::schema::{
-    AppendedMessage, AppendedTurn, AttachedFile, Conversation, ConversationId,
-    ConversationSummary, Message, NewMessage, NewTurn, Role, SystemPrompt,
+    AppendedMessage, AppendedTurn, AttachedFile, Conversation, ConversationSummary, Message,
+    NewTurn, Role, SystemPrompt,
 };
 use super::DbError;
+
+struct NewMessage {
+    role: Role,
+    content: String,
+    attached_files: Option<Vec<AttachedFile>>,
+}
 
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -109,7 +115,7 @@ pub fn load_conversation(conn: &Connection, id: &str) -> Result<Conversation, Db
     })
 }
 
-pub fn start_conversation(conn: &Connection, title: &str) -> Result<ConversationId, DbError> {
+fn start_conversation(conn: &Connection, title: &str) -> Result<String, DbError> {
     let title = title.trim();
     if title.is_empty() {
         return Err(DbError::InvalidInput("conversation title is empty"));
@@ -120,13 +126,10 @@ pub fn start_conversation(conn: &Connection, title: &str) -> Result<Conversation
         "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
         params![id, title, now, now],
     )?;
-    Ok(ConversationId {
-        id,
-        created_at: now,
-    })
+    Ok(id)
 }
 
-pub fn append_message(
+fn append_message(
     conn: &Connection,
     conversation_id: &str,
     msg: &NewMessage,
@@ -177,7 +180,7 @@ pub fn append_turn(
     let tx = conn.transaction()?;
     let conversation_id = match conversation_id {
         Some(id) => id.to_string(),
-        None => start_conversation(&tx, &turn.user)?.id,
+        None => start_conversation(&tx, &turn.user)?,
     };
     let user = append_message(
         &tx,
@@ -203,21 +206,6 @@ pub fn append_turn(
         user,
         assistant,
     })
-}
-
-pub fn rename_conversation(conn: &Connection, id: &str, title: &str) -> Result<(), DbError> {
-    let title = title.trim();
-    if title.is_empty() {
-        return Err(DbError::InvalidInput("conversation title is empty"));
-    }
-    let n = conn.execute(
-        "UPDATE conversations SET title = ? WHERE id = ?",
-        params![title, id],
-    )?;
-    if n == 0 {
-        return Err(DbError::ConversationNotFound(id.to_string()));
-    }
-    Ok(())
 }
 
 pub fn delete_conversation(conn: &Connection, id: &str) -> Result<(), DbError> {
@@ -399,7 +387,7 @@ mod tests {
         };
         let m1 = append_message(
             &conn,
-            &cid.id,
+            &cid,
             &NewMessage {
                 role: Role::User,
                 content: "hi".into(),
@@ -409,7 +397,7 @@ mod tests {
         .unwrap();
         let m2 = append_message(
             &conn,
-            &cid.id,
+            &cid,
             &NewMessage {
                 role: Role::Assistant,
                 content: "hello!".into(),
@@ -418,8 +406,8 @@ mod tests {
         )
         .unwrap();
 
-        let conv = load_conversation(&conn, &cid.id).unwrap();
-        assert_eq!(conv.id, cid.id);
+        let conv = load_conversation(&conn, &cid).unwrap();
+        assert_eq!(conv.id, cid);
         assert_eq!(conv.title, "hello there");
         assert_eq!(conv.messages.len(), 2);
         assert_eq!(conv.messages[0].id, m1.id);
@@ -495,7 +483,7 @@ mod tests {
             }
             let id = match target {
                 Target::New => None,
-                Target::Existing => Some(x.id.as_str()),
+                Target::Existing => Some(x.as_str()),
                 Target::Unknown => Some("no-such-id"),
             };
             let r = append_turn(&mut conn, id, turn);
@@ -517,7 +505,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         append_message(
             &conn,
-            &b.id,
+            &b,
             &NewMessage {
                 role: Role::User,
                 content: "bump".into(),
@@ -528,10 +516,10 @@ mod tests {
 
         let s = list_conversation_summaries(&conn).unwrap();
         assert_eq!(s.len(), 3);
-        assert_eq!(s[0].id, b.id);
+        assert_eq!(s[0].id, b);
         assert_eq!(s[0].message_count, 1);
-        assert_eq!(s[1].id, c.id);
-        assert_eq!(s[2].id, a.id);
+        assert_eq!(s[1].id, c);
+        assert_eq!(s[2].id, a);
     }
 
     #[test]
@@ -540,7 +528,7 @@ mod tests {
         let cid = start_conversation(&conn, "x").unwrap();
         let m1 = append_message(
             &conn,
-            &cid.id,
+            &cid,
             &NewMessage {
                 role: Role::User,
                 content: "1".into(),
@@ -550,7 +538,7 @@ mod tests {
         .unwrap();
         let m2 = append_message(
             &conn,
-            &cid.id,
+            &cid,
             &NewMessage {
                 role: Role::Assistant,
                 content: "2".into(),
@@ -567,7 +555,7 @@ mod tests {
         let cid = start_conversation(&conn, "x").unwrap();
         append_message(
             &conn,
-            &cid.id,
+            &cid,
             &NewMessage {
                 role: Role::User,
                 content: "1".into(),
@@ -575,22 +563,15 @@ mod tests {
             },
         )
         .unwrap();
-        delete_conversation(&conn, &cid.id).unwrap();
+        delete_conversation(&conn, &cid).unwrap();
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
-                params![cid.id],
+                params![cid],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn rename_unknown_errors() {
-        let conn = fresh();
-        let err = rename_conversation(&conn, "no-such-id", "anything").unwrap_err();
-        assert!(matches!(err, DbError::ConversationNotFound(_)));
     }
 
     #[test]

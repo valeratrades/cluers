@@ -130,7 +130,7 @@ pub async fn fetch_api_response_config(
     Ok(cfg)
 }
 
-pub fn map_api_error_message(error_rules: &[ApiConfigError], sources: &[String]) -> String {
+fn map_api_error_message(error_rules: &[ApiConfigError], sources: &[String]) -> String {
     for source in sources {
         for rule in error_rules {
             if !rule.includes.is_empty() && source.contains(&rule.includes) {

@@ -3,7 +3,7 @@ import { PostHog } from "tauri-plugin-posthog-api";
 /**
  * Event names for tracking
  */
-export const ANALYTICS_EVENTS = {
+const ANALYTICS_EVENTS = {
   // App Lifecycle
   APP_STARTED: "app_started",
 } as const;
@@ -11,7 +11,7 @@ export const ANALYTICS_EVENTS = {
 /**
  * Capture an analytics event
  */
-export const captureEvent = async (
+const captureEvent = async (
   eventName: string,
   properties?: Record<string, any>
 ) => {

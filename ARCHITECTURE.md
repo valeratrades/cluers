@@ -50,13 +50,11 @@ re-running the migrations (the schema is already in place). The
 ### Command surface
 
 Commands are named after intent, not SQL CRUD. There is no
-`save_conversation` or `update_conversation`: the frontend
-`start_conversation`s once and `append_message`s per turn. The list/detail
-split is enforced — `list_conversation_summaries` returns summaries (no
-message bodies); `load_conversation` returns the full conversation on demand.
-`append_turn` persists a user+assistant pair in one transaction, starting the
-conversation when the id is null; it is the only write path for chat turns
-from the overlay and the chat view.
+`save_conversation`, `update_conversation` or rename: chat writes go only
+through `append_turn`, which persists a user+assistant pair in one transaction
+and creates the conversation when the id is null. The list/detail split is
+enforced — `list_conversation_summaries` returns summaries (no message
+bodies); `load_conversation` returns the full conversation on demand.
 
 ### Errors
 

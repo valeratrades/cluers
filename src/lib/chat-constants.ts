@@ -7,16 +7,6 @@
  */
 
 /**
- * CONVERSATION_SAVE_DEBOUNCE_MS
- *
- * Debounce delay for the system-audio conversation auto-sync. The sync diffs
- * persisted vs in-memory message IDs and appends only the new ones.
- *
- * 500ms balances responsiveness with avoiding write storms.
- */
-export const CONVERSATION_SAVE_DEBOUNCE_MS = 500;
-
-/**
  * DOWNLOAD_SUCCESS_DISPLAY_MS
  *
  * How long the "Downloaded" / "Attached" feedback indicator stays visible

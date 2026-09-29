@@ -5,13 +5,13 @@ import {
   DEFAULT_AUTO_SCROLL,
 } from "../response-settings.constants";
 
-export interface ResponseSettings {
+interface ResponseSettings {
   responseLength: string;
   language: string;
   autoScroll: boolean;
 }
 
-export const DEFAULT_RESPONSE_SETTINGS: ResponseSettings = {
+const DEFAULT_RESPONSE_SETTINGS: ResponseSettings = {
   responseLength: DEFAULT_RESPONSE_LENGTH,
   language: DEFAULT_LANGUAGE,
   autoScroll: DEFAULT_AUTO_SCROLL,
@@ -48,7 +48,7 @@ export const getResponseSettings = (): ResponseSettings => {
 /**
  * Save response settings to localStorage
  */
-export const setResponseSettings = (settings: ResponseSettings): void => {
+const setResponseSettings = (settings: ResponseSettings): void => {
   try {
     localStorage.setItem(
       STORAGE_KEYS.RESPONSE_SETTINGS,

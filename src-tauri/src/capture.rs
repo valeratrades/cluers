@@ -301,7 +301,7 @@ mod tests {
             height,
         };
         #[rustfmt::skip]
-        let cases: Vec<(&str, Vec<(u32, u32)>, usize, SelectionCoords, Result<(u32, u32), ()>, Vec<&str>)> = vec![
+        let cases = [
             ("index out of range", vec![(20, 20), (20, 20)], 5, sel(0, 0, 10, 10), Err(()), vec!["capture-closed"]),
             ("zero width", vec![(20, 20), (20, 20)], 0, sel(0, 0, 0, 10), Err(()), vec!["capture-closed"]),
             ("valid", vec![(20, 20)], 0, sel(5, 5, 10, 10), Ok((10, 10)), vec!["captured-selection"]),

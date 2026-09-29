@@ -26,7 +26,7 @@ export const getPlatformDefaultKey = (action: ShortcutAction): string => {
 /**
  * Get default shortcuts configuration
  */
-export const getDefaultShortcutsConfig = (): ShortcutsConfig => {
+const getDefaultShortcutsConfig = (): ShortcutsConfig => {
   const bindings: Record<string, ShortcutBinding> = {};
 
   DEFAULT_SHORTCUT_ACTIONS.forEach((action) => {
@@ -51,7 +51,7 @@ export const getShortcutsConfig = (): ShortcutsConfig => {
   return { bindings: { ...defaults.bindings, ...parsed.bindings } };
 };
 
-export const setShortcutsConfig = (config: ShortcutsConfig): void =>
+const setShortcutsConfig = (config: ShortcutsConfig): void =>
   localStorage.setItem(STORAGE_KEYS.SHORTCUTS, JSON.stringify(config));
 
 /**

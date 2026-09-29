@@ -51,15 +51,6 @@ pub struct Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NewMessage {
-    pub role: Role,
-    pub content: String,
-    #[serde(default)]
-    pub attached_files: Option<Vec<AttachedFile>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Conversation {
     pub id: String,
     pub title: String,
@@ -76,13 +67,6 @@ pub struct ConversationSummary {
     pub created_at: i64,
     pub updated_at: i64,
     pub message_count: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConversationId {
-    pub id: String,
-    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,9 +7,7 @@ import {
 } from "@/lib";
 import { ChatConversation } from "@/types/completion";
 
-export type UseHistoryType = ReturnType<typeof useHistory>;
-
-export interface UseHistoryReturn {
+interface UseHistoryReturn {
   conversations: ConversationSummary[];
   deleteConfirm: string | null;
   isDownloaded: boolean;

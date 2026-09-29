@@ -1,6 +1,6 @@
 import curl2Json from "@bany/curl-to-json";
 
-export interface CurlValidationResult {
+interface CurlValidationResult {
   isValid: boolean;
   message?: string;
 }

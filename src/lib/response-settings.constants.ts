@@ -1,11 +1,11 @@
-export interface ResponseLengthOption {
+interface ResponseLengthOption {
   id: "short" | "medium" | "auto";
   title: string;
   description: string;
   prompt: string;
 }
 
-export interface LanguageOption {
+interface LanguageOption {
   id: string;
   name: string;
   flag: string;
