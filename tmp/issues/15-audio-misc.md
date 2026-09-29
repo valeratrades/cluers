@@ -6,3 +6,4 @@
 - Any remaining `.ok()` / `let _ =` / `unwrap_or` / empty catch in `speaker/` and audio TS without a justification.
 
 Run together with 14 (same files, one agent).
+- `speaker::linux::tests::stream_ends_with_error_when_capture_is_killed` flaked once during issue 12 (live-Pulse timing). Harden it or document why it's inherently racy.
