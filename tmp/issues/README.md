@@ -14,3 +14,5 @@ Phases are chosen so that issues within one phase touch disjoint files.
 Approved plans land next to each issue as `NN-slug.plan.md`.
 
 Workflow worktrees fork from `master`, not `riir`. Implementers must `git reset --hard riir` on their fresh branch before any work. Inside worktrees use `nix develop path:. -c ...` (a flake-with-git-worktree bug).
+
+Blocked on the owner (needs a GUI repro): 20.
