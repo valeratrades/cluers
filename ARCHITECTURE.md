@@ -156,3 +156,22 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
   behaviour is identical across sample rates. `run_vad_capture` only forwards
   events to IPC. The spec is `tests/vad.rs` plus the fixtures, regenerated with
   `nix develop -c src-tauri/tests/fixtures/vad/gen.sh`.
+
+## Global shortcuts
+
+- Config source is the main renderer's localStorage. `useApp` (main-window
+  root hook) sends it through `update_shortcuts` on mount; a failure is shown
+  in the main bar and forwarded to `js_log`.
+- `update_shortcuts` validates the whole config first (unknown action ids and
+  unparsable keys reject it untouched), then each plugin registration owns its
+  `Action` via `on_shortcut`. No lookup map, no re-parsing per press.
+- Handlers run on the global-hotkey thread: errors are `tracing::error!`ed,
+  never panicked (a panic there kills every shortcut for the session).
+- Renderer listeners are mounted exactly once per webview, by
+  `useGlobalShortcutListeners` in `useApp`. `useGlobalShortcuts` is only a
+  stable callback registry.
+- The move-window loop is a sanctioned `spawn`: its handle lives in
+  `MoveWindowState` and is aborted on key release or re-registration.
+- Linux backend is X11 key grabs only (global-hotkey 0.7). Under Wayland,
+  presses arrive only while an XWayland window has focus; a warning is logged
+  at startup.

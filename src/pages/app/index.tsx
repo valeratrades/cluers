@@ -7,14 +7,14 @@ import {
 } from "./components";
 import { useApp } from "@/hooks";
 import { useApp as useAppContext } from "@/contexts";
-import { SparklesIcon } from "lucide-react";
+import { AlertCircle, SparklesIcon } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { ErrorBoundary } from "react-error-boundary";
 import { ErrorLayout } from "@/layouts";
 import { getPlatform } from "@/lib";
 
 const App = () => {
-  const { isHidden, systemAudio } = useApp();
+  const { isHidden, systemAudio, shortcutError } = useApp();
   const { customizable } = useAppContext();
   const platform = getPlatform();
 
@@ -68,6 +68,17 @@ const App = () => {
             }`}
           >
             <Completion isHidden={isHidden} />
+            {shortcutError ? (
+              <Button
+                size={"icon"}
+                variant="destructive"
+                className="cursor-pointer"
+                title={shortcutError}
+                onClick={openDashboard}
+              >
+                <AlertCircle className="h-4 w-4" />
+              </Button>
+            ) : null}
             <Button
               size={"icon"}
               className="cursor-pointer"

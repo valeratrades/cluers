@@ -1,47 +1,80 @@
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::fmt;
+use std::str::FromStr;
+use std::sync::Mutex;
+use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tokio::time::{sleep, Duration};
 
 #[cfg(target_os = "macos")]
 use tauri_nspanel::ManagerExt;
 
-use crate::window::show_dashboard_window;
 // State for window visibility
 pub struct WindowVisibility {
     #[allow(dead_code)]
     pub is_hidden: Mutex<bool>,
 }
 
-// State for registered shortcuts
-pub struct RegisteredShortcuts {
-    pub shortcuts: Mutex<HashMap<String, String>>, // action_id -> shortcut_key
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
-impl Default for RegisteredShortcuts {
-    fn default() -> Self {
-        RegisteredShortcuts {
-            shortcuts: Mutex::new(HashMap::new()),
-        }
+impl Direction {
+    const ALL: [Direction; 4] = [
+        Direction::Up,
+        Direction::Down,
+        Direction::Left,
+        Direction::Right,
+    ];
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Direction::Up => "up",
+            Direction::Down => "down",
+            Direction::Left => "left",
+            Direction::Right => "right",
+        })
     }
 }
 
-pub(crate) type MoveWindowTask = Arc<AtomicBool>;
-
-pub(crate) struct MoveWindowState {
-    tasks: Mutex<HashMap<String, MoveWindowTask>>,
+#[derive(Clone, Copy, Debug)]
+enum Action {
+    ToggleDashboard,
+    ToggleWindow,
+    FocusInput,
+    AudioRecording,
+    Screenshot,
+    SystemAudio,
+    Move(Direction),
 }
 
-impl Default for MoveWindowState {
-    fn default() -> Self {
-        MoveWindowState {
-            tasks: Mutex::new(HashMap::new()),
-        }
+/// Ids mirror `src/config/shortcuts.ts`; `move_window` is expanded in [`bindings`].
+impl FromStr for Action {
+    type Err = String;
+    fn from_str(id: &str) -> Result<Self, String> {
+        Ok(match id {
+            "toggle_dashboard" => Action::ToggleDashboard,
+            "toggle_window" => Action::ToggleWindow,
+            "focus_input" => Action::FocusInput,
+            "audio_recording" => Action::AudioRecording,
+            "screenshot" => Action::Screenshot,
+            "system_audio" => Action::SystemAudio,
+            _ => return Err(format!("unknown shortcut action '{id}'")),
+        })
     }
+}
+
+#[derive(Default)]
+pub struct MoveWindowState {
+    tasks: Mutex<HashMap<Direction, JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,235 +89,31 @@ pub struct ShortcutsConfig {
     pub bindings: HashMap<String, ShortcutBinding>,
 }
 
-/// Initialize global shortcuts for the application
-pub fn setup_global_shortcuts<R: Runtime>(
-    app: &AppHandle<R>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Let the frontend initialize from localStorage
-    let state = app.state::<RegisteredShortcuts>();
-    let _registered = match state.shortcuts.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            eprintln!("Mutex poisoned in setup, recovering...");
-            poisoned.into_inner()
-        }
+fn bindings(config: &ShortcutsConfig) -> Result<Vec<(Shortcut, Action)>, String> {
+    let parse = |key: &str, id: &str| {
+        key.parse::<Shortcut>()
+            .map_err(|e| format!("invalid shortcut '{key}' for '{id}': {e}"))
     };
-    eprintln!("Global shortcuts state initialized, waiting for frontend config");
-
-    Ok(())
-}
-
-/// Handle shortcut action based on action_id
-pub fn handle_shortcut_action<R: Runtime>(app: &AppHandle<R>, action_id: &str) {
-    match action_id {
-        "toggle_dashboard" => handle_toggle_dashboard(app),
-        "toggle_window" => handle_toggle_window(app),
-        "focus_input" => handle_focus_input(app),
-        "move_window_up" => handle_move_window(app, "up"),
-        "move_window_down" => handle_move_window(app, "down"),
-        "move_window_left" => handle_move_window(app, "left"),
-        "move_window_right" => handle_move_window(app, "right"),
-        "audio_recording" => handle_audio_shortcut(app),
-        "screenshot" => handle_screenshot_shortcut(app),
-        "system_audio" => handle_system_audio_shortcut(app),
-        custom_action => {
-            // Emit custom action event for frontend to handle
-            if let Some(window) = app.get_webview_window("main") {
-                if let Err(e) = window.emit(
-                    "custom-shortcut-triggered",
-                    json!({ "action": custom_action }),
-                ) {
-                    eprintln!("Failed to emit custom shortcut event: {}", e);
+    let mut out = Vec::new();
+    for (id, binding) in &config.bindings {
+        let action = match id.as_str() {
+            "move_window" => None,
+            id => Some(id.parse::<Action>()?),
+        };
+        if !binding.enabled || binding.key.is_empty() {
+            continue;
+        }
+        match action {
+            Some(action) => out.push((parse(&binding.key, id)?, action)),
+            None => {
+                for dir in Direction::ALL {
+                    let key = format!("{}+{dir}", binding.key.trim());
+                    out.push((parse(&key, id)?, Action::Move(dir)));
                 }
             }
         }
     }
-}
-
-pub fn start_move_window<R: Runtime>(app: &AppHandle<R>, direction: &str) {
-    let state = app.state::<MoveWindowState>();
-    let mut tasks = match state.tasks.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    if tasks.contains_key(direction) {
-        return;
-    }
-
-    let stop_flag: MoveWindowTask = Arc::new(AtomicBool::new(false));
-    let flag_clone = stop_flag.clone();
-    let dir = direction.to_string();
-    let app_handle = app.clone();
-
-    tauri::async_runtime::spawn(async move {
-        let interval = Duration::from_millis(16);
-        while !flag_clone.load(Ordering::Relaxed) {
-            handle_move_window(&app_handle, &dir);
-            sleep(interval).await;
-        }
-    });
-
-    tasks.insert(direction.to_string(), stop_flag);
-}
-
-pub fn stop_move_window<R: Runtime>(app: &AppHandle<R>, direction: &str) {
-    let state = app.state::<MoveWindowState>();
-    let mut tasks = match state.tasks.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    if let Some(flag) = tasks.remove(direction) {
-        flag.store(true, Ordering::Relaxed);
-    }
-}
-
-pub fn stop_all_move_windows<R: Runtime>(app: &AppHandle<R>) {
-    let state = app.state::<MoveWindowState>();
-    let mut tasks = match state.tasks.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    for (_direction, flag) in tasks.drain() {
-        flag.store(true, Ordering::Relaxed);
-    }
-}
-
-/// Handle app toggle (hide/show) with input focus and app icon management
-fn handle_toggle_window<R: Runtime>(app: &AppHandle<R>) {
-    // Get the main window
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
-
-    #[cfg(target_os = "windows")]
-    {
-        let state = app.state::<WindowVisibility>();
-        let mut is_hidden = state.is_hidden.lock().unwrap();
-        *is_hidden = !*is_hidden;
-
-        if let Err(e) = window.emit("toggle-window-visibility", *is_hidden) {
-            eprintln!("Failed to emit toggle-window-visibility event: {}", e);
-        }
-
-        if !*is_hidden {
-            if let Err(e) = window.show() {
-                eprintln!("Failed to show window: {}", e);
-            }
-            if let Err(e) = window.set_focus() {
-                eprintln!("Failed to focus window: {}", e);
-            }
-            if let Err(e) = window.emit("focus-text-input", json!({})) {
-                eprintln!("Failed to emit focus-text-input event: {}", e);
-            }
-        }
-        return;
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    match window.is_visible() {
-        Ok(true) => {
-            #[cfg(target_os = "macos")]
-            {
-                let panel = app.get_webview_window("main").unwrap();
-                let _ = panel.hide();
-            }
-            // Window is visible, hide it and handle app icon based on user settings
-            if let Err(e) = window.hide() {
-                eprintln!("Failed to hide window: {}", e);
-            }
-        }
-        Ok(false) => {
-            // Window is hidden, show it and handle app icon based on user settings
-            if let Err(e) = window.show() {
-                eprintln!("Failed to show window: {}", e);
-            }
-
-            if let Err(e) = window.set_focus() {
-                eprintln!("Failed to focus window: {}", e);
-            }
-
-            #[cfg(target_os = "macos")]
-            {
-                let panel = app.get_webview_panel("main").unwrap();
-                panel.show();
-            }
-            // Emit event to focus text input
-            window.emit("focus-text-input", json!({})).unwrap();
-        }
-        Err(e) => {
-            eprintln!("Failed to check window visibility: {}", e);
-        }
-    }
-}
-
-/// Handle audio shortcut
-fn handle_audio_shortcut<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window("main") {
-        // Ensure window is visible
-        if let Ok(false) = window.is_visible() {
-            if let Err(_e) = window.show() {
-                return;
-            }
-            if let Err(e) = window.set_focus() {
-                eprintln!("Failed to focus window: {}", e);
-            }
-        }
-
-        // Emit event to start audio recording
-        if let Err(e) = window.emit("start-audio-recording", json!({})) {
-            eprintln!("Failed to emit audio recording event: {}", e);
-        }
-    }
-}
-
-/// Handle screenshot shortcut
-fn handle_screenshot_shortcut<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window("main") {
-        // Emit event to trigger screenshot - frontend will determine auto/manual mode
-        if let Err(e) = window.emit("trigger-screenshot", json!({})) {
-            eprintln!("Failed to emit screenshot event: {}", e);
-        }
-    }
-}
-
-/// Handle system audio shortcut
-fn handle_system_audio_shortcut<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window("main") {
-        // Ensure window is visible
-        if let Ok(false) = window.is_visible() {
-            if let Err(e) = window.show() {
-                eprintln!("Failed to show window: {}", e);
-                return;
-            }
-            if let Err(e) = window.set_focus() {
-                eprintln!("Failed to focus window: {}", e);
-            }
-        }
-
-        // Emit event to toggle system audio capture - frontend will determine current state
-        if let Err(e) = window.emit("toggle-system-audio", json!({})) {
-            eprintln!("Failed to emit system audio event: {}", e);
-        }
-    }
-}
-
-/// Tauri command to get all registered shortcuts
-#[tauri::command]
-pub fn get_registered_shortcuts<R: Runtime>(
-    app: AppHandle<R>,
-) -> Result<HashMap<String, String>, String> {
-    let state = app.state::<RegisteredShortcuts>();
-    let registered = match state.shortcuts.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            eprintln!("Mutex poisoned in get_registered_shortcuts, recovering...");
-            poisoned.into_inner()
-        }
-    };
-    Ok(registered.clone())
+    Ok(out)
 }
 
 /// Tauri command to update shortcuts dynamically
@@ -293,156 +122,170 @@ pub fn update_shortcuts<R: Runtime>(
     app: AppHandle<R>,
     config: ShortcutsConfig,
 ) -> Result<(), String> {
-    eprintln!("Updating shortcuts with {} bindings", config.bindings.len());
+    let bindings =
+        bindings(&config).inspect_err(|e| tracing::error!("rejected shortcuts config: {e}"))?;
 
-    let mut shortcuts_to_register = Vec::new();
-
-    for (action_id, binding) in &config.bindings {
-        if binding.enabled && !binding.key.is_empty() {
-            if action_id == "move_window" {
-                let modifiers = binding.key.trim();
-                if modifiers.is_empty() {
-                    continue;
-                }
-
-                let arrow_keys = vec!["up", "down", "left", "right"];
-                for arrow in arrow_keys {
-                    let full_key = format!("{}+{}", modifiers, arrow);
-                    match full_key.parse::<Shortcut>() {
-                        Ok(shortcut) => {
-                            let direction_action_id = format!("move_window_{}", arrow);
-                            shortcuts_to_register.push((direction_action_id, full_key, shortcut));
-                        }
-                        Err(e) => {
-                            eprintln!("Invalid shortcut '{}' for move_window: {}", full_key, e);
-                            return Err(format!(
-                                "Invalid shortcut '{}' for move_window: {}",
-                                full_key, e
-                            ));
-                        }
-                    }
-                }
-
-                continue;
-            }
-
-            match binding.key.parse::<Shortcut>() {
-                Ok(shortcut) => {
-                    shortcuts_to_register.push((action_id.clone(), binding.key.clone(), shortcut));
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Invalid shortcut '{}' for action '{}': {}",
-                        binding.key, action_id, e
-                    );
-                    return Err(format!(
-                        "Invalid shortcut '{}' for action '{}': {}",
-                        binding.key, action_id, e
-                    ));
-                }
-            }
-        }
-    }
-
-    // First, stop any ongoing window movement
     stop_all_move_windows(&app);
+    let gs = app.global_shortcut();
+    gs.unregister_all().map_err(|e| e.to_string())?;
 
-    // Then, unregister all existing shortcuts
-    unregister_all_shortcuts(&app)?;
-
-    // Now register all new shortcuts
-    let mut successfully_registered = HashMap::new();
-
-    let mut registration_failures: Vec<(String, String, String)> = Vec::new();
-
-    for (action_id, shortcut_str, shortcut) in shortcuts_to_register {
-        match app.global_shortcut().register(shortcut) {
-            Ok(_) => {
-                eprintln!("Registered shortcut: {} -> {}", action_id, shortcut_str);
-                successfully_registered.insert(action_id, shortcut_str);
-            }
-            Err(e) => {
-                eprintln!("Failed to register {} shortcut: {}", action_id, e);
-                registration_failures.push((action_id, shortcut_str, e.to_string()));
-            }
+    let mut failures = Vec::new();
+    for (shortcut, action) in bindings {
+        if let Err(e) = gs.on_shortcut(shortcut, move |app, _, ev| on_event(app, action, ev.state))
+        {
+            failures.push(format!("{action:?} ({shortcut}) - {e}"));
         }
     }
-
-    // Update state with successfully registered shortcuts
-    {
-        let state = app.state::<RegisteredShortcuts>();
-        let mut registered = match state.shortcuts.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                eprintln!("Mutex poisoned in update_shortcuts, recovering...");
-                poisoned.into_inner()
-            }
-        };
-
-        registered.clear();
-        registered.extend(successfully_registered);
-    }
-
-    if !registration_failures.is_empty() {
-        if let Some(window) = app.get_webview_window("main") {
-            if let Err(e) = window.emit("shortcut-registration-error", &registration_failures) {
-                eprintln!("Failed to emit shortcut registration error event: {}", e);
-            }
-        }
-
-        let error_messages: Vec<String> = registration_failures
-            .into_iter()
-            .map(|(action, key, error)| format!("{} ({}) - {}", action, key, error))
-            .collect();
-
-        return Err(format!(
+    if !failures.is_empty() {
+        let msg = format!(
             "Some shortcuts could not be registered: {}",
-            error_messages.join("; ")
-        ));
+            failures.join("; ")
+        );
+        tracing::error!("{msg}");
+        return Err(msg);
     }
-
     Ok(())
 }
 
-/// Unregister all currently registered shortcuts
-fn unregister_all_shortcuts<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    let state = app.state::<RegisteredShortcuts>();
-    let registered = match state.shortcuts.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            eprintln!("Mutex poisoned in unregister_all_shortcuts, recovering...");
-            poisoned.into_inner()
+fn on_event<R: Runtime>(app: &AppHandle<R>, action: Action, state: ShortcutState) {
+    let result = match (action, state) {
+        (Action::Move(dir), ShortcutState::Pressed) => {
+            start_move_window(app, dir);
+            Ok(())
         }
+        (Action::Move(dir), ShortcutState::Released) => {
+            stop_move_window(app, dir);
+            Ok(())
+        }
+        (action, ShortcutState::Pressed) => run(app, action),
+        (_, ShortcutState::Released) => Ok(()),
     };
+    if let Err(e) = result {
+        tracing::error!("shortcut {action:?} failed: {e:#}"); // runs on the hotkey thread: nothing to return to, a panic kills all shortcuts
+    }
+}
 
-    for (action_id, shortcut_str) in registered.iter() {
-        if let Ok(shortcut) = shortcut_str.parse::<Shortcut>() {
-            match app.global_shortcut().unregister(shortcut) {
-                Ok(_) => {
-                    eprintln!("Unregistered shortcut: {} -> {}", action_id, shortcut_str);
+fn run<R: Runtime>(app: &AppHandle<R>, action: Action) -> anyhow::Result<()> {
+    if let Action::ToggleDashboard = action {
+        return crate::window::toggle_dashboard(app).map_err(anyhow::Error::msg);
+    }
+    let window = app
+        .get_webview_window("main")
+        .ok_or(tauri::Error::WindowNotFound)?;
+    match action {
+        Action::FocusInput => {
+            if !window.is_visible()? {
+                window.show()?;
+            }
+            window.set_focus()?;
+            window.emit("focus-text-input", ())?;
+        }
+        Action::AudioRecording | Action::SystemAudio => {
+            if !window.is_visible()? {
+                window.show()?;
+                window.set_focus()?;
+            }
+            let event = match action {
+                Action::AudioRecording => "start-audio-recording",
+                _ => "toggle-system-audio",
+            };
+            window.emit(event, ())?;
+        }
+        Action::Screenshot => window.emit("trigger-screenshot", ())?,
+        Action::ToggleWindow => {
+            #[cfg(target_os = "windows")]
+            {
+                let state = app.state::<WindowVisibility>();
+                let mut is_hidden = state.is_hidden.lock().unwrap();
+                *is_hidden = !*is_hidden;
+
+                window.emit("toggle-window-visibility", *is_hidden)?;
+
+                if !*is_hidden {
+                    window.show()?;
+                    window.set_focus()?;
+                    window.emit("focus-text-input", ())?;
                 }
-                Err(e) => {
-                    eprintln!("Failed to unregister shortcut {}: {}", shortcut_str, e);
+                return Ok(());
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            if window.is_visible()? {
+                #[cfg(target_os = "macos")]
+                {
+                    let panel = app.get_webview_window("main").unwrap();
+                    let _ = panel.hide();
                 }
+                window.hide()?;
+            } else {
+                window.show()?;
+                window.set_focus()?;
+
+                #[cfg(target_os = "macos")]
+                {
+                    let panel = app.get_webview_panel("main").unwrap();
+                    panel.show();
+                }
+                window.emit("focus-text-input", ())?;
             }
         }
+        Action::ToggleDashboard | Action::Move(_) => {
+            unreachable!("dashboard handled above, Move routed in on_event")
+        }
     }
-
     Ok(())
 }
 
-/// Tauri command to check if shortcuts are registered
-#[tauri::command]
-pub fn check_shortcuts_registered<R: Runtime>(app: AppHandle<R>) -> Result<bool, String> {
-    let state = app.state::<RegisteredShortcuts>();
-    let registered = match state.shortcuts.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            eprintln!("Mutex poisoned in check_shortcuts_registered, recovering...");
-            poisoned.into_inner()
+fn start_move_window<R: Runtime>(app: &AppHandle<R>, dir: Direction) {
+    let state = app.state::<MoveWindowState>();
+    let mut tasks = state.tasks.lock().unwrap();
+    if tasks.contains_key(&dir) {
+        return;
+    }
+    let app = app.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        loop {
+            if let Err(e) = move_once(&app, dir) {
+                tracing::error!("move window {dir} failed: {e}");
+                break;
+            }
+            sleep(Duration::from_millis(16)).await;
         }
+    });
+    tasks.insert(dir, task);
+}
+
+fn stop_move_window<R: Runtime>(app: &AppHandle<R>, dir: Direction) {
+    if let Some(task) = app
+        .state::<MoveWindowState>()
+        .tasks
+        .lock()
+        .unwrap()
+        .remove(&dir)
+    {
+        task.abort();
+    }
+}
+
+fn stop_all_move_windows<R: Runtime>(app: &AppHandle<R>) {
+    for (_, task) in app.state::<MoveWindowState>().tasks.lock().unwrap().drain() {
+        task.abort();
+    }
+}
+
+fn move_once<R: Runtime>(app: &AppHandle<R>, dir: Direction) -> tauri::Result<()> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or(tauri::Error::WindowNotFound)?;
+    let pos = window.outer_position()?;
+    let step = 12;
+    let (x, y) = match dir {
+        Direction::Up => (pos.x, pos.y - step),
+        Direction::Down => (pos.x, pos.y + step),
+        Direction::Left => (pos.x - step, pos.y),
+        Direction::Right => (pos.x + step, pos.y),
     };
-    Ok(!registered.is_empty())
+    window.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }))
 }
 
 /// Tauri command to validate shortcut key
@@ -516,87 +359,54 @@ pub fn set_always_on_top<R: Runtime>(app: AppHandle<R>, enabled: bool) -> Result
     Ok(())
 }
 
-/// Handle toggle dashboard shortcut
-fn handle_toggle_dashboard<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(dashboard_window) = app.get_webview_window("dashboard") {
-        match dashboard_window.is_visible() {
-            Ok(true) => {
-                // Window is visible, hide it
-                if let Err(e) = dashboard_window.hide() {
-                    eprintln!("Failed to hide dashboard window: {}", e);
-                }
-            }
-            Ok(false) => {
-                // Window is hidden, show and focus it
-                if let Err(e) = dashboard_window.show() {
-                    eprintln!("Failed to show dashboard window: {}", e);
-                }
-                if let Err(e) = dashboard_window.set_focus() {
-                    eprintln!("Failed to focus dashboard window: {}", e);
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to check dashboard visibility: {}", e);
-            }
-        }
-    } else {
-        // Window doesn't exist, create and show it
-        match show_dashboard_window(app) {
-            Ok(_) => eprintln!("Dashboard window created and shown successfully"),
-            Err(e) => eprintln!("Failed to create/show dashboard window: {}", e),
-        }
-    }
-}
-
-/// Handle focus input shortcut
-fn handle_focus_input<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window("main") {
-        // Ensure window is visible
-        if let Ok(false) = window.is_visible() {
-            let _ = window.show();
-        }
-
-        let _ = window.set_focus();
-        let _ = window.emit("focus-text-input", json!({}));
-    }
-}
-
-fn handle_move_window<R: Runtime>(app: &AppHandle<R>, direction: &str) {
-    if let Some(window) = app.get_webview_window("main") {
-        match window.outer_position() {
-            Ok(current_pos) => {
-                let step = 12;
-                let (new_x, new_y) = match direction {
-                    "up" => (current_pos.x, current_pos.y - step),
-                    "down" => (current_pos.x, current_pos.y + step),
-                    "left" => (current_pos.x - step, current_pos.y),
-                    "right" => (current_pos.x + step, current_pos.y),
-                    _ => {
-                        eprintln!("Invalid direction: {}", direction);
-                        return;
-                    }
-                };
-
-                if let Err(e) =
-                    window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
-                        x: new_x,
-                        y: new_y,
-                    }))
-                {
-                    eprintln!("Failed to set window position: {}", e);
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to get window position: {}", e);
-            }
-        }
-    } else {
-        eprintln!("Main window not found");
-    }
-}
-
 /// Tauri command to exit the application
 #[tauri::command]
 pub fn exit_app(app_handle: tauri::AppHandle) {
     app_handle.exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauri::test::{mock_builder, mock_context, noop_assets};
+
+    fn config(entries: &[(&str, &str, bool)]) -> ShortcutsConfig {
+        ShortcutsConfig {
+            bindings: entries
+                .iter()
+                .map(|&(action, key, enabled)| {
+                    let binding = ShortcutBinding {
+                        action: action.into(),
+                        key: key.into(),
+                        enabled,
+                    };
+                    (action.to_string(), binding)
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn invalid_config_is_rejected_naming_the_offender() {
+        let cases = [
+            (
+                "custom_x",
+                config(&[
+                    ("screenshot", "ctrl+shift+s", true),
+                    ("custom_x", "ctrl+k", true),
+                ]),
+            ),
+            ("custom_x", config(&[("custom_x", "ctrl+k", false)])),
+            ("screenshot", config(&[("screenshot", "ctrl+nope", true)])),
+            ("move_window", config(&[("move_window", "bogus", true)])),
+        ];
+        for (offender, config) in cases {
+            let app = mock_builder()
+                .manage(MoveWindowState::default())
+                .build(mock_context(noop_assets()))
+                .unwrap();
+            let err = update_shortcuts(app.handle().clone(), config).unwrap_err();
+            assert!(err.contains(offender), "{offender}: {err}");
+        }
+    }
 }

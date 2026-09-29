@@ -5,7 +5,6 @@ export * from "./useWindow";
 export * from "./useCustomProviders";
 export * from "./useSettings";
 export * from "./useGlobalShortcuts";
-export * from "./useShortcuts";
 export * from "./useSystemAudio";
 export * from "./useHistory";
 export * from "./useCopyToClipboard";

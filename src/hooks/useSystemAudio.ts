@@ -960,7 +960,7 @@ export function useSystemAudio() {
         await startCapture();
       }
     });
-  }, [startCapture, stopCapture]);
+  }, [capturing, startCapture, stopCapture]);
 
   useEffect(() => {
     return () => {
