@@ -51,7 +51,6 @@ jobs:
       - name: Create environment file
         run: |
           echo "API_ACCESS_KEY=${{ secrets.API_ACCESS_KEY }}" > src-tauri/.env
-          echo "PAYMENT_ENDPOINT=${{ secrets.PAYMENT_ENDPOINT }}" >> src-tauri/.env
           echo "APP_ENDPOINT=${{ secrets.APP_ENDPOINT }}" >> src-tauri/.env
           echo "POSTHOG_API_KEY=${{ secrets.POSTHOG_API_KEY }}" >> src-tauri/.env
 
@@ -65,7 +64,6 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           API_ACCESS_KEY: ${{ secrets.API_ACCESS_KEY }}
-          PAYMENT_ENDPOINT: ${{ secrets.PAYMENT_ENDPOINT }}
           APP_ENDPOINT: ${{ secrets.APP_ENDPOINT }}
           POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
         with:

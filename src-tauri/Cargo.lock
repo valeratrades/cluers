@@ -3815,7 +3815,6 @@ dependencies = [
  "keyring",
  "libpulse-binding",
  "libpulse-simple-binding",
- "once_cell",
  "reqwest 0.12.23",
  "ringbuf",
  "rusqlite",
