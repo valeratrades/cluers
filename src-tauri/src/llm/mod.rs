@@ -4,7 +4,8 @@
 //!   frontend uses to drive both the Pluely-hosted path and arbitrary
 //!   custom provider templates. Streaming is over a Tauri `Channel<T>`.
 //! - Cancellation is `tokio::select!` against an `oneshot::Receiver`
-//!   whose `Sender` lives in `LlmState` keyed by `request_id`.
+//!   whose `Sender` lives in `LlmState` keyed by `request_id`. Duplicate
+//!   in-flight ids are rejected; cancel is idempotent.
 //! - Custom-provider secrets (API keys etc.) live in the OS keychain via
 //!   `secrets.rs`. Non-secret preferences such as the Pluely-hosted
 //!   `selected_model` live in the SQLite `settings` table — the keychain is
@@ -22,8 +23,7 @@ pub use state::LlmState;
 use serde::Serialize;
 
 /// Event payload sent over the per-request `Channel<StreamEvent>`.
-/// One stream lifetime: zero or more `Chunk`s, terminated by exactly
-/// one of `Done` or `Error`.
+/// Zero or more `Chunk`s, terminated by `Done`; failures are the command's `Err`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum StreamEvent {
@@ -32,10 +32,6 @@ pub enum StreamEvent {
     },
     Done {
         full_response: String,
-        request_id: String,
-    },
-    Error {
-        message: String,
         request_id: String,
     },
 }
@@ -66,6 +62,8 @@ pub enum LlmError {
     TextAttachment(String, String),
     #[error("provider template has no {{{{{0}}}}} slot — add one to the curl template to enable this attachment type")]
     UnsupportedAttachment(&'static str),
+    #[error("request id already in flight: {0}")]
+    DuplicateRequestId(String),
     #[error("cancelled")]
     Cancelled,
 }
