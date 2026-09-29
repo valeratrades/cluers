@@ -100,7 +100,7 @@ pub fn run() {
             shortcuts::set_app_icon_visibility,
             shortcuts::set_always_on_top,
             shortcuts::exit_app,
-            api::transcribe_audio,
+            llm::commands::transcribe,
             api::fetch_models,
             api::fetch_prompts,
             api::generate_system_prompt_via_api,

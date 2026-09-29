@@ -7,7 +7,7 @@
 
 use crate::db::Db;
 use crate::db::schema::AttachedFile;
-use crate::llm::{pluely, provider, LlmError, LlmState, StreamEvent};
+use crate::llm::{pluely, provider, secrets::ProviderKind, stt, LlmError, LlmState, StreamEvent};
 use serde::Deserialize;
 use std::collections::HashMap;
 use tauri::ipc::Channel;
@@ -119,6 +119,29 @@ pub async fn stream_chat(
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscribeRequest {
+    pub provider: ProviderInput,
+    pub audio_base64: String,
+    pub mime: String,
+}
+
+#[tauri::command]
+pub async fn transcribe(
+    app: AppHandle,
+    state: State<'_, LlmState>,
+    request: TranscribeRequest,
+) -> Result<String, String> {
+    use base64::Engine as _;
+    let audio = base64::engine::general_purpose::STANDARD
+        .decode(&request.audio_base64)
+        .map_err(|e| format!("audio base64: {e}"))?;
+    stt::transcribe(&app, &state, &request.provider, &audio, &request.mime)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn cancel_chat(state: State<'_, LlmState>, request_id: String) {
     state.cancels.cancel(&request_id)
@@ -127,6 +150,7 @@ pub fn cancel_chat(state: State<'_, LlmState>, request_id: String) {
 #[tauri::command]
 pub async fn set_provider_secret(
     state: State<'_, LlmState>,
+    kind: ProviderKind,
     provider_id: String,
     name: String,
     value: String,
@@ -136,7 +160,7 @@ pub async fn set_provider_secret(
     }
     state
         .secrets
-        .set(&provider_id, &name, &value)
+        .set(kind, &provider_id, &name, &value)
         .await
         .map_err(|e| e.to_string())
 }
@@ -144,11 +168,12 @@ pub async fn set_provider_secret(
 #[tauri::command]
 pub async fn list_provider_secret_names(
     state: State<'_, LlmState>,
+    kind: ProviderKind,
     provider_id: String,
 ) -> Result<Vec<String>, String> {
     let mut names: Vec<String> = state
         .secrets
-        .provider(&provider_id)
+        .provider(kind, &provider_id)
         .await
         .map_err(|e| e.to_string())?
         .into_keys()
@@ -160,12 +185,13 @@ pub async fn list_provider_secret_names(
 #[tauri::command]
 pub async fn delete_provider_secret(
     state: State<'_, LlmState>,
+    kind: ProviderKind,
     provider_id: String,
     name: String,
 ) -> Result<(), String> {
     state
         .secrets
-        .delete(&provider_id, &name)
+        .delete(kind, &provider_id, &name)
         .await
         .map_err(|e| e.to_string())
 }
@@ -173,11 +199,12 @@ pub async fn delete_provider_secret(
 #[tauri::command]
 pub async fn delete_all_provider_secrets(
     state: State<'_, LlmState>,
+    kind: ProviderKind,
     provider_id: String,
 ) -> Result<(), String> {
     state
         .secrets
-        .delete_all(&provider_id)
+        .delete_all(kind, &provider_id)
         .await
         .map_err(|e| e.to_string())
 }

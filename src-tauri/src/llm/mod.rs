@@ -3,6 +3,7 @@
 //! - `stream_chat` (in `commands`) is the single command surface the
 //!   frontend uses to drive both the Pluely-hosted path and arbitrary
 //!   custom provider templates. Streaming is over a Tauri `Channel<T>`.
+//! - `transcribe` is the STT counterpart (`stt::transcribe`), same routing.
 //! - Cancellation is `tokio::select!` against an `oneshot::Receiver`
 //!   whose `Sender` lives in `LlmState` keyed by `request_id`. Duplicate
 //!   in-flight ids are rejected; cancel is idempotent.
@@ -17,6 +18,7 @@ pub mod provider;
 pub mod secrets;
 pub mod state;
 pub mod stream;
+pub mod stt;
 
 pub use state::LlmState;
 
@@ -62,6 +64,10 @@ pub enum LlmError {
     TextAttachment(String, String),
     #[error("provider template has no {{{{{0}}}}} slot — add one to the curl template to enable this attachment type")]
     UnsupportedAttachment(&'static str),
+    #[error("pluely stt: {0}")]
+    PluelyStt(String),
+    #[error("stt response: {0}")]
+    SttResponse(String),
     #[error("request id already in flight: {0}")]
     DuplicateRequestId(String),
     #[error("cancelled")]

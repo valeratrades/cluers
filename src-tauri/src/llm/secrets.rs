@@ -1,8 +1,9 @@
 //! Custom-provider secret storage in the OS keychain.
 //!
-//! One keychain entry per provider: service `pluely.provider.<id>`,
-//! account `"secrets"`, value = a JSON object `{name: value}`. Every
-//! operation touches the keychain at most once.
+//! One keychain entry per (kind, provider): service `pluely.provider.<id>`
+//! for AI and `pluely.stt-provider.<id>` for STT (built-in ids such as `groq`
+//! exist in both kinds), account `"secrets"`, value = a JSON object
+//! `{name: value}`. Every operation touches the keychain at most once.
 //!
 //! [`Secrets`] is a write-through cache: the first read of a provider loads
 //! its map from the keychain; every subsequent read is served from memory,
@@ -10,10 +11,9 @@
 //! provider per app run, and never again. Writes go to the keychain first
 //! and only mutate the cache on success.
 //!
-//! Pre-release note (`riir`): this is a fresh keychain scheme. The old
-//! per-variable / `__names__` layout and the `pluely.license`
-//! `selected_model` entry are intentionally orphaned — there is no
-//! migration. The user re-enters API keys / re-selects a model once.
+//! The old per-variable / `__names__` AI layout and the `pluely.license`
+//! `selected_model` entry are orphaned (no migration). Plaintext STT keys
+//! from localStorage are migrated by the renderer (`migrateSttLegacyStorage`).
 
 use std::collections::HashMap;
 
@@ -22,11 +22,26 @@ use tokio::sync::Mutex;
 
 use crate::llm::LlmError;
 
-const SVC_PROVIDER_PREFIX: &str = "pluely.provider.";
 const ACCT_SECRETS: &str = "secrets";
 
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    Ai,
+    Stt,
+}
+
+impl ProviderKind {
+    fn service(self, id: &str) -> String {
+        match self {
+            ProviderKind::Ai => format!("pluely.provider.{id}"),
+            ProviderKind::Stt => format!("pluely.stt-provider.{id}"),
+        }
+    }
+}
+
 pub struct Secrets {
-    /// provider_id -> {name -> value}; key presence == loaded from keychain.
+    /// keychain service -> {name -> value}; key presence == loaded from keychain.
     cache: Mutex<HashMap<String, HashMap<String, String>>>,
 }
 
@@ -38,79 +53,84 @@ impl Secrets {
     }
 
     /// All secrets for a provider, loading from the keychain on first miss.
-    pub async fn provider(&self, id: &str) -> Result<HashMap<String, String>, LlmError> {
+    pub async fn provider(
+        &self,
+        kind: ProviderKind,
+        id: &str,
+    ) -> Result<HashMap<String, String>, LlmError> {
         let mut cache = self.cache.lock().await;
-        if let Some(map) = cache.get(id) {
-            return Ok(map.clone());
-        }
-        let id_owned = id.to_string();
-        let map = tokio::task::spawn_blocking(move || load_blocking(&id_owned))
-            .await
-            .expect("secrets load spawn_blocking join")?;
-        cache.insert(id.to_string(), map.clone());
-        Ok(map)
+        ensure_loaded(&mut cache, &kind.service(id)).await
     }
 
-    pub async fn set(&self, id: &str, name: &str, value: &str) -> Result<(), LlmError> {
+    pub async fn set(
+        &self,
+        kind: ProviderKind,
+        id: &str,
+        name: &str, value: &str,
+    ) -> Result<(), LlmError> {
+        let svc = kind.service(id);
         let mut cache = self.cache.lock().await;
-        let mut map = ensure_loaded(&mut cache, id).await?;
+        let mut map = ensure_loaded(&mut cache, &svc).await?;
         map.insert(name.to_string(), value.to_string());
-        store(id, &map).await?;
-        cache.insert(id.to_string(), map);
+        store(&svc, &map).await?;
+        cache.insert(svc, map);
         Ok(())
     }
 
-    pub async fn delete(&self, id: &str, name: &str) -> Result<(), LlmError> {
+    pub async fn delete(
+        &self,
+        kind: ProviderKind,
+        id: &str,
+        name: &str,
+    ) -> Result<(), LlmError> {
+        let svc = kind.service(id);
         let mut cache = self.cache.lock().await;
-        let mut map = ensure_loaded(&mut cache, id).await?;
+        let mut map = ensure_loaded(&mut cache, &svc).await?;
         map.remove(name);
-        store(id, &map).await?;
-        cache.insert(id.to_string(), map);
+        store(&svc, &map).await?;
+        cache.insert(svc, map);
         Ok(())
     }
 
     /// Drop every secret for a provider. Does not load first, so it doubles
     /// as an escape hatch when the stored JSON is corrupt.
-    pub async fn delete_all(&self, id: &str) -> Result<(), LlmError> {
+    pub async fn delete_all(&self, kind: ProviderKind, id: &str) -> Result<(), LlmError> {
+        let svc = kind.service(id);
         let mut cache = self.cache.lock().await;
-        store(id, &HashMap::new()).await?;
-        cache.insert(id.to_string(), HashMap::new());
+        store(&svc, &HashMap::new()).await?;
+        cache.insert(svc, HashMap::new());
         Ok(())
     }
 }
 
-/// Load into `cache[id]` if absent and return a clone of the loaded map.
+/// Load into `cache[svc]` if absent and return a clone of the loaded map.
 /// The caller holds the cache lock across the keychain access so concurrent
 /// read-modify-write is serialized (desirable per keyring docs).
 async fn ensure_loaded(
     cache: &mut HashMap<String, HashMap<String, String>>,
-    id: &str,
+    svc: &str,
 ) -> Result<HashMap<String, String>, LlmError> {
-    if let Some(map) = cache.get(id) {
+    if let Some(map) = cache.get(svc) {
         return Ok(map.clone());
     }
-    let id_owned = id.to_string();
-    let map = tokio::task::spawn_blocking(move || load_blocking(&id_owned))
+    let svc_owned = svc.to_string();
+    let map = tokio::task::spawn_blocking(move || load_blocking(&svc_owned))
         .await
         .expect("secrets load spawn_blocking join")?;
-    cache.insert(id.to_string(), map.clone());
+    cache.insert(svc.to_string(), map.clone());
     Ok(map)
 }
 
-async fn store(id: &str, map: &HashMap<String, String>) -> Result<(), LlmError> {
-    let id_owned = id.to_string();
+async fn store(svc: &str, map: &HashMap<String, String>) -> Result<(), LlmError> {
+    let svc_owned = svc.to_string();
     let map_owned = map.clone();
-    tokio::task::spawn_blocking(move || store_blocking(&id_owned, &map_owned))
+    tokio::task::spawn_blocking(move || store_blocking(&svc_owned, &map_owned))
         .await
         .expect("secrets store spawn_blocking join")
 }
 
-fn provider_service(id: &str) -> String {
-    format!("{}{}", SVC_PROVIDER_PREFIX, id)
-}
-
-fn load_blocking(id: &str) -> Result<HashMap<String, String>, LlmError> {
-    let entry = Entry::new(&provider_service(id), ACCT_SECRETS)?;
+fn load_blocking(svc: &str) -> Result<HashMap<String, String>, LlmError> {
+    let entry = Entry::new(svc, ACCT_SECRETS)?;
     match entry.get_password() {
         Ok(json) => Ok(serde_json::from_str(&json)?),
         Err(keyring::Error::NoEntry) => Ok(HashMap::new()),
@@ -118,8 +138,8 @@ fn load_blocking(id: &str) -> Result<HashMap<String, String>, LlmError> {
     }
 }
 
-fn store_blocking(id: &str, map: &HashMap<String, String>) -> Result<(), LlmError> {
-    let entry = Entry::new(&provider_service(id), ACCT_SECRETS)?;
+fn store_blocking(svc: &str, map: &HashMap<String, String>) -> Result<(), LlmError> {
+    let entry = Entry::new(svc, ACCT_SECRETS)?;
     if map.is_empty() {
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -132,7 +152,7 @@ fn store_blocking(id: &str, map: &HashMap<String, String>) -> Result<(), LlmErro
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -239,7 +259,7 @@ mod tests {
 
     static STORE: OnceLock<(Store, Counters)> = OnceLock::new();
 
-    fn install() -> (Store, Counters) {
+    pub(crate) fn install() -> (Store, Counters) {
         STORE
             .get_or_init(|| {
                 let data: Store = Arc::new(StdMutex::new(HashMap::new()));
@@ -257,7 +277,7 @@ mod tests {
         counters
             .lock()
             .unwrap()
-            .get(&provider_service(id))
+            .get(&ProviderKind::Ai.service(id))
             .copied()
             .unwrap_or((0, 0, 0))
     }
@@ -274,13 +294,13 @@ mod tests {
 
         let secrets = Secrets::new();
         let before = snapshot(&counters, id);
-        secrets.set(id, "API_KEY", "k").await.unwrap();
+        secrets.set(ProviderKind::Ai, id, "API_KEY", "k").await.unwrap();
         // set: load-on-miss (1 get) + store (1 set).
         assert_eq!(delta(&counters, id, before), (1, 1, 0));
 
         // Already cached -> no further keychain ops.
         let before = snapshot(&counters, id);
-        let map = secrets.provider(id).await.unwrap();
+        let map = secrets.provider(ProviderKind::Ai, id).await.unwrap();
         assert_eq!(map.get("API_KEY").map(String::as_str), Some("k"));
         assert_eq!(delta(&counters, id, before), (0, 0, 0));
 
@@ -288,7 +308,7 @@ mod tests {
         let stored = data
             .lock()
             .unwrap()
-            .get(&(provider_service(id), ACCT_SECRETS.to_string()))
+            .get(&(ProviderKind::Ai.service(id), ACCT_SECRETS.to_string()))
             .cloned()
             .unwrap();
         assert_eq!(stored, r#"{"API_KEY":"k"}"#);
@@ -296,11 +316,11 @@ mod tests {
         // Fresh instance: first provider() loads (1 get), second is cached.
         let fresh = Secrets::new();
         let before = snapshot(&counters, id);
-        let map = fresh.provider(id).await.unwrap();
+        let map = fresh.provider(ProviderKind::Ai, id).await.unwrap();
         assert_eq!(map.get("API_KEY").map(String::as_str), Some("k"));
         assert_eq!(delta(&counters, id, before), (1, 0, 0));
         let before = snapshot(&counters, id);
-        fresh.provider(id).await.unwrap();
+        fresh.provider(ProviderKind::Ai, id).await.unwrap();
         assert_eq!(delta(&counters, id, before), (0, 0, 0));
     }
 
@@ -310,18 +330,18 @@ mod tests {
         let id = "delete_last";
 
         let secrets = Secrets::new();
-        secrets.set(id, "ONLY", "v").await.unwrap();
-        secrets.delete(id, "ONLY").await.unwrap();
+        secrets.set(ProviderKind::Ai, id, "ONLY", "v").await.unwrap();
+        secrets.delete(ProviderKind::Ai, id, "ONLY").await.unwrap();
 
         // Empty map -> the keychain entry is deleted, not left as `{}`.
         assert!(data
             .lock()
             .unwrap()
-            .get(&(provider_service(id), ACCT_SECRETS.to_string()))
+            .get(&(ProviderKind::Ai.service(id), ACCT_SECRETS.to_string()))
             .is_none());
 
         let before = snapshot(&counters, id);
-        let map = secrets.provider(id).await.unwrap();
+        let map = secrets.provider(ProviderKind::Ai, id).await.unwrap();
         assert!(map.is_empty());
         assert_eq!(delta(&counters, id, before), (0, 0, 0));
     }
@@ -333,19 +353,19 @@ mod tests {
 
         // Seed directly so `delete_all` has something to remove.
         data.lock().unwrap().insert(
-            (provider_service(id), ACCT_SECRETS.to_string()),
+            (ProviderKind::Ai.service(id), ACCT_SECRETS.to_string()),
             r#"{"A":"1"}"#.to_string(),
         );
 
         let secrets = Secrets::new();
         let before = snapshot(&counters, id);
-        secrets.delete_all(id).await.unwrap();
+        secrets.delete_all(ProviderKind::Ai, id).await.unwrap();
         // No gets: delete_all never loads.
         assert_eq!(delta(&counters, id, before).0, 0);
         assert!(data
             .lock()
             .unwrap()
-            .get(&(provider_service(id), ACCT_SECRETS.to_string()))
+            .get(&(ProviderKind::Ai.service(id), ACCT_SECRETS.to_string()))
             .is_none());
     }
 
@@ -355,15 +375,41 @@ mod tests {
         let id = "multi_name";
 
         let secrets = Secrets::new();
-        secrets.set(id, "B_KEY", "2").await.unwrap();
-        secrets.set(id, "A_KEY", "1").await.unwrap();
+        secrets.set(ProviderKind::Ai, id, "B_KEY", "2").await.unwrap();
+        secrets.set(ProviderKind::Ai, id, "A_KEY", "1").await.unwrap();
 
-        let map = secrets.provider(id).await.unwrap();
+        let map = secrets.provider(ProviderKind::Ai, id).await.unwrap();
         assert_eq!(map.get("A_KEY").map(String::as_str), Some("1"));
         assert_eq!(map.get("B_KEY").map(String::as_str), Some("2"));
 
         let mut names: Vec<String> = map.into_keys().collect();
         names.sort();
         assert_eq!(names, vec!["A_KEY".to_string(), "B_KEY".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn kinds_are_isolated() {
+        let _ = install();
+        let id = "groq_iso";
+
+        let secrets = Secrets::new();
+        secrets.set(ProviderKind::Ai, id, "API_KEY", "a").await.unwrap();
+        secrets.set(ProviderKind::Stt, id, "API_KEY", "s").await.unwrap();
+        assert_eq!(
+            secrets.provider(ProviderKind::Ai, id).await.unwrap().get("API_KEY").map(String::as_str),
+            Some("a")
+        );
+        assert_eq!(
+            secrets.provider(ProviderKind::Stt, id).await.unwrap().get("API_KEY").map(String::as_str),
+            Some("s")
+        );
+
+        secrets.delete_all(ProviderKind::Stt, id).await.unwrap();
+        let fresh = Secrets::new();
+        assert!(fresh.provider(ProviderKind::Stt, id).await.unwrap().is_empty());
+        assert_eq!(
+            fresh.provider(ProviderKind::Ai, id).await.unwrap().get("API_KEY").map(String::as_str),
+            Some("a")
+        );
     }
 }
