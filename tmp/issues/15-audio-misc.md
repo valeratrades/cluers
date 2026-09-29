@@ -7,3 +7,4 @@
 
 Run together with 14 (same files, one agent).
 - `speaker::linux::tests::stream_ends_with_error_when_capture_is_killed` flaked once during issue 12 (live-Pulse timing). Harden it or document why it's inherently racy.
+- `first_sample_arrives_within_200ms` flakes under heavy machine load (210-330ms at loadavg 35-57, from other processes). Make the latency assertion robust under load (e.g. measure the delivery interval between fragments rather than wall-clock from open), without losing the ability to catch a regression to ~2s.
