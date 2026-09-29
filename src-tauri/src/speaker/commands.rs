@@ -9,12 +9,8 @@ use std::collections::VecDeque;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-// Memory ordering choice for capture state:
-// `Acquire` on the load side and `Release` on the store side establish a
-// happens-before relationship - any thread that observes `is_capturing == true`
-// is guaranteed to see all the side-effects that preceded the store, and vice versa.
-// `AcqRel` on compare_exchange combines both for the success case.
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 use tauri::{AppHandle, Emitter, Listener, Manager};
 use tauri_plugin_shell::ShellExt;
 use tracing::{error, warn};
@@ -78,97 +74,90 @@ pub async fn start_system_audio_capture(
     device_id: Option<String>,
 ) -> Result<(), String> {
     let state = app.state::<crate::AudioState>();
+    let app_clone = app.clone();
+    state
+        .start(|| {
+            if let Some(config) = vad_config {
+                let mut vad_cfg = state
+                    .vad_config
+                    .lock()
+                    .map_err(|e| format!("Failed to acquire VAD config lock: {}", e))?;
+                *vad_cfg = config;
+            }
 
-    // Atomic entry guard: flips false -> true exactly once. Concurrent callers
-    // that lose the CAS race exit immediately without setting up any resources.
-    if state
-        .is_capturing
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        warn!("Capture already running");
-        return Err("Capture already running".to_string());
-    }
+            let input = SpeakerInput::new_with_device(device_id).map_err(|e| {
+                error!("Failed to create speaker input: {}", e);
+                format!("Failed to access system audio: {}", e)
+            })?;
 
-    // From here on, any error path must reset is_capturing back to false.
-    // Wrap the setup in a closure so we can roll back on failure with one path.
-    let setup = (|| -> Result<_, String> {
-        // Update VAD config if provided
-        if let Some(config) = vad_config {
-            let mut vad_cfg = state
+            let stream = input.stream();
+            let sr = stream.sample_rate();
+
+            if !(8000..=96000).contains(&sr) {
+                error!("Invalid sample rate: {}", sr);
+                return Err(format!(
+                    "Invalid sample rate: {}. Expected 8000-96000 Hz",
+                    sr
+                ));
+            }
+
+            let vad_config = state
                 .vad_config
                 .lock()
-                .map_err(|e| format!("Failed to acquire VAD config lock: {}", e))?;
-            *vad_cfg = config;
+                .map_err(|e| format!("Failed to read VAD config: {}", e))?
+                .clone();
+
+            Ok(async move {
+                if vad_config.enabled {
+                    run_vad_capture(app_clone, stream, sr, vad_config).await;
+                } else {
+                    run_continuous_capture(app_clone, stream, sr, vad_config).await;
+                }
+            })
+        })
+        .await
+}
+
+impl crate::AudioState {
+    /// Locks the capture slot; Err if a capture is live. A finished capture is reaped.
+    async fn lock_idle(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<JoinHandle<()>>>, String> {
+        let mut slot = self.capture.lock().await;
+        if let Some(done) = slot.take_if(|t| t.is_finished()) {
+            reap(done).await;
         }
-
-        let input = SpeakerInput::new_with_device(device_id).map_err(|e| {
-            error!("Failed to create speaker input: {}", e);
-            format!("Failed to access system audio: {}", e)
-        })?;
-
-        let stream = input.stream();
-        let sr = stream.sample_rate();
-
-        // Validate sample rate
-        if !(8000..=96000).contains(&sr) {
-            error!("Invalid sample rate: {}", sr);
-            return Err(format!(
-                "Invalid sample rate: {}. Expected 8000-96000 Hz",
-                sr
-            ));
+        if slot.is_some() {
+            warn!("Capture already running");
+            return Err("Capture already running".to_string());
         }
-
-        let vad_config = state
-            .vad_config
-            .lock()
-            .map_err(|e| format!("Failed to read VAD config: {}", e))?
-            .clone();
-
-        Ok((stream, sr, vad_config))
-    })();
-
-    let (stream, sr, vad_config) = match setup {
-        Ok(v) => v,
-        Err(e) => {
-            // Roll back the entry guard so the next start can proceed.
-            state.is_capturing.store(false, Ordering::Release);
-            return Err(e);
-        }
-    };
-
-    let app_clone = app.clone();
-
-    // Emit capture started event
-    if let Err(e) = app_clone.emit("capture-started", sr) {
-        error!("Failed to emit capture-started: {}", e);
+        Ok(slot)
     }
 
-    let state_clone = app.state::<crate::AudioState>();
-    let task = tokio::spawn(async move {
-        if vad_config.enabled {
-            run_vad_capture(app_clone.clone(), stream, sr, vad_config).await;
-        } else {
-            run_continuous_capture(app_clone.clone(), stream, sr, vad_config).await;
+    async fn start<F>(&self, open: impl FnOnce() -> Result<F, String>) -> Result<(), String>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut slot = self.lock_idle().await?;
+        *slot = Some(tokio::spawn(open()?));
+        Ok(())
+    }
+
+    async fn stop(&self) {
+        let mut slot = self.capture.lock().await;
+        if let Some(task) = slot.take() {
+            task.abort();
+            reap(task).await;
         }
+    }
+}
 
-        let state = app_clone.state::<crate::AudioState>();
-        {
-            if let Ok(mut guard) = state.stream_task.lock() {
-                *guard = None;
-            };
-        }
-        // Also clear `is_capturing` so the next start isn't blocked by stale state
-        // when the task ends naturally (max duration, safety cap, stream EOF, etc.)
-        state.is_capturing.store(false, Ordering::Release);
-    });
-
-    *state_clone
-        .stream_task
-        .lock()
-        .map_err(|e| format!("Failed to store task: {}", e))? = Some(task);
-
-    Ok(())
+async fn reap(task: JoinHandle<()>) {
+    if let Err(e) = task.await {
+        if e.is_panic() {
+            std::panic::resume_unwind(e.into_panic());
+        } // Cancelled is our own abort
+    }
 }
 
 // VAD-enabled capture - OPTIMIZED for real-time speech detection
@@ -578,33 +567,7 @@ fn samples_to_wav_b64(sample_rate: u32, mono_f32: &[f32]) -> Result<String, Stri
 
 #[tauri::command]
 pub async fn stop_system_audio_capture(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<crate::AudioState>();
-
-    // Abort task in separate scope (Send trait fix)
-    {
-        let mut guard = state
-            .stream_task
-            .lock()
-            .map_err(|e| format!("Failed to acquire task lock: {}", e))?;
-
-        if let Some(task) = guard.take() {
-            task.abort();
-        }
-    }
-
-    // LONGER delay for proper cleanup (300ms instead of 150ms)
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-    // Mark as not capturing
-    state.is_capturing.store(false, Ordering::Release);
-
-    // Additional cleanup delay (CRITICAL for mic indicator)
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-    // Emit stopped event
-    if let Err(e) = app.emit("capture-stopped", ()) {
-        error!("Failed to emit capture-stopped: {}", e);
-    }
+    app.state::<crate::AudioState>().stop().await;
     Ok(())
 }
 
@@ -703,9 +666,7 @@ pub async fn calibrate_vad_thresholds(
     }
 
     let state = app.state::<crate::AudioState>();
-    if state.is_capturing.load(Ordering::Acquire) {
-        return Err("Stop the current capture before calibrating.".to_string());
-    }
+    let idle = state.lock_idle().await?;
 
     let input = SpeakerInput::new_with_device(device_id).map_err(|e| {
         error!("Calibration: failed to open audio source: {}", e);
@@ -747,6 +708,8 @@ pub async fn calibrate_vad_thresholds(
             None => break,
         }
     }
+    drop(stream);
+    drop(idle); // release device before admitting a start
 
     if floor_samples.is_empty() {
         return Err(
@@ -755,9 +718,13 @@ pub async fn calibrate_vad_thresholds(
         );
     }
 
+    if floor_samples.iter().any(|r| r.is_nan()) {
+        return Err("Audio source produced NaN samples".to_string());
+    }
+
     // Use the 90th-percentile RMS as the noise-floor "ceiling" so a single
     // transient (keystroke, mouse click) doesn't blow out the result.
-    floor_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    floor_samples.sort_by(f32::total_cmp);
     let idx = ((floor_samples.len() as f32) * 0.9) as usize;
     let noise_floor = floor_samples[idx.min(floor_samples.len() - 1)];
 
@@ -804,25 +771,6 @@ pub async fn update_vad_config(app: AppHandle, config: VadConfig) -> Result<(), 
 }
 
 #[tauri::command]
-pub async fn get_capture_status(app: AppHandle) -> Result<bool, String> {
-    let state = app.state::<crate::AudioState>();
-    Ok(state.is_capturing.load(Ordering::Acquire))
-}
-
-#[tauri::command]
-pub fn get_audio_sample_rate(_app: AppHandle) -> Result<u32, String> {
-    let input = SpeakerInput::new().map_err(|e| {
-        error!("Failed to create speaker input: {}", e);
-        format!("Failed to access system audio: {}", e)
-    })?;
-
-    let stream = input.stream();
-    let sr = stream.sample_rate();
-
-    Ok(sr)
-}
-
-#[tauri::command]
 pub fn get_input_devices() -> Result<Vec<AudioDevice>, String> {
     crate::speaker::list_input_devices().map_err(|e| {
         error!("Failed to get input devices: {}", e);
@@ -836,4 +784,136 @@ pub fn get_output_devices() -> Result<Vec<AudioDevice>, String> {
         error!("Failed to get output devices: {}", e);
         format!("Failed to get output devices: {}", e)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::AudioState;
+    use futures_util::{Stream, StreamExt};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    #[derive(Default)]
+    struct Counters {
+        now: AtomicUsize,
+        max: AtomicUsize,
+    }
+
+    struct FakeStream {
+        live: Arc<Counters>,
+        remaining: Option<usize>,
+    }
+
+    impl FakeStream {
+        fn new(live: Arc<Counters>, remaining: Option<usize>) -> Self {
+            let now = live.now.fetch_add(1, Ordering::SeqCst) + 1;
+            live.max.fetch_max(now, Ordering::SeqCst);
+            Self { live, remaining }
+        }
+    }
+
+    impl Drop for FakeStream {
+        fn drop(&mut self) {
+            self.live.now.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Stream for FakeStream {
+        type Item = f32;
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<f32>> {
+            match &mut self.remaining {
+                None => Poll::Pending,
+                Some(0) => Poll::Ready(None),
+                Some(n) => {
+                    *n -= 1;
+                    Poll::Ready(Some(0.0))
+                }
+            }
+        }
+    }
+
+    async fn start(
+        state: &AudioState,
+        live: &Arc<Counters>,
+        remaining: Option<usize>,
+    ) -> Result<(), String> {
+        let live = live.clone();
+        state
+            .start(|| {
+                let mut s = FakeStream::new(live, remaining);
+                Ok(async move { while s.next().await.is_some() {} })
+            })
+            .await
+    }
+
+    #[derive(Debug)]
+    enum Op {
+        Start,
+        StartFinite(usize),
+        WaitFinished,
+        Stop,
+    }
+
+    #[tokio::test]
+    async fn lifecycle() {
+        use Op::*;
+        // (ops, per-op success, live streams at end, max concurrent streams)
+        let cases: &[(&[Op], &[bool], usize, usize)] = &[
+            (&[Start, Stop, Start], &[true, true, true], 1, 1),
+            (&[Start, Start], &[true, false], 1, 1),
+            (&[Stop, Stop], &[true, true], 0, 0),
+            (&[StartFinite(10), WaitFinished, Start], &[true, true, true], 1, 1),
+            (&[Start, Stop], &[true, true], 0, 1),
+        ];
+        for (ops, expected, now, max) in cases {
+            let state = AudioState::default();
+            let live = Arc::new(Counters::default());
+            let mut got = Vec::new();
+            for op in *ops {
+                got.push(match op {
+                    Start => start(&state, &live, None).await.is_ok(),
+                    StartFinite(n) => start(&state, &live, Some(*n)).await.is_ok(),
+                    WaitFinished => {
+                        while live.now.load(Ordering::SeqCst) != 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        true
+                    }
+                    Stop => {
+                        state.stop().await;
+                        true
+                    }
+                });
+            }
+            assert_eq!(&got[..], *expected, "{ops:?}");
+            assert_eq!(live.now.load(Ordering::SeqCst), *now, "{ops:?} live streams");
+            assert_eq!(live.max.load(Ordering::SeqCst), *max, "{ops:?} max streams");
+            state.stop().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_stop_start_never_orphans() {
+        let state = Arc::new(AudioState::default());
+        let live = Arc::new(Counters::default());
+        for _ in 0..20 {
+            let (s1, s2, s3) = (state.clone(), state.clone(), state.clone());
+            let l = live.clone();
+            let stop1 = tokio::spawn(async move { s1.stop().await });
+            let stop2 = tokio::spawn(async move { s2.stop().await });
+            let start = tokio::spawn(async move {
+                if let Err(e) = start(&s3, &l, None).await {
+                    assert_eq!(e, "Capture already running"); // lost the race to a live capture, which is allowed
+                }
+            });
+            stop1.await.unwrap();
+            stop2.await.unwrap();
+            start.await.unwrap();
+        }
+        state.stop().await;
+        assert_eq!(live.now.load(Ordering::SeqCst), 0, "orphaned capture still live");
+        assert!(live.max.load(Ordering::SeqCst) <= 1, "two captures ran at once");
+    }
 }

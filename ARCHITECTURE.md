@@ -129,3 +129,15 @@ platform-specific "list items by service" call.
 `ProviderApi { status, body }`, `CurlParse`, `Json`, `Cancelled`) with
 a manual `serde::Serialize` impl emitting `self.to_string()`. The
 previous fire-and-forget `report_api_error` spawns are awaited inline.
+
+## `src-tauri/src/speaker/` — capture lifecycle
+
+- `AudioState.capture: tokio::sync::Mutex<Option<JoinHandle<()>>>` is the
+  single lifecycle state. Live capture = unfinished handle; a task that ends
+  on its own reads as idle. No separate flag.
+- `start` while live is `Err("Capture already running")`; `stop` is idempotent
+  and aborts *and awaits* the task, so the stream is dropped and the device
+  released before it returns. No sleep-based sequencing.
+- The capture task is the one sanctioned `tokio::spawn`: it outlives the
+  command, but its handle is owned by `AudioState` and always joined.
+- Calibration holds the slot while sampling, so a concurrent start waits.
