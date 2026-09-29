@@ -68,15 +68,33 @@ impl VadConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VadEvent {
-    SpeechStart { start_ms: u64 },
+    SpeechStart {
+        start_ms: u64,
+    },
     /// `start_ms`/`end_ms` are the detected speech on/offset; `samples` also carry pre-roll and a short tail.
-    Segment { samples: Vec<f32>, start_ms: u64, end_ms: u64 },
-    Discarded { start_ms: u64, end_ms: u64 },
-    Metrics { rms: f32, peak: f32, in_speech: bool },
+    Segment {
+        samples: Vec<f32>,
+        start_ms: u64,
+        end_ms: u64,
+    },
+    Discarded {
+        start_ms: u64,
+        end_ms: u64,
+    },
+    Metrics {
+        rms: f32,
+        peak: f32,
+        in_speech: bool,
+    },
 }
 
 const TAIL_MS: u32 = 150;
 const METRICS_MS: u32 = 100;
+const MIN_RUN_MS: u32 = 60; // shorter loud bursts (clicks) never count as speech
+const FLOOR_WINDOW_MS: u32 = 10_000; // long enough that inter-word dips inside continuous speech keep the floor low
+/// (config-threshold scale, noise-floor multiple); HOLD keeps an open segment through quiet word tails.
+const ONSET: (f32, f32) = (1.0, 2.0);
+const HOLD: (f32, f32) = (0.5, 1.5);
 
 struct Active {
     buf: Vec<f32>,
@@ -97,12 +115,17 @@ pub struct Segmenter {
     min_speech_hops: u32,
     max_segment_hops: u32,
     metrics_hops: u32,
+    min_run_hops: u32,
+    floor_hops: usize,
     pre_len: usize,
     tail_len: u64,
     pending: Vec<f32>,
     samples_seen: u64,
     hops_seen: u64,
     pre_roll: VecDeque<f32>,
+    // ponytail: min-statistics floor over all hops; switch to percentile/decaying floor if users show early cuts
+    floor: VecDeque<f32>,
+    run: u32, // consecutive loud hops
     active: Option<Active>,
 }
 
@@ -127,12 +150,16 @@ impl Segmenter {
             min_speech_hops: hops(config.min_speech_ms),
             max_segment_hops: hops(config.max_segment_ms),
             metrics_hops: hops(METRICS_MS),
-            pre_len: hops(config.pre_speech_ms) as usize * hop_len,
+            min_run_hops: hops(MIN_RUN_MS),
+            floor_hops: hops(FLOOR_WINDOW_MS) as usize,
+            pre_len: (hops(config.pre_speech_ms) + hops(MIN_RUN_MS)) as usize * hop_len,
             tail_len: sample_rate as u64 * TAIL_MS as u64 / 1000,
             pending: Vec::new(),
             samples_seen: 0,
             hops_seen: 0,
             pre_roll: VecDeque::new(),
+            floor: VecDeque::new(),
+            run: 0,
             active: None,
         })
     }
@@ -160,39 +187,58 @@ impl Segmenter {
 
         let mono = apply_noise_gate(raw, self.noise_gate_threshold);
         let (rms, peak) = calculate_audio_metrics(&mono);
-        let is_speech = rms > self.sensitivity_rms || peak > self.peak_threshold;
 
-        if self.hops_seen % self.metrics_hops as u64 == 0 {
-            events.push(VadEvent::Metrics { rms, peak, in_speech: self.active.is_some() });
+        if self.floor.len() == self.floor_hops {
+            self.floor.pop_front();
+        }
+        self.floor.push_back(rms);
+        let floor = self.floor.iter().copied().fold(f32::INFINITY, f32::min);
+        let (abs, rel) = if self.active.is_some() { HOLD } else { ONSET };
+        let loud = rms > (abs * self.sensitivity_rms).max(rel * floor)
+            || peak > (abs * self.peak_threshold).max(2.0 * rel * floor); // peak of a sine is ~1.4x its rms
+        self.run = if loud { self.run + 1 } else { 0 };
+        let is_speech = self.run >= self.min_run_hops;
+        let run_start = hop_end - self.run as u64 * self.hop_len as u64;
+
+        if self.hops_seen.is_multiple_of(self.metrics_hops as u64) {
+            events.push(VadEvent::Metrics {
+                rms,
+                peak,
+                in_speech: self.active.is_some(),
+            });
         }
         self.hops_seen += 1;
 
         let Some(a) = &mut self.active else {
+            self.pre_roll.extend(mono);
+            let excess = self.pre_roll.len().saturating_sub(self.pre_len);
+            self.pre_roll.drain(..excess);
             if is_speech {
-                let pre: Vec<f32> = self.pre_roll.drain(..).collect();
-                let mut buf = pre;
-                let buf_origin = hop_start - buf.len() as u64;
-                buf.extend_from_slice(&mono);
+                let buf: Vec<f32> = self.pre_roll.drain(..).collect();
+                let buf_origin = hop_end - buf.len() as u64;
+                let start_sample = run_start.max(buf_origin);
                 self.active = Some(Active {
                     buf,
                     buf_origin,
-                    start_sample: hop_start,
+                    start_sample,
                     last_speech_end: hop_end,
-                    speech_hops: 1,
+                    speech_hops: self.run,
                     silence_hops: 0,
                 });
-                events.push(VadEvent::SpeechStart { start_ms: self.ms(hop_start) });
-            } else {
-                self.pre_roll.extend(mono);
-                let excess = self.pre_roll.len().saturating_sub(self.pre_len);
-                self.pre_roll.drain(..excess);
+                events.push(VadEvent::SpeechStart {
+                    start_ms: self.ms(start_sample),
+                });
             }
             return;
         };
 
         a.buf.extend_from_slice(&mono);
         if is_speech {
-            a.speech_hops += 1;
+            a.speech_hops += if self.run == self.min_run_hops {
+                self.run
+            } else {
+                1
+            };
             a.silence_hops = 0;
             a.last_speech_end = hop_end;
         } else {
@@ -215,7 +261,9 @@ impl Segmenter {
                     speech_hops: 0,
                     silence_hops: 0,
                 });
-                events.push(VadEvent::SpeechStart { start_ms: self.ms(hop_end) });
+                events.push(VadEvent::SpeechStart {
+                    start_ms: self.ms(hop_end),
+                });
             }
             return;
         }
@@ -226,7 +274,11 @@ impl Segmenter {
             if a.speech_hops >= self.min_speech_hops {
                 let keep = (a.last_speech_end + self.tail_len - a.buf_origin) as usize;
                 a.buf.truncate(keep);
-                events.push(VadEvent::Segment { samples: a.buf, start_ms, end_ms });
+                events.push(VadEvent::Segment {
+                    samples: a.buf,
+                    start_ms,
+                    end_ms,
+                });
             } else {
                 events.push(VadEvent::Discarded { start_ms, end_ms });
             }

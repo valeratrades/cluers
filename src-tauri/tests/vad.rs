@@ -21,7 +21,9 @@ fn load(name: &str, rate: u32) -> Vec<f32> {
     let mut r = hound::WavReader::open(dir().join(format!("{name}_{rate}.wav"))).unwrap();
     assert_eq!(r.spec().sample_rate, rate);
     assert_eq!(r.spec().channels, 1);
-    r.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect()
+    r.samples::<i16>()
+        .map(|s| s.unwrap() as f32 / 32768.0)
+        .collect()
 }
 
 fn truth(name: &str) -> Vec<(u64, u64)> {
@@ -69,7 +71,9 @@ fn apply(variant: Variant, samples: &mut [f32], rate: u32, truth: &[(u64, u64)])
                 }
                 for (k, ms) in (from..to).step_by(700).enumerate() {
                     let sign = if k % 2 == 0 { 0.6 } else { -0.6 };
-                    samples[at(ms)..at(ms + 1)].iter_mut().for_each(|s| *s += sign);
+                    samples[at(ms)..at(ms + 1)]
+                        .iter_mut()
+                        .for_each(|s| *s += sign);
                 }
             }
         }
@@ -83,7 +87,11 @@ fn run(samples: &[f32], rate: u32, config: &VadConfig) -> (Vec<(u64, u64)>, usiz
     for chunk in samples.chunks(4096) {
         for ev in vad.push(chunk) {
             match ev {
-                VadEvent::Segment { start_ms, end_ms, samples } => {
+                VadEvent::Segment {
+                    start_ms,
+                    end_ms,
+                    samples,
+                } => {
                     assert!(!samples.is_empty());
                     segs.push((start_ms, end_ms));
                 }
@@ -141,11 +149,16 @@ fn segments_match_ground_truth() {
 
 #[test]
 fn config_rejected() {
-    let cases: &[(&str, fn(&mut VadConfig, &mut u32), bool)] = &[
+    type Mutate = fn(&mut VadConfig, &mut u32);
+    let cases: &[(&str, Mutate, bool)] = &[
         ("default", |_, _| {}, true),
         ("hop 0", |c, _| c.hop_ms = 0, false),
         ("silence < hop", |c, _| c.silence_ms = c.hop_ms - 1, false),
-        ("cap <= silence", |c, _| c.max_segment_ms = c.silence_ms, false),
+        (
+            "cap <= silence",
+            |c, _| c.max_segment_ms = c.silence_ms,
+            false,
+        ),
         ("NaN threshold", |c, _| c.sensitivity_rms = f32::NAN, false),
         ("sr 4000", |_, sr| *sr = 4000, false),
     ];
@@ -158,7 +171,10 @@ fn config_rejected() {
 
 #[test]
 fn max_segment_cap() {
-    let config = VadConfig { max_segment_ms: 1500, ..VadConfig::default() };
+    let config = VadConfig {
+        max_segment_ms: 1500,
+        ..VadConfig::default()
+    };
     let (segs, _) = run(&load("long", 48000), 48000, &config);
     assert!(segs.len() > 1, "{segs:?}");
     for (s, e) in &segs {

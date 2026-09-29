@@ -1,5 +1,7 @@
 // Pluely AI Speech Detection, and capture system audio (speaker output) as a stream of f32 samples.
-use crate::speaker::vad::{apply_noise_gate, calculate_audio_metrics, Segmenter, VadConfig, VadEvent};
+use crate::speaker::vad::{
+    apply_noise_gate, calculate_audio_metrics, Segmenter, VadConfig, VadEvent,
+};
 use crate::speaker::{AudioDevice, SpeakerInput};
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -11,9 +13,9 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::task::JoinHandle;
 use tauri::{AppHandle, Emitter, Listener, Manager};
 use tauri_plugin_shell::ShellExt;
+use tokio::task::JoinHandle;
 use tracing::{error, warn};
 
 /// Live per-chunk metrics emitted to the UI so users can see why VAD does or
@@ -169,7 +171,11 @@ async fn run_vad_capture(
                     "speech-discarded",
                     "Audio too short (likely background noise)",
                 ),
-                VadEvent::Metrics { rms, peak, in_speech } => app.emit(
+                VadEvent::Metrics {
+                    rms,
+                    peak,
+                    in_speech,
+                } => app.emit(
                     "vad-metrics",
                     VadMetrics {
                         rms,
@@ -685,7 +691,12 @@ mod tests {
             (&[Start, Stop, Start], &[true, true, true], 1, 1),
             (&[Start, Start], &[true, false], 1, 1),
             (&[Stop, Stop], &[true, true], 0, 0),
-            (&[StartFinite(10), WaitFinished, Start], &[true, true, true], 1, 1),
+            (
+                &[StartFinite(10), WaitFinished, Start],
+                &[true, true, true],
+                1,
+                1,
+            ),
             (&[Start, Stop], &[true, true], 0, 1),
         ];
         for (ops, expected, now, max) in cases {
@@ -709,7 +720,11 @@ mod tests {
                 });
             }
             assert_eq!(&got[..], *expected, "{ops:?}");
-            assert_eq!(live.now.load(Ordering::SeqCst), *now, "{ops:?} live streams");
+            assert_eq!(
+                live.now.load(Ordering::SeqCst),
+                *now,
+                "{ops:?} live streams"
+            );
             assert_eq!(live.max.load(Ordering::SeqCst), *max, "{ops:?} max streams");
             state.stop().await;
         }
@@ -734,7 +749,14 @@ mod tests {
             start.await.unwrap();
         }
         state.stop().await;
-        assert_eq!(live.now.load(Ordering::SeqCst), 0, "orphaned capture still live");
-        assert!(live.max.load(Ordering::SeqCst) <= 1, "two captures ran at once");
+        assert_eq!(
+            live.now.load(Ordering::SeqCst),
+            0,
+            "orphaned capture still live"
+        );
+        assert!(
+            live.max.load(Ordering::SeqCst) <= 1,
+            "two captures ran at once"
+        );
     }
 }
