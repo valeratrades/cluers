@@ -6,7 +6,7 @@ Scope: Linux only. macOS/Windows-specific bugs intentionally not tracked.
 |---|---|---|
 | 1 | 01 02 03 04 05 06 07 | v0.1.10 |
 | 2 | 08 09 10 11 18 | v0.1.11 |
-| 3 | 12 | v0.1.12 |
+| 3 | 12 19 | v0.1.12 |
 | 4 | 13 | v0.1.13 |
 | 5 | 14+15 (one agent) 16 17 | v0.1.14 |
 
