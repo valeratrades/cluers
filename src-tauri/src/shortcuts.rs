@@ -18,7 +18,7 @@ pub struct WindowVisibility {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Direction {
+pub(crate) enum Direction {
     Up,
     Down,
     Left,
@@ -46,7 +46,7 @@ impl fmt::Display for Direction {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Action {
+pub(crate) enum Action {
     ToggleDashboard,
     ToggleWindow,
     FocusInput,
@@ -162,6 +162,30 @@ fn on_event<R: Runtime>(app: &AppHandle<R>, action: Action, state: ShortcutState
     };
     if let Err(e) = result {
         tracing::error!("shortcut {action:?} failed: {e:#}"); // runs on the hotkey thread: nothing to return to, a panic kills all shortcuts
+    }
+}
+
+/// `pluely --action <id>` fires the action in the running instance; compositor binds use this on Wayland.
+#[cfg(target_os = "linux")]
+pub(crate) fn cli_action(argv: &[String]) -> Result<Option<Action>, String> {
+    match argv {
+        [_] => Ok(None),
+        [_, flag, id] if flag == "--action" => id.parse().map(Some),
+        _ => Err(format!(
+            "usage: pluely [--action <action_id>], got {:?}",
+            &argv[1..]
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn run_cli_action<R: Runtime>(app: &AppHandle<R>, argv: &[String]) {
+    let result = cli_action(argv).and_then(|a| match a {
+        Some(a) => run(app, a).map_err(|e| format!("{a:?}: {e:#}")),
+        None => Ok(()), // bare relaunch: the instance is already up
+    });
+    if let Err(e) = result {
+        tracing::error!("cli shortcut failed: {e}"); // the sending process has already exited: nothing to return to
     }
 }
 

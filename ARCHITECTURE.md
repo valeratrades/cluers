@@ -184,6 +184,19 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
   stable callback registry.
 - The move-window loop is a sanctioned `spawn`: its handle lives in
   `MoveWindowState` and is aborted on key release or re-registration.
-- Linux backend is X11 key grabs only (global-hotkey 0.7). Under Wayland,
-  presses arrive only while an XWayland window has focus; a warning is logged
-  at startup.
+- Linux: X11 key grabs (global-hotkey 0.7) plus a CLI trigger.
+  `pluely --action <action_id>` is forwarded to the running instance by
+  tauri-plugin-single-instance (D-Bus) and runs the same `run()`. This is the
+  Wayland path: the GlobalShortcuts portal is missing on wlroots (sway) and
+  Hyprland ignores its proposed triggers. Invalid argv exits 2 before startup;
+  `move_window` needs key release, so it stays X11-only. Sway config (defaults
+  from `src/config/shortcuts.ts`):
+
+  ```
+  bindsym ctrl+shift+d exec pluely --action toggle_dashboard
+  bindsym ctrl+backslash exec pluely --action toggle_window
+  bindsym ctrl+shift+i exec pluely --action focus_input
+  bindsym ctrl+shift+m exec pluely --action system_audio
+  bindsym ctrl+shift+a exec pluely --action audio_recording
+  bindsym ctrl+shift+s exec pluely --action screenshot
+  ```

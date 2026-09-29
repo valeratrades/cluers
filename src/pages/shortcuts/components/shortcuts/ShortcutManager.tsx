@@ -8,6 +8,7 @@ import {
   checkShortcutConflicts,
   formatShortcutKeyForDisplay,
   getPlatformDefaultKey,
+  isLinux,
 } from "@/lib";
 import { ShortcutBinding } from "@/types";
 import { DEFAULT_SHORTCUT_ACTIONS } from "@/config";
@@ -251,9 +252,20 @@ export const ShortcutManager = () => {
         })}
       </div>
 
-      {/* Footer Note */}
       <p className="text-xs text-muted-foreground text-center pt-2">
-        💡 Shortcuts work globally, even when the app is hidden
+        {isLinux() ? (
+          <>
+            On Wayland, bind <code>pluely --action &lt;action&gt;</code> in your
+            compositor (sway:{" "}
+            <code>bindsym ctrl+backslash exec pluely --action toggle_window</code>
+            ). Actions:{" "}
+            {DEFAULT_SHORTCUT_ACTIONS.filter((a) => a.id !== "move_window")
+              .map((a) => a.id)
+              .join(", ")}
+          </>
+        ) : (
+          "Shortcuts work globally, even when the app is hidden"
+        )}
       </p>
     </div>
   );
