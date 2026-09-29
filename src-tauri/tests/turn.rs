@@ -578,7 +578,11 @@ fn attribution_boundaries() {
             Input::Flush,
         ])
     };
-    assert_eq!(echo_tail(t - 400), merged, "run ending before the echo tail");
+    assert_eq!(
+        echo_tail(t - 400),
+        merged,
+        "run ending before the echo tail"
+    );
     assert_eq!(echo_tail(t + 100), split, "run after the echo tail");
 
     let backchannel = |len: u64| {
@@ -593,6 +597,14 @@ fn attribution_boundaries() {
             Input::Flush,
         ])
     };
-    assert_eq!(backchannel(BACKCHANNEL_MS - 100), asked_a, "short interviewer segment");
-    assert_eq!(backchannel(BACKCHANNEL_MS + 100), split, "long interviewer segment");
+    assert_eq!(
+        backchannel(BACKCHANNEL_MS - 100),
+        asked_a,
+        "short interviewer segment"
+    );
+    assert_eq!(
+        backchannel(BACKCHANNEL_MS + 100),
+        split,
+        "long interviewer segment"
+    );
 }

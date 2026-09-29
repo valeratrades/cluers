@@ -1,10 +1,10 @@
 //! Pure turn machine: segments, transcripts and replies in; LLM asks and UI events out. No IO, no clocks.
 //! Spec: `tests/turn.rs`.
+use super::vad::VadConfig;
 use crate::db::schema::Role;
 use crate::llm::provider::HistoryMessage;
-use super::vad::VadConfig;
 use serde::Serialize;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub(crate) const SKIP_WORDS: [&str; 2] = ["SKIP", "COPY"];
 pub(crate) const SKIP_INSTRUCTION: &str = "You are receiving live transcribed speech from system audio, which may \
@@ -13,7 +13,9 @@ missing the actual question, or otherwise insufficient to give a meaningful answ
 single word SKIP (uppercase, no punctuation, no other text); the fragment will be prepended to the next chunk. \
 If the input is complete and understood but calls for no reply (e.g. a statement not addressed to you, or one \
 that needs no answer), reply with exactly the single word COPY. Otherwise respond normally.";
-const TURN_GAP_MS: u64 = 2000; // > natural mid-question pauses (~1.5s); effectively max(this, silence_ms). Stays the no-mic fallback once user speech closes turns (issue 13)
+const TURN_GAP_MS: u64 = 2000; // > natural mid-question pauses (~1.5s); effectively max(this, silence_ms). Closes the turn when the user stays silent
+const BLEED_TAIL_MS: u64 = 400; // playback latency (Bluetooth ~300ms) can put echo after short interviewer speech
+const BACKCHANNEL_MS: u64 = 1000; // "mm-hm", "right"
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Speaker {
@@ -78,6 +80,13 @@ enum Pending {
     Prompt(String),
 }
 
+/// Latest mic run; runs are sequential and the newest one decides.
+struct UserRun {
+    start_ms: u64,
+    end_ms: Option<u64>,
+    took_turn: Option<bool>,
+}
+
 pub struct Turns {
     history: Vec<HistoryMessage>,
     carry: String,
@@ -86,11 +95,15 @@ pub struct Turns {
     open: Segments,
     closed: VecDeque<Pending>,
     asking: Option<String>,
+    user: Option<UserRun>,
+    backchannels: BTreeSet<u64>, // dropped interviewer segment ids
+    now_ms: u64,
+    mic_hold_ms: u64,
 }
 
 impl Turns {
     pub fn new(history: Vec<HistoryMessage>, carry: String, vad: &VadConfig) -> Self {
-        let _ = vad;
+        let hop = vad.hop_ms as u64;
         Self {
             history,
             carry,
@@ -99,6 +112,10 @@ impl Turns {
             open: Segments::new(),
             closed: VecDeque::new(),
             asking: None,
+            user: None,
+            backchannels: BTreeSet::new(),
+            now_ms: 0,
+            mic_hold_ms: (vad.silence_ms as u64).div_ceil(hop) * hop + hop, // a mic run with no speech after t has ended by t + this
         }
     }
 
@@ -107,15 +124,27 @@ impl Turns {
         match input {
             Input::SpeechStart {
                 speaker: Speaker::User,
-                ..
+                at_ms,
+            } => {
+                self.user = Some(UserRun {
+                    start_ms: at_ms,
+                    end_ms: None,
+                    took_turn: None,
+                })
             }
-            | Input::Segment {
+            Input::Segment {
                 speaker: Speaker::User,
+                end_ms,
                 ..
+            } => {
+                self.user
+                    .as_mut()
+                    .expect("mic segment without speech start")
+                    .end_ms = Some(end_ms)
             }
-            | Input::Discarded {
+            Input::Discarded {
                 speaker: Speaker::User,
-            } => {}
+            } => self.user = None, // shorter than min_speech_ms: noise
             Input::SpeechStart {
                 speaker: Speaker::Interviewer,
                 at_ms,
@@ -128,14 +157,22 @@ impl Turns {
                 start_ms,
                 end_ms,
             } => {
-                let fresh = self.open.insert(start_ms, None).is_none();
-                assert!(fresh, "segment {start_ms} pushed twice");
                 self.speaking = false;
                 self.last_end_ms = end_ms;
+                let fresh = match end_ms - start_ms < BACKCHANNEL_MS
+                    && self.user_holds_floor_at(start_ms)
+                {
+                    true => self.backchannels.insert(start_ms),
+                    false => self.open.insert(start_ms, None).is_none(),
+                };
+                assert!(fresh, "segment {start_ms} pushed twice");
             }
             Input::Discarded {
                 speaker: Speaker::Interviewer,
             } => self.speaking = false,
+            Input::Transcript { start_ms, .. } if self.backchannels.contains(&start_ms) => {
+                self.backchannels.remove(&start_ms);
+            }
             Input::Transcript { start_ms, text } => {
                 let heard = matches!(&text, Ok(t) if !t.trim().is_empty());
                 let slot = std::iter::once(&mut self.open)
@@ -153,7 +190,10 @@ impl Turns {
                     }));
                 }
             }
-            Input::Tick { now_ms } => self.close_if_due(now_ms),
+            Input::Tick { now_ms } => {
+                self.now_ms = now_ms;
+                self.close_if_due(now_ms)
+            }
             Input::Flush => self.close(),
             Input::Prompt(text) => self.closed.push_back(Pending::Prompt(text)),
             Input::Reply(reply) => {
@@ -191,8 +231,36 @@ impl Turns {
                 }));
             }
         }
+        self.resolve_user();
         self.pump(&mut out);
         out
+    }
+
+    // ponytail: echo judged by timing against the interviewer's VAD; the user barging in mid-question falls back to TURN_GAP_MS. Needs real AEC to detect.
+    fn resolve_user(&mut self) {
+        if self.speaking {
+            return;
+        }
+        let Some(run) = self.user.as_mut().filter(|r| r.took_turn.is_none()) else {
+            return;
+        };
+        let t = self.last_end_ms + BLEED_TAIL_MS;
+        let took = match run.end_ms {
+            _ if run.start_ms > t => true,
+            Some(end) => end > t,
+            None if self.now_ms >= t + self.mic_hold_ms => true,
+            None => return,
+        };
+        run.took_turn = Some(took);
+        if took {
+            self.close();
+        }
+    }
+
+    fn user_holds_floor_at(&self, t: u64) -> bool {
+        self.user.as_ref().is_some_and(|r| {
+            r.took_turn == Some(true) && r.start_ms <= t && r.end_ms.is_none_or(|e| e >= t)
+        })
     }
 
     fn close_if_due(&mut self, t: u64) {
