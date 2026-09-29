@@ -1,7 +1,9 @@
 //! Spec for the VAD segmenter. Fixtures: `tests/fixtures/vad/gen.sh`.
 use pluely_lib::vad::{Segmenter, VadConfig, VadEvent};
 use std::f32::consts::TAU;
-use std::path::PathBuf;
+
+mod common;
+use common::{load, truth};
 
 const RATES: [u32; 3] = [16000, 44100, 48000];
 const TOLERANCE_MS: i64 = 50;
@@ -11,30 +13,6 @@ enum Variant {
     Clean,
     Hum,
     Clicks,
-}
-
-fn dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vad")
-}
-
-fn load(name: &str, rate: u32) -> Vec<f32> {
-    let mut r = hound::WavReader::open(dir().join(format!("{name}_{rate}.wav"))).unwrap();
-    assert_eq!(r.spec().sample_rate, rate);
-    assert_eq!(r.spec().channels, 1);
-    r.samples::<i16>()
-        .map(|s| s.unwrap() as f32 / 32768.0)
-        .collect()
-}
-
-fn truth(name: &str) -> Vec<(u64, u64)> {
-    std::fs::read_to_string(dir().join(format!("{name}.truth")))
-        .unwrap()
-        .lines()
-        .map(|l| {
-            let (a, b) = l.split_once(' ').unwrap();
-            (a.parse().unwrap(), b.parse().unwrap())
-        })
-        .collect()
 }
 
 /// Utterances closer than `silence_ms` belong to one segment.

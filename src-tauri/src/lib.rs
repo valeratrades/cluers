@@ -13,6 +13,7 @@ use tauri_plugin_posthog::{init as posthog_init, PostHogConfig, PostHogOptions};
 use tokio::task::JoinHandle;
 mod speaker;
 use capture::CaptureState;
+pub use speaker::turn;
 pub use speaker::vad;
 use speaker::vad::VadConfig;
 
