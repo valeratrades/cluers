@@ -17,9 +17,10 @@ fn trace(outs: Vec<Output>, into: &mut Vec<String>, mut on_ask: impl FnMut()) {
             }
             Output::Event(e) => match e {
                 TurnEvent::Answered { .. } => into.push("answered".into()),
-                TurnEvent::Skipped { carried, .. } => {
-                    into.push(format!("skipped {}", if carried { "carried" } else { "copy" }))
-                }
+                TurnEvent::Skipped { carried, .. } => into.push(format!(
+                    "skipped {}",
+                    if carried { "carried" } else { "copy" }
+                )),
                 TurnEvent::NoSpeech => into.push("nospeech".into()),
                 TurnEvent::Failed { error } => into.push(format!("failed {error}")),
                 TurnEvent::Heard { .. } | TurnEvent::Asked { .. } | TurnEvent::Delta { .. } => {}
@@ -36,45 +37,66 @@ struct Case {
     want: &'static [&'static str],
 }
 
+/// Delivers fake STT/LLM completions on the audio clock.
+struct Sim<'a> {
+    turns: Turns,
+    replies: VecDeque<&'a str>,
+    reply_delay_ms: u64,
+    due: Vec<(u64, Input)>,
+    out: Vec<String>,
+}
+
+impl Sim<'_> {
+    fn feed(&mut self, input: Input, now: u64) {
+        let mut asked = 0;
+        trace(self.turns.push(input), &mut self.out, || asked += 1);
+        for _ in 0..asked {
+            let r = self
+                .replies
+                .pop_front()
+                .expect("more asks than scripted replies");
+            self.due
+                .push((now + self.reply_delay_ms, Input::Reply(Ok(r.to_string()))));
+        }
+    }
+
+    fn deliver(&mut self, until: u64) {
+        loop {
+            self.due.sort_by_key(|d| d.0); // stable: same-time completions keep issue order
+            if self.due.first().is_none_or(|d| d.0 > until) {
+                return;
+            }
+            let (at, input) = self.due.remove(0);
+            self.feed(input, at);
+        }
+    }
+}
+
 /// Fake STT names the truth utterances a segment overlaps; fake LLM replies from `case.replies`.
 fn run(case: &Case, rate: u32) -> Vec<String> {
     let truth = truth("pauses");
     let samples = load("pauses", rate);
     let mut vad = Segmenter::new(&VadConfig::default(), rate).unwrap();
-    let mut turns = Turns::new(Vec::new(), String::new());
-    let mut replies: VecDeque<&str> = case.replies.iter().copied().collect();
-    let mut due: Vec<(u64, Input)> = Vec::new(); // stable-sorted by time on delivery
-    let mut out = Vec::new();
+    let mut sim = Sim {
+        turns: Turns::new(Vec::new(), String::new()),
+        replies: case.replies.iter().copied().collect(),
+        reply_delay_ms: case.reply_delay_ms,
+        due: Vec::new(),
+        out: Vec::new(),
+    };
     let (mut seen, mut seg_idx) = (0u64, 0usize);
-
-    let mut feed = |turns: &mut Turns, input: Input, now: u64, due: &mut Vec<(u64, Input)>| {
-        let mut asked = 0;
-        trace(turns.push(input), &mut out, || asked += 1);
-        for _ in 0..asked {
-            let r = replies.pop_front().expect("more asks than scripted replies");
-            due.push((now + case.reply_delay_ms, Input::Reply(Ok(r.to_string()))));
-        }
-    };
-    let deliver = |turns: &mut Turns, due: &mut Vec<(u64, Input)>, until: u64, feed: &mut dyn FnMut(&mut Turns, Input, u64, &mut Vec<(u64, Input)>)| {
-        loop {
-            due.sort_by_key(|d| d.0);
-            if due.first().is_none_or(|d| d.0 > until) {
-                break;
-            }
-            let (at, input) = due.remove(0);
-            feed(turns, input, at, due);
-        }
-    };
 
     for chunk in samples.chunks(4096) {
         seen += chunk.len() as u64;
         let now = seen * 1000 / rate as u64;
         let events = vad.push(chunk);
-        deliver(&mut turns, &mut due, now, &mut feed);
+        sim.deliver(now);
         for ev in events {
             let input = match ev {
                 VadEvent::SpeechStart { start_ms } => Input::SpeechStart { at_ms: start_ms },
-                VadEvent::Segment { start_ms, end_ms, .. } => {
+                VadEvent::Segment {
+                    start_ms, end_ms, ..
+                } => {
                     let names: Vec<String> = truth
                         .iter()
                         .enumerate()
@@ -83,45 +105,82 @@ fn run(case: &Case, rate: u32) -> Vec<String> {
                         .collect();
                     let delay = case.stt_delay_ms.get(seg_idx).copied().unwrap_or(0);
                     seg_idx += 1;
-                    due.push((now + delay, Input::Transcript { start_ms, text: Ok(names.join(" ")) }));
+                    sim.due.push((
+                        now + delay,
+                        Input::Transcript {
+                            start_ms,
+                            text: Ok(names.join(" ")),
+                        },
+                    ));
                     Input::Segment { start_ms, end_ms }
                 }
                 VadEvent::Discarded { .. } => Input::Discarded,
                 VadEvent::Metrics { .. } => continue,
             };
-            feed(&mut turns, input, now, &mut due);
+            sim.feed(input, now);
         }
-        feed(&mut turns, Input::Tick { now_ms: now }, now, &mut due);
+        sim.feed(Input::Tick { now_ms: now }, now);
     }
-    let end = seen * 1000 / rate as u64;
-    feed(&mut turns, Input::Flush, end, &mut due);
-    deliver(&mut turns, &mut due, u64::MAX, &mut feed);
-    drop(feed);
-    out
+    sim.feed(Input::Flush, seen * 1000 / rate as u64);
+    sim.deliver(u64::MAX);
+    sim.out
 }
 
 // Truth: u1 +0.5s u2 (one VAD segment), +1.5s u3, +3s u4.
-const SPLIT: &[&str] = &[r#"ask "u1 u2 u3" h=0"#, "answered", r#"ask "u4" h=2"#, "answered"];
+const SPLIT: &[&str] = &[
+    r#"ask "u1 u2 u3" h=0"#,
+    "answered",
+    r#"ask "u4" h=2"#,
+    "answered",
+];
 
 #[test]
 fn fixture_turns() {
     let cases = [
-        Case { name: "split question", stt_delay_ms: &[], reply_delay_ms: 0, replies: &["A", "B"], want: SPLIT },
+        Case {
+            name: "split question",
+            stt_delay_ms: &[],
+            reply_delay_ms: 0,
+            replies: &["A", "B"],
+            want: SPLIT,
+        },
         Case {
             name: "SKIP carries",
             stt_delay_ms: &[],
             reply_delay_ms: 0,
             replies: &["SKIP", "B"],
-            want: &[r#"ask "u1 u2 u3" h=0"#, "skipped carried", r#"ask "u1 u2 u3 u4" h=0"#, "answered"],
+            want: &[
+                r#"ask "u1 u2 u3" h=0"#,
+                "skipped carried",
+                r#"ask "u1 u2 u3 u4" h=0"#,
+                "answered",
+            ],
         },
-        Case { name: "out-of-order STT", stt_delay_ms: &[5000], reply_delay_ms: 0, replies: &["A", "B"], want: SPLIT },
-        Case { name: "answer in flight", stt_delay_ms: &[], reply_delay_ms: 10000, replies: &["A", "B"], want: SPLIT },
+        Case {
+            name: "out-of-order STT",
+            stt_delay_ms: &[5000],
+            reply_delay_ms: 0,
+            replies: &["A", "B"],
+            want: SPLIT,
+        },
+        Case {
+            name: "answer in flight",
+            stt_delay_ms: &[],
+            reply_delay_ms: 10000,
+            replies: &["A", "B"],
+            want: SPLIT,
+        },
         Case {
             name: "COPY",
             stt_delay_ms: &[],
             reply_delay_ms: 0,
             replies: &[" COPY\n", "B"],
-            want: &[r#"ask "u1 u2 u3" h=0"#, "skipped copy", r#"ask "u4" h=0"#, "answered"],
+            want: &[
+                r#"ask "u1 u2 u3" h=0"#,
+                "skipped copy",
+                r#"ask "u4" h=0"#,
+                "answered",
+            ],
         },
     ];
     let mut failures = Vec::new();
@@ -129,7 +188,10 @@ fn fixture_turns() {
         for rate in RATES {
             let got = run(case, rate);
             if got != case.want {
-                failures.push(format!("{} @{rate}:\n  got  {got:?}\n  want {:?}", case.name, case.want));
+                failures.push(format!(
+                    "{} @{rate}:\n  got  {got:?}\n  want {:?}",
+                    case.name, case.want
+                ));
             }
         }
     }
@@ -150,7 +212,10 @@ fn seg(start_ms: u64, end_ms: u64) -> Input {
 }
 
 fn heard(start_ms: u64, text: &str) -> Input {
-    Input::Transcript { start_ms, text: Ok(text.into()) }
+    Input::Transcript {
+        start_ms,
+        text: Ok(text.into()),
+    }
 }
 
 fn reply(text: &str) -> Input {
@@ -159,13 +224,25 @@ fn reply(text: &str) -> Input {
 
 #[test]
 fn scripted() {
-    check(vec![seg(0, 500), seg(900, 1500), heard(0, ""), heard(900, " "), Input::Flush], &["nospeech"]);
+    check(
+        vec![
+            seg(0, 500),
+            seg(900, 1500),
+            heard(0, ""),
+            heard(900, " "),
+            Input::Flush,
+        ],
+        &["nospeech"],
+    );
     check(
         vec![
             seg(0, 500),
             seg(900, 1500),
             heard(0, "how do"),
-            Input::Transcript { start_ms: 900, text: Err("timeout".into()) },
+            Input::Transcript {
+                start_ms: 900,
+                text: Err("timeout".into()),
+            },
             Input::Flush,
         ],
         &["failed timeout"],
@@ -178,30 +255,40 @@ fn scripted() {
             Input::Prompt("summarize".into()),
             reply("SKIP"),
         ],
-        &[r#"ask "q" h=0"#, "skipped carried", r#"ask "q\n\nsummarize" h=0"#],
+        &[
+            r#"ask "q" h=0"#,
+            "skipped carried",
+            r#"ask "q\n\nsummarize" h=0"#,
+        ],
     );
-    check(vec![seg(0, 500), heard(0, "q"), Input::Flush, reply("  ")], &[r#"ask "q" h=0"#, "failed model returned an empty answer"]);
+    check(
+        vec![seg(0, 500), heard(0, "q"), Input::Flush, reply("  ")],
+        &[r#"ask "q" h=0"#, "failed model returned an empty answer"],
+    );
 }
 
 /// Next speech at `gap_ms` after the previous segment's end, with ticks every `tick_ms`.
 fn gap(gap_ms: u64, tick_ms: u64) -> Vec<String> {
+    let next = 1000 + gap_ms;
+    let mut inputs = vec![
+        Input::SpeechStart { at_ms: 100 },
+        seg(100, 1000),
+        heard(100, "a"),
+    ];
+    inputs.extend((1..=next / tick_ms).map(|k| Input::Tick {
+        now_ms: k * tick_ms,
+    }));
+    inputs.extend([
+        Input::SpeechStart { at_ms: next },
+        seg(next, next + 500),
+        heard(next, "b"),
+        Input::Flush,
+    ]);
     let mut turns = Turns::new(Vec::new(), String::new());
     let mut got = Vec::new();
-    let mut push = |turns: &mut Turns, i: Input| trace(turns.push(i), &mut got, || {});
-    push(&mut turns, Input::SpeechStart { at_ms: 100 });
-    push(&mut turns, seg(100, 1000));
-    push(&mut turns, heard(100, "a"));
-    let next = 1000 + gap_ms;
-    let mut t = 0;
-    while t + tick_ms <= next {
-        t += tick_ms;
-        push(&mut turns, Input::Tick { now_ms: t });
+    for input in inputs {
+        trace(turns.push(input), &mut got, || {});
     }
-    push(&mut turns, Input::SpeechStart { at_ms: next });
-    push(&mut turns, seg(next, next + 500));
-    push(&mut turns, heard(next, "b"));
-    push(&mut turns, Input::Flush);
-    drop(push);
     loop {
         let open = got.iter().filter(|l| l.starts_with("ask")).count()
             - got.iter().filter(|l| *l == "answered").count();
@@ -217,8 +304,16 @@ fn turn_gap_boundary() {
     let gap_ms = 2000; // TURN_GAP_MS
     for tick_ms in [20, 256, 1000] {
         let merged = gap(gap_ms - 100, tick_ms);
-        assert_eq!(merged, [r#"ask "a b" h=0"#, "answered"], "gap-100 tick {tick_ms}");
+        assert_eq!(
+            merged,
+            [r#"ask "a b" h=0"#, "answered"],
+            "gap-100 tick {tick_ms}"
+        );
         let split = gap(gap_ms + 100, tick_ms);
-        assert_eq!(split, [r#"ask "a" h=0"#, "answered", r#"ask "b" h=2"#, "answered"], "gap+100 tick {tick_ms}");
+        assert_eq!(
+            split,
+            [r#"ask "a" h=0"#, "answered", r#"ask "b" h=2"#, "answered"],
+            "gap+100 tick {tick_ms}"
+        );
     }
 }

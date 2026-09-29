@@ -10,7 +10,6 @@ use tauri::Manager;
 #[cfg(target_os = "macos")]
 use tauri::{AppHandle, WebviewWindow};
 use tauri_plugin_posthog::{init as posthog_init, PostHogConfig, PostHogOptions};
-use tokio::task::JoinHandle;
 mod speaker;
 use capture::CaptureState;
 pub use speaker::turn;
@@ -23,7 +22,7 @@ use tauri_nspanel::{cocoa::appkit::NSWindowCollectionBehavior, panel_delegate, W
 
 #[derive(Default)]
 pub struct AudioState {
-    capture: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    capture: tokio::sync::Mutex<Option<speaker::Capture>>,
     vad_config: Arc<Mutex<VadConfig>>,
 }
 
@@ -125,6 +124,7 @@ pub fn run() {
             db::commands::delete_system_prompt,
             speaker::start_system_audio_capture,
             speaker::stop_system_audio_capture,
+            speaker::system_audio_control,
             speaker::manual_stop_continuous,
             speaker::check_system_audio_access,
             speaker::request_system_audio_access,

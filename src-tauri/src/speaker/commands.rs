@@ -1,22 +1,32 @@
 // Pluely AI Speech Detection, and capture system audio (speaker output) as a stream of f32 samples.
+use crate::db::schema::AttachedFile;
+use crate::llm::commands::{complete, Chat, ProviderInput};
+use crate::llm::provider::HistoryMessage;
+use crate::llm::{stt, LlmError, LlmState};
+use crate::speaker::turn::{Input, Output, TurnEvent, Turns, SKIP_INSTRUCTION, SKIP_WORDS};
 use crate::speaker::vad::{
     apply_noise_gate, calculate_audio_metrics, Segmenter, VadConfig, VadEvent,
 };
 use crate::speaker::{AudioDevice, SpeakerInput};
 use anyhow::Result;
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use futures_util::StreamExt;
+use futures_util::future::{BoxFuture, OptionFuture};
+use futures_util::stream::{self, FuturesUnordered};
+use futures_util::{FutureExt, Stream, StreamExt};
 use hound::{WavSpec, WavWriter};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Listener, Manager};
 use tauri_plugin_shell::ShellExt;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
+
+const STT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Live per-chunk metrics emitted to the UI so users can see why VAD does or
 /// does not trigger on their setup.
@@ -40,16 +50,48 @@ pub struct VadCalibration {
     pub noise_gate_threshold: f32,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfig {
+    stt: ProviderInput,
+    ai: ProviderInput,
+    system_prompt: String,
+    attached_files: Vec<AttachedFile>,
+}
+
+/// Renderer-held session memory, seeded into each capture.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Session {
+    config: SessionConfig,
+    history: Vec<HistoryMessage>,
+    carry: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Control {
+    Config { config: Box<SessionConfig> },
+    Prompt { text: String },
+}
+
+pub(crate) struct Capture {
+    task: JoinHandle<()>,
+    control: mpsc::UnboundedSender<Control>,
+}
+
 #[tauri::command]
 pub async fn start_system_audio_capture(
     app: AppHandle,
     vad_config: Option<VadConfig>,
     device_id: Option<String>,
+    session: Session,
+    events: Channel<TurnEvent>,
 ) -> Result<(), String> {
     let state = app.state::<crate::AudioState>();
     let app_clone = app.clone();
     state
-        .start(|| {
+        .start(|control| {
             if let Some(config) = vad_config {
                 config.validate()?;
                 let mut vad_cfg = state
@@ -87,31 +129,64 @@ pub async fn start_system_audio_capture(
                 .transpose()?;
 
             Ok(async move {
+                let app = app_clone;
                 let mut stream = stream;
-                if let Some(vad) = segmenter {
-                    run_vad_capture(app_clone.clone(), &mut stream, sr, vad, &vad_config).await;
-                } else {
-                    run_continuous_capture(app_clone.clone(), &mut stream, sr, vad_config).await;
-                }
-                if let Some(e) = stream.error() {
-                    error!("System audio capture ended: {e:#}");
-                    if let Err(emit_err) = app_clone.emit("capture-error", format!("{e:#}")) {
-                        error!("Failed to emit capture-error: {}", emit_err);
+                let recording = match segmenter {
+                    Some(mut vad) => {
+                        let mut seen = 0u64;
+                        let audio = (&mut stream).ready_chunks(4096).map(|c| {
+                            seen += c.len() as u64;
+                            (vad.push(&c), seen * 1000 / sr as u64)
+                        });
+                        drive(&app, sr, &vad_config, audio, session, control, events).await;
+                        report_stream_error(&app, stream.error());
+                        return;
                     }
+                    None => run_continuous_capture(&app, &mut stream, sr, &vad_config).await,
+                };
+                if report_stream_error(&app, stream.error()) {
+                    return;
+                }
+                drop(stream); // release the device while answering
+                if let Some(samples) = recording {
+                    let end_ms = samples.len() as u64 * 1000 / sr as u64;
+                    let segment = VadEvent::Segment { samples, start_ms: 0, end_ms };
+                    let audio = stream::iter([(vec![segment], end_ms)]);
+                    drive(&app, sr, &vad_config, audio, session, control, events).await;
                 }
             })
         })
         .await
 }
 
+/// True if the stream ended on an error.
+fn report_stream_error(app: &AppHandle, e: Option<anyhow::Error>) -> bool {
+    let Some(e) = e else { return false };
+    error!("System audio capture ended: {e:#}");
+    if let Err(emit_err) = app.emit("capture-error", format!("{e:#}")) {
+        error!("Failed to emit capture-error: {}", emit_err);
+    }
+    true
+}
+
+#[tauri::command]
+pub async fn system_audio_control(app: AppHandle, control: Control) -> Result<(), String> {
+    let state = app.state::<crate::AudioState>();
+    let slot = state.capture.lock().await;
+    slot.as_ref()
+        .ok_or(())
+        .and_then(|c| c.control.send(control).map_err(drop))
+        .map_err(|()| "System audio capture is not running".to_string())
+}
+
 impl crate::AudioState {
     /// Locks the capture slot; Err if a capture is live. A finished capture is reaped.
     async fn lock_idle(
         &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<JoinHandle<()>>>, String> {
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<Capture>>, String> {
         let mut slot = self.capture.lock().await;
-        if let Some(done) = slot.take_if(|t| t.is_finished()) {
-            reap(done).await;
+        if let Some(done) = slot.take_if(|c| c.task.is_finished()) {
+            reap(done.task).await;
         }
         if slot.is_some() {
             warn!("Capture already running");
@@ -120,20 +195,27 @@ impl crate::AudioState {
         Ok(slot)
     }
 
-    async fn start<F>(&self, open: impl FnOnce() -> Result<F, String>) -> Result<(), String>
+    async fn start<F>(
+        &self,
+        open: impl FnOnce(mpsc::UnboundedReceiver<Control>) -> Result<F, String>,
+    ) -> Result<(), String>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let mut slot = self.lock_idle().await?;
-        *slot = Some(tokio::spawn(open()?));
+        let (control, rx) = mpsc::unbounded_channel();
+        *slot = Some(Capture {
+            task: tokio::spawn(open(rx)?),
+            control,
+        });
         Ok(())
     }
 
     async fn stop(&self) {
         let mut slot = self.capture.lock().await;
-        if let Some(task) = slot.take() {
-            task.abort();
-            reap(task).await;
+        if let Some(c) = slot.take() {
+            c.task.abort();
+            reap(c.task).await;
         }
     }
 }
@@ -146,61 +228,161 @@ async fn reap(task: JoinHandle<()>) {
     }
 }
 
-async fn run_vad_capture(
-    app: AppHandle,
-    stream: impl StreamExt<Item = f32> + Unpin,
+/// Segment -> STT -> turn -> LLM loop. Owns every STT and LLM future, so aborting the task cancels them.
+async fn drive(
+    app: &AppHandle,
     sr: u32,
-    mut vad: Segmenter,
-    config: &VadConfig,
+    vad_cfg: &VadConfig,
+    mut audio: impl Stream<Item = (Vec<VadEvent>, u64)> + Unpin,
+    session: Session,
+    mut control: mpsc::UnboundedReceiver<Control>,
+    events: Channel<TurnEvent>,
 ) {
-    let mut chunks = stream.ready_chunks(4096);
-    while let Some(chunk) = chunks.next().await {
-        for ev in vad.push(&chunk) {
-            let emitted = match ev {
-                VadEvent::SpeechStart { .. } => app.emit("speech-start", ()),
-                VadEvent::Segment { samples, .. } => {
-                    match samples_to_wav_b64(sr, &normalize_audio_level(&samples, 0.1)) {
-                        Ok(b64) => app.emit("speech-detected", b64),
-                        Err(e) => {
-                            error!("Failed to encode speech to WAV: {}", e);
-                            app.emit("audio-encoding-error", "Failed to encode speech")
+    let llm = app.state::<LlmState>();
+    let llm: &LlmState = &llm;
+    let Session {
+        mut config,
+        history,
+        carry,
+    } = session;
+    let mut turns = Turns::new(history, carry);
+    let mut transcripts = FuturesUnordered::<BoxFuture<'_, (u64, Result<String, String>)>>::new();
+    let mut answer: Option<BoxFuture<'_, Result<String, LlmError>>> = None;
+    let mut audio_done = false;
+
+    loop {
+        if audio_done && transcripts.is_empty() && answer.is_none() {
+            return;
+        }
+        let inputs = tokio::select! {
+            chunk = audio.next(), if !audio_done => match chunk {
+                None => {
+                    audio_done = true;
+                    vec![Input::Flush]
+                }
+                Some((vad_events, now_ms)) => {
+                    let mut inputs = Vec::new();
+                    for ev in vad_events {
+                        match ev {
+                            VadEvent::SpeechStart { start_ms } => {
+                                inputs.push(Input::SpeechStart { at_ms: start_ms })
+                            }
+                            VadEvent::Segment { samples, start_ms, end_ms } => {
+                                let wav = samples_to_wav(sr, &normalize_audio_level(&samples, 0.1));
+                                let provider = config.stt.clone();
+                                transcripts.push(
+                                    async move {
+                                        let text = match tokio::time::timeout(
+                                            STT_TIMEOUT,
+                                            stt::transcribe(app, llm, &provider, &wav, "audio/wav"),
+                                        )
+                                        .await
+                                        {
+                                            Ok(r) => r.map_err(|e| format!("Transcription failed: {e}")),
+                                            Err(_) => Err("Speech transcription timed out (30s)".to_string()),
+                                        };
+                                        (start_ms, text)
+                                    }
+                                    .boxed(),
+                                );
+                                inputs.push(Input::Segment { start_ms, end_ms });
+                            }
+                            VadEvent::Discarded { .. } => {
+                                if let Err(e) = app.emit(
+                                    "speech-discarded",
+                                    "Audio too short (likely background noise)",
+                                ) {
+                                    error!("Failed to emit speech-discarded: {}", e);
+                                }
+                                inputs.push(Input::Discarded);
+                            }
+                            VadEvent::Metrics { rms, peak, in_speech } => {
+                                if let Err(e) = app.emit(
+                                    "vad-metrics",
+                                    VadMetrics {
+                                        rms,
+                                        peak,
+                                        sensitivity_rms: vad_cfg.sensitivity_rms,
+                                        peak_threshold: vad_cfg.peak_threshold,
+                                        noise_gate_threshold: vad_cfg.noise_gate_threshold,
+                                        in_speech,
+                                    },
+                                ) {
+                                    error!("Failed to emit vad-metrics: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    inputs.push(Input::Tick { now_ms });
+                    inputs
+                }
+            },
+            Some((start_ms, text)) = transcripts.next() => vec![Input::Transcript { start_ms, text }],
+            Some(reply) = OptionFuture::from(answer.as_mut()) => {
+                answer = None;
+                vec![Input::Reply(reply.map_err(|e| e.to_string()))]
+            }
+            Some(c) = control.recv() => match c {
+                Control::Config { config: c } => {
+                    config = *c;
+                    Vec::new()
+                }
+                Control::Prompt { text } => vec![Input::Prompt(text)],
+            },
+        };
+
+        for input in inputs {
+            for out in turns.push(input) {
+                match out {
+                    Output::Ask { message, history } => {
+                        assert!(answer.is_none(), "Turns asks one at a time");
+                        let chat = Chat {
+                            provider: config.ai.clone(),
+                            message,
+                            system_prompt: Some(format!("{}\n\n{SKIP_INSTRUCTION}", config.system_prompt)),
+                            history,
+                            attached_files: config.attached_files.clone(),
+                        };
+                        let events = events.clone();
+                        answer = Some(
+                            async move {
+                                let (mut full, mut sent) = (String::new(), 0);
+                                let mut on_delta = |d: String| {
+                                    full.push_str(&d);
+                                    if SKIP_WORDS.iter().any(|w| w.starts_with(full.trim())) {
+                                        return Ok(()); // may still become a skip word, which never reaches the screen
+                                    }
+                                    let delta = full[sent..].to_string();
+                                    sent = full.len();
+                                    events
+                                        .send(TurnEvent::Delta { delta })
+                                        .map_err(|e| LlmError::Channel(e.to_string()))
+                                };
+                                complete(app, llm, chat, &mut on_delta).await
+                            }
+                            .boxed(),
+                        );
+                    }
+                    Output::Event(e) => {
+                        if let Err(err) = events.send(e) {
+                            error!("Turn event channel closed, ending capture: {err}"); // its renderer is gone
+                            return;
                         }
                     }
                 }
-                VadEvent::Discarded { .. } => app.emit(
-                    "speech-discarded",
-                    "Audio too short (likely background noise)",
-                ),
-                VadEvent::Metrics {
-                    rms,
-                    peak,
-                    in_speech,
-                } => app.emit(
-                    "vad-metrics",
-                    VadMetrics {
-                        rms,
-                        peak,
-                        sensitivity_rms: config.sensitivity_rms,
-                        peak_threshold: config.peak_threshold,
-                        noise_gate_threshold: config.noise_gate_threshold,
-                        in_speech,
-                    },
-                ),
-            };
-            if let Err(e) = emitted {
-                error!("Failed to emit VAD event: {}", e);
             }
         }
     }
 }
 
 // Continuous capture (VAD disabled)
+/// Noise-gated recording, or None when nothing usable was captured (already reported to the UI).
 async fn run_continuous_capture(
-    app: AppHandle,
+    app: &AppHandle,
     stream: impl StreamExt<Item = f32> + Unpin,
     sr: u32,
-    config: VadConfig,
-) {
+    config: &VadConfig,
+) -> Option<Vec<f32>> {
     let mut stream = stream;
     let max_samples = (sr as u64 * config.max_recording_duration_secs) as usize;
 
@@ -276,61 +458,42 @@ async fn run_continuous_capture(
     // Clean up event listener (CRITICAL)
     app.unlisten(stop_listener);
 
-    // Process and emit audio
+    if let Err(e) = app.emit("continuous-recording-stopped", ()) {
+        error!("Failed to emit continuous-recording-stopped: {}", e);
+    }
+
     if audio_buffer.is_empty() {
         warn!("No audio captured in continuous mode");
         if let Err(e) = app.emit("audio-encoding-error", "No audio recorded") {
             error!("Failed to emit audio-encoding-error: {}", e);
         }
-    } else {
-        let (raw_rms, raw_peak) = calculate_audio_metrics(&audio_buffer);
-        tracing::info!(
-            "continuous capture: sr={} samples={} dur={:.2}s rms={:.5} peak={:.5}",
-            sr,
-            audio_buffer.len(),
-            audio_buffer.len() as f32 / sr as f32,
-            raw_rms,
-            raw_peak
+        return None;
+    }
+    let (raw_rms, raw_peak) = calculate_audio_metrics(&audio_buffer);
+    tracing::info!(
+        "continuous capture: sr={} samples={} dur={:.2}s rms={:.5} peak={:.5}",
+        sr,
+        audio_buffer.len(),
+        audio_buffer.len() as f32 / sr as f32,
+        raw_rms,
+        raw_peak
+    );
+    if raw_peak < config.noise_gate_threshold {
+        // Nothing rises above the noise floor (e.g. the monitored sink received no signal);
+        // STT would only return an empty transcript.
+        warn!(
+            "Continuous recording contained no audible signal (peak {:.6}, gate {:.6})",
+            raw_peak, config.noise_gate_threshold
         );
-        if raw_peak < config.noise_gate_threshold {
-            // Nothing in the recording rises above the noise floor (e.g. the
-            // monitored sink received no signal at all). Sending it to STT
-            // would only produce an empty transcript; tell the user what
-            // happened instead.
-            warn!(
-                "Continuous recording contained no audible signal (peak {:.6}, gate {:.6})",
-                raw_peak, config.noise_gate_threshold
-            );
-            if let Err(e) = app.emit(
-                "speech-discarded",
-                "recording was silent - check that audio is routed to the captured device",
-            ) {
-                error!("Failed to emit speech-discarded (silent): {}", e);
-            }
-        } else {
-            // Apply noise gate
-            let cleaned_audio = apply_noise_gate(&audio_buffer, config.noise_gate_threshold);
-            let cleaned_audio = normalize_audio_level(&cleaned_audio, 0.1);
-
-            match samples_to_wav_b64(sr, &cleaned_audio) {
-                Ok(b64) => {
-                    if let Err(e) = app.emit("speech-detected", b64) {
-                        error!("Failed to emit speech-detected (continuous): {}", e);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to encode continuous audio: {}", e);
-                    if let Err(emit_err) = app.emit("audio-encoding-error", e) {
-                        error!("Failed to emit audio-encoding-error: {}", emit_err);
-                    }
-                }
-            }
+        if let Err(e) = app.emit(
+            "speech-discarded",
+            "recording was silent - check that audio is routed to the captured device",
+        ) {
+            error!("Failed to emit speech-discarded (silent): {}", e);
         }
+        return None;
     }
-
-    if let Err(e) = app.emit("continuous-recording-stopped", ()) {
-        error!("Failed to emit continuous-recording-stopped: {}", e);
-    }
+    Some(apply_noise_gate(&audio_buffer, config.noise_gate_threshold))
 }
 
 fn normalize_audio_level(samples: &[f32], target_rms: f32) -> Vec<f32> {
@@ -360,22 +523,8 @@ fn normalize_audio_level(samples: &[f32], target_rms: f32) -> Vec<f32> {
         .collect()
 }
 
-// Convert samples to WAV base64 (with proper error handling)
-fn samples_to_wav_b64(sample_rate: u32, mono_f32: &[f32]) -> Result<String, String> {
-    // Validate sample rate
-    if !(8000..=96000).contains(&sample_rate) {
-        error!("Invalid sample rate: {}", sample_rate);
-        return Err(format!(
-            "Invalid sample rate: {}. Expected 8000-96000 Hz",
-            sample_rate
-        ));
-    }
-
-    // Validate buffer
-    if mono_f32.is_empty() {
-        return Err("Empty audio buffer".to_string());
-    }
-
+fn samples_to_wav(sample_rate: u32, mono_f32: &[f32]) -> Vec<u8> {
+    assert!(!mono_f32.is_empty(), "segments are never empty");
     let mut cursor = Cursor::new(Vec::new());
     let spec = WavSpec {
         channels: 1,
@@ -383,21 +532,13 @@ fn samples_to_wav_b64(sample_rate: u32, mono_f32: &[f32]) -> Result<String, Stri
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-
-    let mut writer = WavWriter::new(&mut cursor, spec).map_err(|e| {
-        error!("Failed to create WAV writer: {}", e);
-        e.to_string()
-    })?;
-
+    let mut writer = WavWriter::new(&mut cursor, spec).expect("writing to a Vec cannot fail");
     for &s in mono_f32 {
-        let clamped = s.clamp(-1.0, 1.0);
-        let sample_i16 = (clamped * i16::MAX as f32) as i16;
-        writer.write_sample(sample_i16).map_err(|e| e.to_string())?;
+        let sample_i16 = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        writer.write_sample(sample_i16).expect("writing to a Vec cannot fail");
     }
-
-    writer.finalize().map_err(|e| e.to_string())?;
-
-    Ok(B64.encode(cursor.into_inner()))
+    writer.finalize().expect("writing to a Vec cannot fail");
+    cursor.into_inner()
 }
 
 #[tauri::command]
@@ -668,7 +809,7 @@ mod tests {
     ) -> Result<(), String> {
         let live = live.clone();
         state
-            .start(|| {
+            .start(|_| {
                 let mut s = FakeStream::new(live, remaining);
                 Ok(async move { while s.next().await.is_some() {} })
             })

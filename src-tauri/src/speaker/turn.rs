@@ -15,24 +15,41 @@ that needs no answer), reply with exactly the single word COPY. Otherwise respon
 const TURN_GAP_MS: u64 = 2000; // > natural mid-question pauses (~1.5s); effectively max(this, silence_ms). Stays the no-mic fallback once user speech closes turns (issue 13)
 
 pub enum Input {
-    SpeechStart { at_ms: u64 },
-    Segment { start_ms: u64, end_ms: u64 }, // start_ms is the segment id
+    SpeechStart {
+        at_ms: u64,
+    },
+    Segment {
+        start_ms: u64, // segment id
+        end_ms: u64,
+    },
     Discarded,
-    Transcript { start_ms: u64, text: Result<String, String> },
-    Tick { now_ms: u64 }, // audio clock
-    Flush,                // close the open turn now
+    Transcript {
+        start_ms: u64,
+        text: Result<String, String>,
+    },
+    Tick {
+        now_ms: u64, // audio clock
+    },
+    Flush, // close the open turn now
     Prompt(String),
     Reply(Result<String, String>), // outcome of the in-flight Ask
 }
 
 pub enum Output {
-    Ask { message: String, history: Vec<HistoryMessage> },
+    Ask {
+        message: String,
+        history: Vec<HistoryMessage>,
+    },
     Event(TurnEvent),
 }
 
 /// IPC contract with `useSystemAudio.ts`; `Delta` is produced by the driver.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum TurnEvent {
     Heard { text: String }, // carry + every unanswered transcript, chronological
     Asked { message: String },
@@ -99,7 +116,9 @@ impl Turns {
                     .expect("transcript for unknown segment");
                 *slot = Some(text);
                 if heard {
-                    out.push(Output::Event(TurnEvent::Heard { text: self.unanswered() }));
+                    out.push(Output::Event(TurnEvent::Heard {
+                        text: self.unanswered(),
+                    }));
                 }
             }
             Input::Tick { now_ms } => self.close_if_due(now_ms),
@@ -113,13 +132,27 @@ impl Turns {
                     Ok(answer) => match answer.trim() {
                         "SKIP" => {
                             self.carry = message.clone();
-                            TurnEvent::Skipped { message, carried: true }
+                            TurnEvent::Skipped {
+                                message,
+                                carried: true,
+                            }
                         }
-                        "COPY" => TurnEvent::Skipped { message, carried: false },
-                        "" => TurnEvent::Failed { error: "model returned an empty answer".into() },
+                        "COPY" => TurnEvent::Skipped {
+                            message,
+                            carried: false,
+                        },
+                        "" => TurnEvent::Failed {
+                            error: "model returned an empty answer".into(),
+                        },
                         _ => {
-                            self.history.push(HistoryMessage { role: Role::User, content: message.clone() });
-                            self.history.push(HistoryMessage { role: Role::Assistant, content: answer.clone() });
+                            self.history.push(HistoryMessage {
+                                role: Role::User,
+                                content: message.clone(),
+                            });
+                            self.history.push(HistoryMessage {
+                                role: Role::Assistant,
+                                content: answer.clone(),
+                            });
                             TurnEvent::Answered { message, answer }
                         }
                     },
@@ -138,7 +171,8 @@ impl Turns {
 
     fn close(&mut self) {
         if !self.open.is_empty() {
-            self.closed.push_back(Pending::Speech(std::mem::take(&mut self.open)));
+            self.closed
+                .push_back(Pending::Speech(std::mem::take(&mut self.open)));
         }
     }
 
@@ -176,7 +210,11 @@ impl Turns {
                             .map(|t| t.expect("readiness checked above"))
                             .partition(Result::is_ok);
                         if !errs.is_empty() {
-                            let error = errs.into_iter().map(|e| e.unwrap_err()).collect::<Vec<_>>().join("; ");
+                            let error = errs
+                                .into_iter()
+                                .map(|e| e.unwrap_err())
+                                .collect::<Vec<_>>()
+                                .join("; ");
                             out.push(Output::Event(TurnEvent::Failed { error }));
                             continue;
                         }
@@ -200,7 +238,10 @@ impl Turns {
                 c => format!("{c}{sep}{text}"),
             };
             self.asking = Some(message.clone());
-            out.push(Output::Ask { message: message.clone(), history: self.history.clone() });
+            out.push(Output::Ask {
+                message: message.clone(),
+                history: self.history.clone(),
+            });
             out.push(Output::Event(TurnEvent::Asked { message }));
         }
     }
