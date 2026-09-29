@@ -125,6 +125,8 @@
               pkgs.nodejs_22
               pkgs.pkg-config
               pkgs.openssl
+              pkgs.espeak-ng # VAD fixture generator (src-tauri/tests/fixtures/vad/gen.sh)
+              pkgs.sox
             ] ++ systemDeps ++ combined.enabledPackages;
 
             env = {
