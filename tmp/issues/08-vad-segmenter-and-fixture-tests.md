@@ -12,3 +12,5 @@ Goal:
 - Read https://matklad.github.io/2021/05/31/how-to-test.html before writing tests (data-driven, test the interface not internals).
 
 Improving the detector itself (hysteresis, adaptive noise floor, so hum/clicks behave) is in scope if fixtures show failures — the fixtures are the spec.
+
+Note from phase 1: issue 03 added `SpeakerStream::take_error()` as a stopgap. When run_* internals move here, consider making the source `Stream<Item = Result<f32, CaptureError>>` and deleting `take_error`.
