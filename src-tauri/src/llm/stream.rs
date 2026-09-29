@@ -1,10 +1,9 @@
 //! SSE chunk parser and JSON-path delta extraction.
 //!
-//! The transport contract: the upstream LLM API streams `text/event-stream`
-//! frames of the form `data: <json>\n` with `data: [DONE]` terminating the
-//! stream. Some providers may omit the trailing newline on the final frame.
-//! Lines that don't start with `data:` are ignored; malformed JSON inside
-//! a frame is also silently dropped (matches the JS behavior).
+//! An event is one or more `data:` lines (LF or CRLF) ended by a blank line;
+//! other fields are ignored and `data: [DONE]` is a no-op. Some providers omit
+//! the final newline, so a pending event is flushed at EOF. Bytes are decoded
+//! only as complete JSON payloads; invalid UTF-8 or malformed JSON is an error.
 
 use crate::llm::{LlmError, StreamEvent};
 use futures_util::StreamExt;
@@ -24,7 +23,8 @@ pub async fn stream_sse(
 ) -> Result<StreamOutcome, LlmError> {
     let mut full_response = String::new();
     let mut usage: Option<serde_json::Value> = None;
-    let mut buffer = String::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut data: Option<Vec<u8>> = None;
     let mut stream = response.bytes_stream();
 
     loop {
@@ -37,31 +37,35 @@ pub async fn stream_sse(
             None => break,
             Some(Err(e)) => return Err(LlmError::Reqwest(e)),
             Some(Ok(bytes)) => {
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(idx) = buffer.find('\n') {
-                    let line: String = buffer[..idx].to_string();
-                    buffer.drain(..=idx);
+                buf.extend_from_slice(&bytes);
+                let mut start = 0;
+                while let Some(i) = buf[start..].iter().position(|&b| b == b'\n') {
                     process_line(
-                        &line,
+                        &buf[start..start + i],
+                        &mut data,
                         channel,
                         &extract_delta,
                         &mut full_response,
                         &mut usage,
                     )?;
+                    start += i + 1;
                 }
+                buf.drain(..start);
             }
         }
     }
-    // Flush any unterminated final frame.
-    if !buffer.is_empty() {
-        let line = std::mem::take(&mut buffer);
+    if !buf.is_empty() {
         process_line(
-            &line,
+            &buf,
+            &mut data,
             channel,
             &extract_delta,
             &mut full_response,
             &mut usage,
         )?;
+    }
+    if let Some(d) = data {
+        dispatch(&d, channel, &extract_delta, &mut full_response, &mut usage)?;
     }
 
     Ok(StreamOutcome {
@@ -71,27 +75,43 @@ pub async fn stream_sse(
 }
 
 fn process_line(
-    line: &str,
+    line: &[u8],
+    data: &mut Option<Vec<u8>>,
     channel: &Channel<StreamEvent>,
     extract_delta: &impl Fn(&serde_json::Value) -> Option<String>,
     full_response: &mut String,
     usage: &mut Option<serde_json::Value>,
 ) -> Result<(), LlmError> {
-    let trimmed = line.trim();
-    let Some(rest) = trimmed.strip_prefix("data:") else {
-        return Ok(());
-    };
-    let payload = rest.trim();
-    if payload.is_empty() || payload == "[DONE]" {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.is_empty() {
+        if let Some(d) = data.take() {
+            dispatch(&d, channel, extract_delta, full_response, usage)?;
+        }
+    } else if let Some(value) = line.strip_prefix(b"data:") {
+        let value = value.strip_prefix(b" ").unwrap_or(value);
+        match data {
+            Some(d) => {
+                d.push(b'\n');
+                d.extend_from_slice(value);
+            }
+            None => *data = Some(value.to_vec()),
+        }
+    }
+    Ok(())
+}
+
+fn dispatch(
+    payload: &[u8],
+    channel: &Channel<StreamEvent>,
+    extract_delta: &impl Fn(&serde_json::Value) -> Option<String>,
+    full_response: &mut String,
+    usage: &mut Option<serde_json::Value>,
+) -> Result<(), LlmError> {
+    let payload = payload.trim_ascii();
+    if payload.is_empty() || payload == b"[DONE]" {
         return Ok(());
     }
-    // Malformed JSON in a single frame: silently drop. The provider may
-    // legitimately split a JSON object across multiple network chunks,
-    // in which case the next iteration will reassemble it via the
-    // newline-buffered loop.
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(payload) else {
-        return Ok(());
-    };
+    let parsed: serde_json::Value = serde_json::from_slice(payload)?;
     if usage.is_none() {
         if let Some(u) = parsed.get("usage").filter(|u| !u.is_null()) {
             *usage = Some(u.clone());
