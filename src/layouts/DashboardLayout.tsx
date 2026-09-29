@@ -6,9 +6,9 @@ import { ErrorLayout } from "./ErrorLayout";
 export const DashboardLayout = () => {
   return (
     <ErrorBoundary
-      fallbackRender={() => {
-        return <ErrorLayout />;
-      }}
+      fallbackRender={({ error }) => (
+        <ErrorLayout message={String(error?.message ?? error)} />
+      )}
       resetKeys={["dashboard-error"]}
       onReset={() => {
         console.log("Reset");

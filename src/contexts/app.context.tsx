@@ -20,6 +20,8 @@ import {
   DEFAULT_CUSTOMIZABLE_STATE,
   CursorType,
   updateCursorType,
+  getCustomProviders,
+  migrateSttLegacyStorage,
 } from "@/lib/storage";
 import {
   AttachedFile,
@@ -28,7 +30,6 @@ import {
   TYPE_PROVIDER,
 } from "@/types";
 import { MAX_FILES } from "@/config";
-import curl2Json from "@bany/curl-to-json";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -43,40 +44,6 @@ import {
   useEffect,
   useState,
 } from "react";
-
-const validateAndProcessCurlProviders = (
-  providersJson: string,
-  providerType: "AI" | "STT"
-): TYPE_PROVIDER[] => {
-  try {
-    const parsed = JSON.parse(providersJson);
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    return parsed
-      .filter((p) => {
-        try {
-          curl2Json(p.curl);
-          return true;
-        } catch (e) {
-          return false;
-        }
-
-        return true;
-      })
-      .map((p) => {
-        const provider = { ...p, isCustom: true };
-        if (providerType === "STT" && provider.curl) {
-          provider.curl = provider.curl.replace(/AUDIO_BASE64/g, "AUDIO");
-        }
-        return provider;
-      });
-  } catch (e) {
-    console.warn(`Failed to parse custom ${providerType} providers`, e);
-    return [];
-  }
-};
 
 // Create the context
 const AppContext = createContext<IContextType | undefined>(undefined);
@@ -132,6 +99,11 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     provider: "",
     variables: {},
   });
+  const [sttMigrationError, setSttMigrationError] = useState<string | null>(
+    null
+  );
+  // rethrown during render so the root error boundary shows it
+  const [fatal, setFatal] = useState<Error | null>(null);
 
   const [screenshotConfiguration, setScreenshotConfiguration] =
     useState<ScreenshotConfig>({
@@ -293,23 +265,12 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       }
     }
 
-    // Load custom AI providers
-    const savedAi = safeLocalStorage.getItem(STORAGE_KEYS.CUSTOM_AI_PROVIDERS);
-    let aiList: TYPE_PROVIDER[] = [];
-    if (savedAi) {
-      aiList = validateAndProcessCurlProviders(savedAi, "AI");
+    try {
+      setCustomAiProviders(getCustomProviders("ai"));
+      setCustomSttProviders(getCustomProviders("stt"));
+    } catch (e) {
+      setFatal(e as Error);
     }
-    setCustomAiProviders(aiList);
-
-    // Load custom STT providers
-    const savedStt = safeLocalStorage.getItem(
-      STORAGE_KEYS.CUSTOM_SPEECH_PROVIDERS
-    );
-    let sttList: TYPE_PROVIDER[] = [];
-    if (savedStt) {
-      sttList = validateAndProcessCurlProviders(savedStt, "STT");
-    }
-    setCustomSttProviders(sttList);
 
     // Load selected AI provider
     const savedSelectedAi = safeLocalStorage.getItem(
@@ -412,8 +373,10 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
         console.debug("Failed to track app start:", error);
       }
     };
-    // Load data
     loadData();
+    migrateSttLegacyStorage().then(loadData, (e) =>
+      setSttMigrationError(String(e))
+    );
     initializeApp();
   }, []);
 
@@ -713,6 +676,8 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     loadData();
   };
 
+  if (fatal) throw fatal;
+
   // Create the context value (extend IContextType accordingly)
   const value: IContextType = {
     systemPrompt,
@@ -725,6 +690,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     customSttProviders,
     selectedSttProvider,
     onSetSelectedSttProvider,
+    sttMigrationError,
     screenshotConfiguration,
     setScreenshotConfiguration,
     customizable,

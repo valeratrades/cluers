@@ -5,6 +5,8 @@ import { AppProvider, ThemeProvider } from "./contexts";
 import "./global.css";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import AppRoutes from "./routes";
+import { ErrorBoundary } from "react-error-boundary";
+import { ErrorLayout } from "./layouts/ErrorLayout";
 
 const currentWindow = getCurrentWindow();
 const windowLabel = currentWindow.label;
@@ -22,9 +24,15 @@ if (windowLabel.startsWith("capture-overlay-")) {
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
       <ThemeProvider>
-        <AppProvider>
-          <AppRoutes />
-        </AppProvider>
+        <ErrorBoundary
+          fallbackRender={({ error }) => (
+            <ErrorLayout message={String(error?.message ?? error)} />
+          )}
+        >
+          <AppProvider>
+            <AppRoutes />
+          </AppProvider>
+        </ErrorBoundary>
       </ThemeProvider>
     </React.StrictMode>
   );
