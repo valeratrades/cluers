@@ -3,7 +3,8 @@
 // polling. Cancellation is by per-request UUID via `cancelChat`.
 
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { AttachedFile } from "@/types";
+import type { AttachedFile, TYPE_PROVIDER } from "@/types";
+import { shouldUsePluelyAPI } from "@/lib/functions/pluely.api";
 import { MARKDOWN_FORMATTING_INSTRUCTIONS } from "@/config/constants";
 import {
   RESPONSE_LENGTHS,
@@ -52,6 +53,41 @@ export interface ProviderInput {
   // Non-secret values only. Secret values live in the OS keychain via
   // `setProviderSecret` and are merged in by Rust.
   userVariables: Record<string, string>;
+}
+
+export async function resolveProviderInput(
+  selected: { provider: string; variables: Record<string, string> },
+  providers: TYPE_PROVIDER[]
+): Promise<ProviderInput> {
+  if (await shouldUsePluelyAPI()) {
+    return {
+      id: "pluely",
+      curl: "",
+      responseContentPath: "",
+      streaming: true,
+      isPluelyHosted: true,
+      userVariables: {},
+    };
+  }
+  if (!selected.provider) {
+    throw new Error("Please select an AI provider in settings");
+  }
+  const provider = providers.find((p) => p.id === selected.provider);
+  if (!provider) {
+    throw new Error("Invalid provider selected");
+  }
+  return {
+    id: selected.provider,
+    curl: provider.curl,
+    responseContentPath: provider.responseContentPath ?? "",
+    streaming: provider.streaming ?? false,
+    isPluelyHosted: false,
+    userVariables: Object.fromEntries(
+      Object.entries(selected.variables)
+        .filter(([, v]) => v !== "")
+        .map(([k, v]) => [k.toUpperCase(), v])
+    ),
+  };
 }
 
 export interface HistoryMessage {
