@@ -87,6 +87,17 @@ impl SpeakerInput {
         Ok(Self { inner })
     }
 
+    pub fn microphone(device_id: Option<String>) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        return Ok(Self {
+            inner: PlatformSpeakerInput::microphone(device_id)?,
+        });
+        #[cfg(not(target_os = "linux"))]
+        Err(anyhow::anyhow!(
+            "Microphone capture ({device_id:?}) is only implemented on Linux"
+        ))
+    }
+
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     pub fn new() -> Result<Self> {
         Err(anyhow::anyhow!(

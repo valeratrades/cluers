@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Listener, Manager};
@@ -85,6 +86,7 @@ pub async fn start_system_audio_capture(
     app: AppHandle,
     vad_config: Option<VadConfig>,
     device_id: Option<String>,
+    mic_device_id: Option<String>,
     session: Session,
     events: Channel<TurnEvent>,
 ) -> Result<(), String> {
@@ -100,6 +102,22 @@ pub async fn start_system_audio_capture(
                     .map_err(|e| format!("Failed to acquire VAD config lock: {}", e))?;
                 *vad_cfg = config;
             }
+            let vad_config = state
+                .vad_config
+                .lock()
+                .map_err(|e| format!("Failed to read VAD config: {}", e))?
+                .clone();
+
+            // opened first: open skew then only delays the mic, so echo never precedes its source
+            let mic = vad_config
+                .enabled
+                .then(|| SpeakerInput::microphone(mic_device_id))
+                .transpose()
+                .map_err(|e| {
+                    error!("Failed to open microphone: {e:#}");
+                    format!("Failed to access microphone: {e}")
+                })?
+                .map(SpeakerInput::stream);
 
             let input = SpeakerInput::new_with_device(device_id).map_err(|e| {
                 error!("Failed to create speaker input: {}", e);
@@ -117,29 +135,39 @@ pub async fn start_system_audio_capture(
                 ));
             }
 
-            let vad_config = state
-                .vad_config
-                .lock()
-                .map_err(|e| format!("Failed to read VAD config: {}", e))?
-                .clone();
-
-            let segmenter = vad_config
-                .enabled
-                .then(|| Segmenter::new(&vad_config, sr))
+            let vads = mic
+                .map(|mic| -> Result<_, String> {
+                    assert_eq!(mic.sample_rate(), sr, "both Pulse streams request 44.1kHz");
+                    Ok((
+                        mic,
+                        Segmenter::new(&vad_config, sr)?,
+                        Segmenter::new(&vad_config, sr)?,
+                    ))
+                })
                 .transpose()?;
 
             Ok(async move {
                 let app = app_clone;
                 let mut stream = stream;
-                let recording = match segmenter {
-                    Some(mut vad) => {
-                        let mut seen = 0u64;
-                        let audio = (&mut stream).ready_chunks(4096).map(|c| {
-                            seen += c.len() as u64;
-                            (vad.push(&c).into_iter().map(|e| (Speaker::Interviewer, e)).collect(), seen * 1000 / sr as u64)
-                        });
+                let recording = match vads {
+                    Some((mut mic, mut vad, mut mic_vad)) => {
+                        // ponytail: one sample clock for both devices; under plain PulseAudio (no PipeWire rate matching) clock drift is ~0.2s/h worst case. Resync on timestamps if long sessions show it.
+                        let (mut seen, mut stalled) = (0u64, None);
+                        let audio = lockstep(&mut stream, &mut mic, 2 * sr as usize, &mut stalled)
+                            .map(|(s, m)| {
+                                seen += s.len() as u64;
+                                let mut ev: Vec<_> = vad
+                                    .push(&s)
+                                    .into_iter()
+                                    .map(|e| (Speaker::Interviewer, e))
+                                    .collect();
+                                ev.extend(mic_vad.push(&m).into_iter().map(|e| (Speaker::User, e))); // interviewer first: echo never precedes its source
+                                (ev, seen * 1000 / sr as u64)
+                            });
                         drive(&app, sr, &vad_config, audio, session, control, events).await;
                         report_stream_error(&app, stream.error());
+                        report_stream_error(&app, mic.error().map(|e| e.context("Microphone")));
+                        report_stream_error(&app, stalled.map(anyhow::Error::msg));
                         return;
                     }
                     None => run_continuous_capture(&app, &mut stream, sr, &vad_config).await,
@@ -157,6 +185,48 @@ pub async fn start_system_audio_capture(
             })
         })
         .await
+}
+
+/// Pairs system and mic samples in equal-length chunks. Ends when either ends, or with `stalled` set once one side runs `max_lag` samples ahead.
+fn lockstep<'a, S: Stream<Item = f32> + Unpin + 'a>(
+    sys: S,
+    mic: S,
+    max_lag: usize,
+    stalled: &'a mut Option<String>,
+) -> impl Stream<Item = (Vec<f32>, Vec<f32>)> + 'a {
+    let (mut sys, mut mic) = (sys.ready_chunks(4096), mic.ready_chunks(4096));
+    let (mut sys_buf, mut mic_buf) = (Vec::new(), Vec::new());
+    stream::poll_fn(move |cx| loop {
+        let mut progressed = false;
+        for (side, buf) in [(&mut sys, &mut sys_buf), (&mut mic, &mut mic_buf)] {
+            match side.poll_next_unpin(cx) {
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(c)) => {
+                    buf.extend(c);
+                    progressed = true;
+                }
+                Poll::Pending => {}
+            }
+        }
+        let n = sys_buf.len().min(mic_buf.len());
+        for (lagging, ahead) in [("Microphone", &sys_buf), ("System audio", &mic_buf)] {
+            if ahead.len() - n > max_lag {
+                *stalled = Some(format!(
+                    "{lagging} stopped delivering audio while the other device kept going"
+                ));
+                return Poll::Ready(None);
+            }
+        }
+        if n > 0 {
+            return Poll::Ready(Some((
+                sys_buf.drain(..n).collect(),
+                mic_buf.drain(..n).collect(),
+            )));
+        }
+        if !progressed {
+            return Poll::Pending;
+        }
+    })
 }
 
 /// True if the stream ended on an error.
@@ -873,6 +943,30 @@ mod tests {
             );
             assert_eq!(live.max.load(Ordering::SeqCst), *max, "{ops:?} max streams");
             state.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn lockstep_errs_naming_the_stalled_device() {
+        let feed = |n: usize| futures_util::stream::iter(vec![0.0f32; n]).chain(futures_util::stream::pending());
+        for (sys, mic, want) in [
+            (20_000, 100, "Microphone stopped"),
+            (100, 20_000, "System audio stopped"),
+        ] {
+            let (mut paired, mut stalled) = (0, None);
+            let mut pairs = super::lockstep(feed(sys), feed(mic), 5000, &mut stalled);
+            while let Some((s, m)) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), pairs.next())
+                    .await
+                    .expect("a stall ends the stream instead of waiting")
+            {
+                assert_eq!(s.len(), m.len());
+                paired += s.len();
+            }
+            drop(pairs);
+            assert_eq!(paired, 100);
+            let err = stalled.expect("stall reported");
+            assert!(err.starts_with(want), "{err}");
         }
     }
 
