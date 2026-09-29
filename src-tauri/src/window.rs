@@ -88,8 +88,7 @@ pub fn open_dashboard(app: tauri::AppHandle) -> Result<(), String> {
     show_dashboard_window(&app)
 }
 
-#[tauri::command]
-pub fn toggle_dashboard(app: tauri::AppHandle) -> Result<(), String> {
+pub fn toggle_dashboard<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     if let Some(dashboard_window) = app.get_webview_window("dashboard") {
         match dashboard_window.is_visible() {
             Ok(true) => {
@@ -113,7 +112,7 @@ pub fn toggle_dashboard(app: tauri::AppHandle) -> Result<(), String> {
         }
     } else {
         // Window doesn't exist, create and show it
-        show_dashboard_window(&app)?;
+        show_dashboard_window(app)?;
     }
 
     Ok(())
