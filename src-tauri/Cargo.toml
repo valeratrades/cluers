@@ -55,6 +55,9 @@ rusqlite = { version = "0.32", features = ["bundled", "trace"] }
 thiserror = "1.0"
 tauri-plugin-machine-uid = "0.1.2"
 
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri-plugin-macos-permissions = "2"
 cidre = "0.11.3"
