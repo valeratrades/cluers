@@ -11,7 +11,6 @@ export type UseHistoryType = ReturnType<typeof useHistory>;
 
 export interface UseHistoryReturn {
   conversations: ConversationSummary[];
-  selectedConversationId: string | null;
   deleteConfirm: string | null;
   isDownloaded: boolean;
   isAttached: boolean;
@@ -34,7 +33,6 @@ export function useHistory(): UseHistoryReturn {
   const [isLoading, setIsLoading] = useState(false);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [search, setSearch] = useState("");
-  const [selectedConversationId] = useState<string | null>(null);
 
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const [isDownloaded, setIsDownloaded] = useState(false);
@@ -156,7 +154,6 @@ export function useHistory(): UseHistoryReturn {
 
   return {
     conversations,
-    selectedConversationId,
     deleteConfirm,
     isDownloaded,
     isAttached,

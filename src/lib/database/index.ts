@@ -32,6 +32,18 @@ export interface AppendedMessageResponse {
   timestamp: number;
 }
 
+export interface NewTurn {
+  user: string;
+  attachedFiles: AttachedFile[];
+  assistant: string;
+}
+
+export interface AppendedTurn {
+  conversationId: string;
+  user: AppendedMessageResponse;
+  assistant: AppendedMessageResponse;
+}
+
 // -- chat history ------------------------------------------------------------
 
 export function listConversationSummaries(): Promise<ConversationSummary[]> {
@@ -53,6 +65,13 @@ export function appendMessage(
   message: NewMessage
 ): Promise<AppendedMessageResponse> {
   return invoke("append_message", { conversationId, message });
+}
+
+export function appendTurn(
+  conversationId: string | null,
+  turn: NewTurn
+): Promise<AppendedTurn> {
+  return invoke("append_turn", { conversationId, turn });
 }
 
 export function renameConversation(id: string, title: string): Promise<void> {

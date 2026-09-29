@@ -92,6 +92,22 @@ pub struct AppendedMessage {
     pub timestamp: i64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewTurn {
+    pub user: String,
+    pub attached_files: Vec<AttachedFile>,
+    pub assistant: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendedTurn {
+    pub conversation_id: String,
+    pub user: AppendedMessage,
+    pub assistant: AppendedMessage,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemPrompt {

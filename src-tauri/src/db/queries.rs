@@ -2,8 +2,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::schema::{
-    AppendedMessage, AttachedFile, Conversation, ConversationId, ConversationSummary, Message,
-    NewMessage, Role, SystemPrompt,
+    AppendedMessage, AppendedTurn, AttachedFile, Conversation, ConversationId,
+    ConversationSummary, Message, NewMessage, NewTurn, Role, SystemPrompt,
 };
 use super::DbError;
 
@@ -164,6 +164,45 @@ pub fn append_message(
         params![id, conversation_id, msg.role.as_str(), msg.content, ts, attached],
     )?;
     Ok(AppendedMessage { id, timestamp: ts })
+}
+
+pub fn append_turn(
+    conn: &mut Connection,
+    conversation_id: Option<&str>,
+    turn: NewTurn,
+) -> Result<AppendedTurn, DbError> {
+    if turn.user.trim().is_empty() || turn.assistant.trim().is_empty() {
+        return Err(DbError::InvalidInput("turn message is empty"));
+    }
+    let tx = conn.transaction()?;
+    let conversation_id = match conversation_id {
+        Some(id) => id.to_string(),
+        None => start_conversation(&tx, &turn.user)?.id,
+    };
+    let user = append_message(
+        &tx,
+        &conversation_id,
+        &NewMessage {
+            role: Role::User,
+            content: turn.user,
+            attached_files: (!turn.attached_files.is_empty()).then_some(turn.attached_files),
+        },
+    )?;
+    let assistant = append_message(
+        &tx,
+        &conversation_id,
+        &NewMessage {
+            role: Role::Assistant,
+            content: turn.assistant,
+            attached_files: None,
+        },
+    )?;
+    tx.commit()?;
+    Ok(AppendedTurn {
+        conversation_id,
+        user,
+        assistant,
+    })
 }
 
 pub fn rename_conversation(conn: &Connection, id: &str, title: &str) -> Result<(), DbError> {
@@ -393,6 +432,76 @@ mod tests {
         assert_eq!(conv.messages[1].id, m2.id);
         assert_eq!(conv.messages[1].role, Role::Assistant);
         assert!(conv.messages[1].attached_files.is_none());
+    }
+
+    fn dump(conn: &Connection) -> String {
+        let mut convs = list_conversation_summaries(conn).unwrap();
+        convs.sort_by(|a, b| a.title.cmp(&b.title));
+        convs
+            .iter()
+            .map(|s| {
+                let c = load_conversation(conn, &s.id).unwrap();
+                let msgs: Vec<String> = c
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        let files = m.attached_files.as_ref().map_or(0, Vec::len);
+                        let files = if files > 0 { format!("(+{files})") } else { String::new() };
+                        format!("{}:{}{files}", m.role.as_str(), m.content)
+                    })
+                    .collect();
+                format!("{}[{}]", c.title, msgs.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn append_turn_cases() {
+        enum Target {
+            New,
+            Existing,
+            Unknown,
+        }
+        let file = AttachedFile {
+            id: "f1".into(),
+            name: "a.png".into(),
+            mime: "image/png".into(),
+            base64: "AAAA".into(),
+            size: 4,
+        };
+        let turn = |user: &str, files: Vec<AttachedFile>, assistant: &str| NewTurn {
+            user: user.into(),
+            attached_files: files,
+            assistant: assistant.into(),
+        };
+        let cases = [
+            ("new", Target::New, false, turn(" hi ", vec![file.clone()], "yo"), true, "hi[user: hi (+1), assistant:yo] x[]"),
+            ("existing", Target::Existing, false, turn("hi", vec![], "yo"), true, "x[user:hi, assistant:yo]"),
+            ("unknown id", Target::Unknown, false, turn("hi", vec![], "yo"), false, "x[]"),
+            ("new + sabotage", Target::New, true, turn("hi", vec![], "yo"), false, "x[]"),
+            ("existing + sabotage", Target::Existing, true, turn("hi", vec![], "yo"), false, "x[]"),
+            ("empty assistant", Target::Existing, false, turn("hi", vec![], "  "), false, "x[]"),
+        ];
+        for (name, target, sabotage, turn, expect_ok, expect_dump) in cases {
+            let mut conn = fresh();
+            let x = start_conversation(&conn, "x").unwrap();
+            if sabotage {
+                conn.execute_batch(
+                    "CREATE TEMP TRIGGER s BEFORE INSERT ON messages WHEN NEW.role='assistant' \
+                     BEGIN SELECT RAISE(ABORT,'s'); END;",
+                )
+                .unwrap();
+            }
+            let id = match target {
+                Target::New => None,
+                Target::Existing => Some(x.id.as_str()),
+                Target::Unknown => Some("no-such-id"),
+            };
+            let r = append_turn(&mut conn, id, turn);
+            assert_eq!(r.is_ok(), expect_ok, "{name}: {r:?}");
+            assert_eq!(dump(&conn), expect_dump, "{name}");
+        }
     }
 
     #[test]

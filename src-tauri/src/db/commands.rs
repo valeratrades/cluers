@@ -2,7 +2,8 @@ use tauri::State;
 
 use super::queries;
 use super::schema::{
-    AppendedMessage, Conversation, ConversationId, ConversationSummary, NewMessage, SystemPrompt,
+    AppendedMessage, AppendedTurn, Conversation, ConversationId, ConversationSummary, NewMessage,
+    NewTurn, SystemPrompt,
 };
 use super::{Db, DbError};
 
@@ -38,6 +39,15 @@ pub async fn append_message(
     message: NewMessage,
 ) -> Result<AppendedMessage, DbError> {
     db.with_conn(move |c| queries::append_message(c, &conversation_id, &message)).await
+}
+
+#[tauri::command]
+pub async fn append_turn(
+    db: State<'_, Db>,
+    conversation_id: Option<String>,
+    turn: NewTurn,
+) -> Result<AppendedTurn, DbError> {
+    db.with_conn(move |c| queries::append_turn(c, conversation_id.as_deref(), turn)).await
 }
 
 #[tauri::command]
