@@ -40,6 +40,12 @@ fn js_log(msg: String) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    if let Err(e) = shortcuts::cli_action(&std::env::args().collect::<Vec<_>>()) {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
+
     // Without a subscriber every tracing::error!/warn! in the codebase is
     // silently dropped. RUST_LOG overrides the default level.
     tracing_subscriber::fmt()
@@ -51,7 +57,12 @@ pub fn run() {
 
     // Get PostHog API key
     let posthog_api_key = option_env!("POSTHOG_API_KEY").unwrap_or("").to_string();
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "linux")]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _| {
+        shortcuts::run_cli_action(app, &argv)
+    }));
+    let builder = builder
         .manage(AudioState::default())
         .manage(CaptureState::default())
         .manage(llm::LlmState::new())
@@ -173,7 +184,7 @@ pub fn run() {
                 .expect("Failed to initialize global shortcut plugin");
             #[cfg(target_os = "linux")]
             if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-                tracing::warn!("global shortcuts use X11 key grabs; under Wayland they fire only while an XWayland window has focus");
+                tracing::warn!("global shortcuts use X11 key grabs and fire under Wayland only while an XWayland window has focus; bind `pluely --action <action_id>` in your compositor config instead");
             }
             Ok(())
         });
