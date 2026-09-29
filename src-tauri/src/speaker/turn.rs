@@ -1,6 +1,6 @@
 //! Pure turn machine: segments, transcripts and replies in; LLM asks and UI events out. No IO, no clocks.
 //! Spec: `tests/turn.rs`.
-use super::vad::VadConfig;
+use super::vad::{VadConfig, HOP_MS};
 use crate::db::schema::Role;
 use crate::llm::provider::HistoryMessage;
 use serde::Serialize;
@@ -103,7 +103,6 @@ pub struct Turns {
 
 impl Turns {
     pub fn new(history: Vec<HistoryMessage>, carry: String, vad: &VadConfig) -> Self {
-        let hop = vad.hop_ms as u64;
         Self {
             history,
             carry,
@@ -115,8 +114,12 @@ impl Turns {
             user: None,
             backchannels: BTreeSet::new(),
             now_ms: 0,
-            mic_hold_ms: (vad.silence_ms as u64).div_ceil(hop) * hop + hop, // a mic run with no speech after t has ended by t + this
+            mic_hold_ms: mic_hold_ms(vad),
         }
+    }
+
+    pub fn reconfigure(&mut self, vad: &VadConfig) {
+        self.mic_hold_ms = mic_hold_ms(vad);
     }
 
     pub fn push(&mut self, input: Input) -> Vec<Output> {
@@ -345,4 +348,10 @@ impl Turns {
             out.push(Output::Event(TurnEvent::Asked { message }));
         }
     }
+}
+
+/// A mic run with no speech after t has ended by t + this.
+fn mic_hold_ms(vad: &VadConfig) -> u64 {
+    let hop = HOP_MS as u64;
+    (vad.silence_ms as u64).div_ceil(hop) * hop + hop
 }

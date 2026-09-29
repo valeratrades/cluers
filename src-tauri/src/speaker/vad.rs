@@ -5,7 +5,6 @@ use std::collections::VecDeque;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VadConfig {
     pub enabled: bool,
-    pub hop_ms: u32,
     pub sensitivity_rms: f32,
     pub peak_threshold: f32,
     pub silence_ms: u32,
@@ -20,7 +19,6 @@ impl Default for VadConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            hop_ms: 20,
             sensitivity_rms: 0.012,
             peak_threshold: 0.035,
             silence_ms: 1000,
@@ -35,13 +33,10 @@ impl Default for VadConfig {
 
 impl VadConfig {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if !(1..=100).contains(&self.hop_ms) {
-            return Err(format!("Invalid hop_ms {}: must be 1-100", self.hop_ms));
-        }
-        if self.silence_ms < self.hop_ms {
+        if self.silence_ms < HOP_MS {
             return Err(format!(
-                "Invalid silence_ms {}: must be >= hop_ms ({})",
-                self.silence_ms, self.hop_ms
+                "Invalid silence_ms {}: must be >= {HOP_MS}",
+                self.silence_ms
             ));
         }
         if self.max_segment_ms <= self.silence_ms {
@@ -50,8 +45,23 @@ impl VadConfig {
                 self.max_segment_ms, self.silence_ms
             ));
         }
-        if self.max_recording_duration_secs > 3600 {
-            return Err("Invalid max_recording_duration_secs: must be <= 3600 (1 hour)".into());
+        if self.min_speech_ms >= self.max_segment_ms {
+            return Err(format!(
+                "Invalid min_speech_ms {}: must be < max_segment_ms ({})",
+                self.min_speech_ms, self.max_segment_ms
+            ));
+        }
+        if self.pre_speech_ms > 10_000 {
+            return Err(format!(
+                "Invalid pre_speech_ms {}: must be <= 10000",
+                self.pre_speech_ms
+            ));
+        }
+        if !(1..=3600).contains(&self.max_recording_duration_secs) {
+            return Err(format!(
+                "Invalid max_recording_duration_secs {}: must be 1-3600",
+                self.max_recording_duration_secs
+            ));
         }
         for (name, v) in [
             ("sensitivity_rms", self.sensitivity_rms),
@@ -88,6 +98,7 @@ pub enum VadEvent {
     },
 }
 
+pub const HOP_MS: u32 = 20;
 const TAIL_MS: u32 = 150;
 const METRICS_MS: u32 = 100;
 const MIN_RUN_MS: u32 = 60; // shorter loud bursts (clicks) never count as speech
@@ -137,9 +148,9 @@ impl Segmenter {
                 "Invalid sample rate: {sample_rate}. Expected 8000-96000 Hz"
             ));
         }
-        let hops = |ms: u32| ms.div_ceil(config.hop_ms);
-        let hop_len = (sample_rate as u64 * config.hop_ms as u64 / 1000) as usize;
-        assert!(hop_len > 0, "sr >= 8000 and hop_ms >= 1 give >= 8 samples");
+        let hops = |ms: u32| ms.div_ceil(HOP_MS);
+        let hop_len = (sample_rate as u64 * HOP_MS as u64 / 1000) as usize;
+        assert!(hop_len > 0, "sr >= 8000 gives >= 160 samples");
         Ok(Self {
             sr: sample_rate,
             hop_len,
@@ -162,6 +173,22 @@ impl Segmenter {
             run: 0,
             active: None,
         })
+    }
+
+    /// Applies `config` to the live stream; the open segment, pre-roll and noise floor carry over.
+    pub fn reconfigure(&mut self, config: &VadConfig) -> Result<(), String> {
+        let fresh = Self::new(config, self.sr)?;
+        *self = Self {
+            pending: std::mem::take(&mut self.pending),
+            samples_seen: self.samples_seen,
+            hops_seen: self.hops_seen,
+            pre_roll: std::mem::take(&mut self.pre_roll),
+            floor: std::mem::take(&mut self.floor),
+            run: self.run,
+            active: self.active.take(),
+            ..fresh
+        };
+        Ok(())
     }
 
     pub fn push(&mut self, samples: &[f32]) -> Vec<VadEvent> {
