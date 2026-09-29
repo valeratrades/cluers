@@ -53,11 +53,11 @@ export interface UseCompletionReturn {
   /** Direct state setter for advanced use cases */
   setState: Dispatch<SetStateAction<any>>;
 
-  // Voice Activity Detection (VAD) and microphone
-  /** Whether Voice Activity Detection is enabled */
-  enableVAD: boolean;
-  /** Function to toggle VAD state */
-  setEnableVAD: Dispatch<SetStateAction<boolean>>;
+  // Push-to-talk microphone
+  /** Whether push-to-talk is recording */
+  isRecording: boolean;
+  /** Function to toggle push-to-talk */
+  setIsRecording: Dispatch<SetStateAction<boolean>>;
   /** Whether microphone is currently open/active */
   micOpen: boolean;
   /** Function to control microphone state */
