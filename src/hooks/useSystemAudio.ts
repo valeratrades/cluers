@@ -261,6 +261,7 @@ export function useSystemAudio() {
     let errorUnlisten: (() => void) | undefined;
     let discardedUnlisten: (() => void) | undefined;
     let metricsUnlisten: (() => void) | undefined;
+    let captureErrorUnlisten: (() => void) | undefined;
 
     const setupContinuousListeners = async () => {
       try {
@@ -312,6 +313,19 @@ export function useSystemAudio() {
         metricsUnlisten = await listen("vad-metrics", (event) => {
           setVadMetrics(event.payload as VadMetrics);
         });
+
+        // Backend already reset its capture state; mirror it here.
+        captureErrorUnlisten = await listen<string>("capture-error", (event) => {
+          setError(`System audio capture stopped: ${event.payload}`);
+          setCapturing(false);
+          setIsProcessing(false);
+          setIsAIProcessing(false);
+          setIsContinuousMode(false);
+          setIsRecordingInContinuousMode(false);
+          setRecordingProgress(0);
+          setVadMetrics(null);
+          setIsPopoverOpen(true);
+        });
       } catch (err) {
         console.error("Failed to setup continuous recording listeners:", err);
       }
@@ -326,6 +340,7 @@ export function useSystemAudio() {
       if (errorUnlisten) errorUnlisten();
       if (discardedUnlisten) discardedUnlisten();
       if (metricsUnlisten) metricsUnlisten();
+      if (captureErrorUnlisten) captureErrorUnlisten();
       if (discardedTimeoutRef.current) {
         clearTimeout(discardedTimeoutRef.current);
       }
