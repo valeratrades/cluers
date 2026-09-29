@@ -59,6 +59,7 @@ interface SettingsPanelProps {
   // VAD Config
   vadConfig: VadConfig;
   onUpdateVadConfig: (config: VadConfig) => void;
+  onResetVadConfig: () => void;
   // Calibration
   onCalibrate: (durationSecs?: number) => Promise<void> | void;
   isCalibrating: boolean;
@@ -74,6 +75,7 @@ interface SettingsPanelProps {
 export const SettingsPanel = ({
   vadConfig,
   onUpdateVadConfig,
+  onResetVadConfig,
   onCalibrate,
   isCalibrating,
   calibrationError,
@@ -118,22 +120,6 @@ export const SettingsPanel = ({
       setContextContent(template.prompt);
       setSelectedTemplate("");
     }
-  };
-
-  const handleResetDefaults = () => {
-    const defaultConfig: VadConfig = {
-      enabled: vadConfig.enabled, // Keep current mode
-      hop_ms: 20,
-      sensitivity_rms: 0.012,
-      peak_threshold: 0.035,
-      silence_ms: 1000,
-      min_speech_ms: 160,
-      pre_speech_ms: 300,
-      max_segment_ms: 30000,
-      noise_gate_threshold: 0.003,
-      max_recording_duration_secs: 180,
-    };
-    onUpdateVadConfig(defaultConfig);
   };
 
   return (
@@ -456,7 +442,7 @@ export const SettingsPanel = ({
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={handleResetDefaults}
+                  onClick={onResetVadConfig}
                   className="w-full text-xs"
                 >
                   <RotateCcwIcon className="w-3 h-3 mr-1.5" />

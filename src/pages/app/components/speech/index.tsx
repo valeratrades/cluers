@@ -59,6 +59,7 @@ export const SystemAudio = (props: useSystemAudioType) => {
     handleQuickActionClick,
     vadConfig,
     updateVadConfiguration,
+    resetVadConfig,
     isRecordingInContinuousMode,
     recordingProgress,
     manualStopAndSend,
@@ -79,9 +80,6 @@ export const SystemAudio = (props: useSystemAudioType) => {
   // View mode toggle
   const [conversationMode, setConversationMode] = useState(false);
 
-  const isVadMode = vadConfig.enabled;
-  const hasResponse = lastAIResponse || isAIProcessing;
-
   // Keyboard shortcut for Cmd+K to toggle view mode
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -97,6 +95,10 @@ export const SystemAudio = (props: useSystemAudioType) => {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isPopoverOpen]);
+
+  if (!vadConfig) return null;
+  const isVadMode = vadConfig.enabled;
+  const hasResponse = lastAIResponse || isAIProcessing;
 
   const handleToggleCapture = async () => {
     if (capturing) {
@@ -283,7 +285,7 @@ export const SystemAudio = (props: useSystemAudioType) => {
                       <div className="flex items-start gap-1.5 p-2.5 rounded-lg bg-amber-50 border border-amber-200">
                         <AlertTriangleIcon className="w-3.5 h-3.5 text-amber-500 mt-0.5 flex-shrink-0" />
                         <p className="text-[10px] text-amber-700 leading-snug">
-                          Recording discarded: {discardedNotice}
+                          Recording: {discardedNotice}
                         </p>
                       </div>
                     )}
@@ -314,6 +316,7 @@ export const SystemAudio = (props: useSystemAudioType) => {
                     <SettingsPanel
                       vadConfig={vadConfig}
                       onUpdateVadConfig={updateVadConfiguration}
+                      onResetVadConfig={resetVadConfig}
                       onCalibrate={calibrateVad}
                       isCalibrating={isCalibrating}
                       calibrationError={calibrationError}
