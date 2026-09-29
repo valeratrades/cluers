@@ -118,8 +118,3 @@ export interface UseCompletionReturn {
   /** Whether a screenshot is currently loading */
   isScreenshotLoading: boolean;
 }
-
-/**
- * Type for the useCompletion hook function signature
- */
-export type UseCompletionHook = () => UseCompletionReturn;

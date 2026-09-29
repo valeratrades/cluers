@@ -1,4 +1,4 @@
-export interface PromptTemplate {
+interface PromptTemplate {
   id: string;
   name: string;
   prompt: string;
@@ -129,11 +129,4 @@ export const getPromptTemplateById = (
   id: string
 ): PromptTemplate | undefined => {
   return PROMPT_TEMPLATES.find((template) => template.id === id);
-};
-
-export const getPromptTemplateNames = (): { id: string; name: string }[] => {
-  return PROMPT_TEMPLATES.map((template) => ({
-    id: template.id,
-    name: template.name,
-  }));
 };

@@ -141,7 +141,7 @@ fn tokenize(input: &str) -> Result<Vec<String>, LlmError> {
     Ok(out)
 }
 
-pub fn extract_variables(template: &str) -> Vec<String> {
+fn extract_variables(template: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut rest = template;
     while let Some(start) = rest.find("{{") {
@@ -207,7 +207,7 @@ pub fn substitute_value(value: &mut serde_json::Value, vars: &HashMap<String, St
 /// template message with the actual user turn (text + attachments) and
 /// inserting `history` before it. `messages_key` is auto-detected from
 /// `{messages, contents, conversation, history}`.
-pub fn build_messages(
+fn build_messages(
     body: &mut serde_json::Value,
     history: &[HistoryMessage],
     user_message: &str,

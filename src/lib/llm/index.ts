@@ -44,7 +44,7 @@ export function buildEnhancedSystemPrompt(baseSystemPrompt?: string): string {
   return prompts.join(" ");
 }
 
-export interface ProviderInput {
+interface ProviderInput {
   id: string;
   curl: string;
   responseContentPath: string;
@@ -90,7 +90,7 @@ export async function resolveProviderInput(
   };
 }
 
-export interface HistoryMessage {
+interface HistoryMessage {
   role: "user" | "assistant" | "system";
   content: string;
 }

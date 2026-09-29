@@ -37,7 +37,7 @@ pub fn get_api_access_key() -> Result<String, String> {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ModelsResponse {
+struct ModelsResponse {
     models: Vec<Model>,
 }
 
@@ -48,7 +48,7 @@ pub struct SystemPromptResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct PluelyPrompt {
+struct PluelyPrompt {
     title: String,
     prompt: String,
     #[serde(rename = "modelId")]

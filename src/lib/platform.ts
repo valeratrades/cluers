@@ -23,11 +23,6 @@ export const getPlatform = (): "macos" | "windows" | "linux" => {
 export const isMacOS = (): boolean => getPlatform() === "macos";
 
 /**
- * Check if current platform is Windows
- */
-export const isWindows = (): boolean => getPlatform() === "windows";
-
-/**
  * Check if current platform is Linux
  */
 export const isLinux = (): boolean => getPlatform() === "linux";
