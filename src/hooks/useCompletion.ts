@@ -51,7 +51,7 @@ export const useCompletion = () => {
     conversationHistory: [],
   });
   const [micOpen, setMicOpen] = useState(false);
-  const [enableVAD, setEnableVAD] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
   const [messageHistoryOpen, setMessageHistoryOpen] = useState(false);
   const [keepEngaged, setKeepEngaged] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -384,9 +384,9 @@ export const useCompletion = () => {
   }, [isPopoverOpen]);
 
   const toggleRecording = useCallback(() => {
-    setEnableVAD(!enableVAD);
+    setIsRecording(!isRecording);
     setMicOpen(!micOpen);
-  }, [enableVAD, micOpen]);
+  }, [isRecording, micOpen]);
 
   // register callbacks for global shortcuts
   useEffect(() => {
@@ -417,8 +417,8 @@ export const useCompletion = () => {
     cancel,
     reset,
     setState,
-    enableVAD,
-    setEnableVAD,
+    isRecording,
+    setIsRecording,
     micOpen,
     setMicOpen,
     currentConversationId: state.currentConversationId,

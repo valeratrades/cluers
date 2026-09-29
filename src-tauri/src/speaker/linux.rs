@@ -97,6 +97,18 @@ impl SpeakerInput {
             Some(id) if !id.is_empty() && id != "default" => format!("{id}.monitor"),
             _ => "@DEFAULT_MONITOR@".to_owned(),
         };
+        Self::open(source, "System Audio Capture")
+    }
+
+    pub fn microphone(device_id: Option<String>) -> Result<Self> {
+        let source = match device_id {
+            Some(id) if !id.is_empty() && id != "default" => id,
+            _ => "@DEFAULT_SOURCE@".to_owned(),
+        };
+        Self::open(source, "Microphone Capture")
+    }
+
+    fn open(source: String, stream_name: &str) -> Result<Self> {
         // PipeWire-pulse silently records from the default source when the target is missing.
         let mut pulse = Pulse::connect()?;
         let found = Rc::new(Cell::new(false));
@@ -132,7 +144,7 @@ impl SpeakerInput {
             "pluely",
             Direction::Record,
             Some(&source),
-            "System Audio Capture",
+            stream_name,
             &spec,
             None,
             Some(&attr),
@@ -402,8 +414,26 @@ mod tests {
     }
 
     #[test]
-    fn new_errors_for_missing_device() {
-        assert!(SpeakerInput::new_with_device(Some("cluers-no-such-sink".into())).is_err());
+    fn constructors_error_for_missing_device() {
+        let missing = || Some("cluers-no-such-device".to_owned());
+        for (name, opened) in [
+            ("monitor", SpeakerInput::new_with_device(missing()).is_ok()),
+            ("microphone", SpeakerInput::microphone(missing()).is_ok()),
+        ] {
+            assert!(!opened, "{name} opened a missing device");
+        }
+    }
+
+    #[tokio::test]
+    async fn microphone_delivers_samples_from_named_source() {
+        let sink = NullSink::new();
+        let mut stream = SpeakerInput::microphone(Some(sink.monitor()))
+            .unwrap()
+            .stream();
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("capture delivers samples")
+            .expect("stream alive");
     }
 
     #[test]

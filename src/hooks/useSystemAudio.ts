@@ -481,6 +481,10 @@ export function useSystemAudio() {
           selectedAudioDevices.output.id !== "default"
             ? selectedAudioDevices.output.id
             : null,
+        micDeviceId:
+          selectedAudioDevices.input.id !== "default"
+            ? selectedAudioDevices.input.id
+            : null,
         session: {
           config: await buildSessionConfig(),
           history: conversationRef.current.messages.map(({ role, content }) => ({
@@ -492,7 +496,11 @@ export function useSystemAudio() {
         events,
       });
     },
-    [buildSessionConfig, selectedAudioDevices.output.id]
+    [
+      buildSessionConfig,
+      selectedAudioDevices.output.id,
+      selectedAudioDevices.input.id,
+    ]
   );
 
   // Continuous mode only has a backend while recording (and answering it).

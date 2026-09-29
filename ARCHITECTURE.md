@@ -162,6 +162,24 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
   and the audio clock in; asks and `TurnEvent`s out). It decides when a turn
   closes, joins its fragments chronologically, carries SKIPped text into the
   next ask and orders history. The spec is `tests/turn.rs`.
+- The mic is captured through Pulse (`@DEFAULT_SOURCE@` or a named source),
+  next to the monitor. VAD mode requires it; there is no cpal. Continuous
+  mode records system audio only.
+- Both channels go through their own `Segmenter` in lockstep on one sample
+  clock (the system sample count); interviewer events are fed first. A
+  device that stops delivering for 2s while the other keeps going ends the
+  capture with a `capture-error` naming it.
+- `turn.rs` attributes speakers:
+  - the interviewer's turn closes on `TURN_GAP_MS` silence, or when the user
+    has mic speech after the echo tail (`BLEED_TAIL_MS` past the
+    interviewer's last speech end);
+  - user speech is never transcribed or asked;
+  - interviewer segments shorter than `BACKCHANNEL_MS` are dropped while the
+    user holds the floor;
+  - echo is judged by timing against the system reference, not by AEC, so
+    the user barging in mid-question still waits for `TURN_GAP_MS`.
+- The attribution spec is the `tests/turn.rs` scenes, assembled from the
+  `pauses` fixture (no extra WAVs).
 - The capture task (`drive`) owns every STT and LLM future: one answer at a
   time, FIFO, never cancelled by a newer turn. Stopping the capture drops
   them all. Events reach the renderer over the `Channel<TurnEvent>` passed
