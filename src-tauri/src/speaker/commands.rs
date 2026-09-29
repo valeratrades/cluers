@@ -108,10 +108,17 @@ pub async fn start_system_audio_capture(
                 .clone();
 
             Ok(async move {
+                let mut stream = stream;
                 if vad_config.enabled {
-                    run_vad_capture(app_clone, stream, sr, vad_config).await;
+                    run_vad_capture(app_clone.clone(), &mut stream, sr, vad_config).await;
                 } else {
-                    run_continuous_capture(app_clone, stream, sr, vad_config).await;
+                    run_continuous_capture(app_clone.clone(), &mut stream, sr, vad_config).await;
+                }
+                if let Some(e) = stream.error() {
+                    error!("System audio capture ended: {e:#}");
+                    if let Err(emit_err) = app_clone.emit("capture-error", format!("{e:#}")) {
+                        error!("Failed to emit capture-error: {}", emit_err);
+                    }
                 }
             })
         })
@@ -589,7 +596,7 @@ pub fn check_system_audio_access(_app: AppHandle) -> Result<bool, String> {
         Ok(_) => Ok(true),
         Err(e) => {
             error!("System audio access check failed: {}", e);
-            Ok(false)
+            Ok(false) // IPC contract is a bool; the cause is only logged
         }
     }
 }
@@ -619,18 +626,16 @@ pub async fn request_system_audio_access(app: AppHandle) -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
-        let commands = ["pavucontrol", "gnome-control-center sound"];
-        let mut opened = false;
-
-        for cmd in &commands {
-            if app.shell().command(cmd).spawn().is_ok() {
-                opened = true;
-                break;
-            }
-        }
-
-        if !opened {
-            warn!("Failed to open audio settings on Linux");
+        let commands: [(&str, &[&str]); 2] =
+            [("pavucontrol", &[]), ("gnome-control-center", &["sound"])];
+        // A failed spawn only means that app isn't installed; try the next one.
+        if !commands
+            .iter()
+            .any(|(cmd, args)| app.shell().command(cmd).args(*args).spawn().is_ok())
+        {
+            return Err(
+                "No audio settings app found (tried pavucontrol, gnome-control-center)".into(),
+            );
         }
     }
 
