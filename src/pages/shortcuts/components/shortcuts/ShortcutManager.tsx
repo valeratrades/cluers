@@ -2,7 +2,6 @@ import { useState, useEffect } from "react";
 import { Button, Card, Switch } from "@/components";
 import { RotateCcw, AlertCircle, Keyboard } from "lucide-react";
 import {
-  getAllShortcutActions,
   getShortcutsConfig,
   updateShortcutBinding,
   resetShortcutsToDefaults,
@@ -10,12 +9,12 @@ import {
   formatShortcutKeyForDisplay,
   getPlatformDefaultKey,
 } from "@/lib";
-import { ShortcutAction, ShortcutBinding } from "@/types";
+import { ShortcutBinding } from "@/types";
+import { DEFAULT_SHORTCUT_ACTIONS } from "@/config";
 import { invoke } from "@tauri-apps/api/core";
 import { ShortcutRecorder } from "./ShortcutRecorder";
 
 export const ShortcutManager = () => {
-  const [actions, setActions] = useState<ShortcutAction[]>([]);
   const [bindings, setBindings] = useState<Record<string, ShortcutBinding>>({});
   const [editingAction, setEditingAction] = useState<string | null>(null);
   const [conflicts, setConflicts] = useState<string[]>([]);
@@ -26,10 +25,11 @@ export const ShortcutManager = () => {
   }, []);
 
   const loadShortcuts = () => {
-    const config = getShortcutsConfig();
-    const allActions = getAllShortcutActions(true);
-    setActions(allActions);
-    setBindings(config.bindings);
+    try {
+      setBindings(getShortcutsConfig().bindings);
+    } catch (error) {
+      setConflicts([`Stored shortcuts are unreadable (${error}). Reset to recover.`]);
+    }
   };
 
   const handleToggleEnabled = async (actionId: string, enabled: boolean) => {
@@ -53,7 +53,7 @@ export const ShortcutManager = () => {
     if (conflict) {
       setConflicts([
         `Shortcut "${key}" is already used by: ${conflict.actions
-          .map((id) => actions.find((a) => a.id === id)?.name)
+          .map((id) => DEFAULT_SHORTCUT_ACTIONS.find((a) => a.id === id)?.name)
           .join(", ")}`,
       ]);
       return;
@@ -126,7 +126,7 @@ export const ShortcutManager = () => {
             Keyboard Shortcuts
           </h3>
           <p className="text-sm text-muted-foreground">
-            {actions.length} shortcut{actions.length !== 1 ? "s" : ""}{" "}
+            {DEFAULT_SHORTCUT_ACTIONS.length} shortcut{DEFAULT_SHORTCUT_ACTIONS.length !== 1 ? "s" : ""}{" "}
             configured
           </p>
         </div>
@@ -162,7 +162,7 @@ export const ShortcutManager = () => {
 
       {/* Flat Shortcuts List */}
       <div className="space-y-3">
-        {actions.map((action) => {
+        {DEFAULT_SHORTCUT_ACTIONS.map((action) => {
           const binding = bindings[action.id] || {
             action: action.id,
             key: getPlatformDefaultKey(action),

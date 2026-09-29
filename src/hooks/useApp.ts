@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useTitles, useSystemAudio } from "@/hooks";
+import { useTitles, useSystemAudio, useGlobalShortcutListeners } from "@/hooks";
 import { listen } from "@tauri-apps/api/event";
 import { getShortcutsConfig } from "@/lib/storage";
 import { invoke } from "@tauri-apps/api/core";
@@ -10,18 +10,18 @@ export const useApp = () => {
   // Initialize title management
   useTitles();
 
-  // Initialize shortcuts from localStorage on app startup
-  useEffect(() => {
-    const initializeShortcuts = async () => {
-      try {
-        const config = getShortcutsConfig();
-        await invoke("update_shortcuts", { config });
-      } catch (error) {
-        console.error("Failed to initialize shortcuts:", error);
-      }
-    };
+  const [shortcutError, setShortcutError] = useState<string | null>(null);
+  useGlobalShortcutListeners();
 
-    initializeShortcuts();
+  useEffect(() => {
+    (async () => {
+      try {
+        await invoke("update_shortcuts", { config: getShortcutsConfig() });
+      } catch (error) {
+        setShortcutError(`${error}`);
+        await invoke("js_log", { msg: `shortcut init failed: ${error}` });
+      }
+    })();
   }, []);
 
   const handleSelectConversation = (conversation: any) => {
@@ -71,51 +71,10 @@ export const useApp = () => {
     };
   }, []);
 
-  useEffect(() => {
-    const handleShortcutRegistrationError = (
-      event: Event | CustomEvent<Array<[string, string, string]>>
-    ) => {
-      const detail =
-        (event as CustomEvent<Array<[string, string, string]>>)?.detail ?? [];
-
-      if (!detail.length) {
-        return;
-      }
-
-      const formatted = detail
-        .map(([action, key, error]) => ({ action, key, error }))
-        .filter(({ action, key }) => action && key);
-
-      if (!formatted.length) {
-        return;
-      }
-
-      console.warn(
-        "Some shortcuts could not be registered:",
-        formatted.map(({ action, key, error }) => ({
-          action,
-          key,
-          error,
-        }))
-      );
-    };
-
-    window.addEventListener(
-      "shortcutRegistrationError",
-      handleShortcutRegistrationError as EventListener
-    );
-
-    return () => {
-      window.removeEventListener(
-        "shortcutRegistrationError",
-        handleShortcutRegistrationError as EventListener
-      );
-    };
-  }, []);
-
   return {
     isHidden,
     setIsHidden,
+    shortcutError,
     handleSelectConversation,
     handleNewConversation,
     systemAudio,
