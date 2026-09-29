@@ -1,4 +1,3 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod api;
 mod capture;
 mod db;
@@ -62,13 +61,14 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _| {
         shortcuts::run_cli_action(app, &argv)
     }));
+    #[cfg(target_os = "windows")]
+    let builder = builder.manage(shortcuts::WindowVisibility {
+        is_hidden: Mutex::new(false),
+    });
     let builder = builder
         .manage(AudioState::default())
         .manage(CaptureState::default())
         .manage(llm::LlmState::new())
-        .manage(shortcuts::WindowVisibility {
-            is_hidden: Mutex::new(false),
-        })
         .manage(shortcuts::MoveWindowState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -98,7 +98,6 @@ pub fn run() {
             js_log,
             window::set_window_height,
             window::open_dashboard,
-            window::move_window,
             capture::capture_to_base64,
             capture::start_screen_capture,
             capture::capture_selected_area,
@@ -123,10 +122,7 @@ pub fn run() {
             llm::commands::pluely_selected_model_set,
             db::commands::list_conversation_summaries,
             db::commands::load_conversation,
-            db::commands::start_conversation,
-            db::commands::append_message,
             db::commands::append_turn,
-            db::commands::rename_conversation,
             db::commands::delete_conversation,
             db::commands::delete_all_conversations,
             db::commands::list_system_prompts,

@@ -11,9 +11,8 @@ use tokio::time::{sleep, Duration};
 #[cfg(target_os = "macos")]
 use tauri_nspanel::ManagerExt;
 
-// State for window visibility
+#[cfg(target_os = "windows")]
 pub struct WindowVisibility {
-    #[allow(dead_code)]
     pub is_hidden: Mutex<bool>,
 }
 
