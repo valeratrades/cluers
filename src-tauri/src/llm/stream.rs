@@ -5,10 +5,8 @@
 //! the final newline, so a pending event is flushed at EOF. Bytes are decoded
 //! only as complete JSON payloads; invalid UTF-8 or malformed JSON is an error.
 
-use crate::llm::{LlmError, StreamEvent};
+use crate::llm::LlmError;
 use futures_util::StreamExt;
-use tauri::ipc::Channel;
-use tokio::sync::oneshot;
 
 pub struct StreamOutcome {
     pub full_response: String,
@@ -17,8 +15,7 @@ pub struct StreamOutcome {
 
 pub async fn stream_sse(
     response: reqwest::Response,
-    channel: &Channel<StreamEvent>,
-    cancel_rx: &mut oneshot::Receiver<()>,
+    on_delta: &mut impl FnMut(String) -> Result<(), LlmError>,
     extract_delta: impl Fn(&serde_json::Value) -> Option<String>,
 ) -> Result<StreamOutcome, LlmError> {
     let mut full_response = String::new();
@@ -27,45 +24,34 @@ pub async fn stream_sse(
     let mut data: Option<Vec<u8>> = None;
     let mut stream = response.bytes_stream();
 
-    loop {
-        let next = tokio::select! {
-            biased;
-            _ = &mut *cancel_rx => return Err(LlmError::Cancelled),
-            n = stream.next() => n,
-        };
-        match next {
-            None => break,
-            Some(Err(e)) => return Err(LlmError::Reqwest(e)),
-            Some(Ok(bytes)) => {
-                buf.extend_from_slice(&bytes);
-                let mut start = 0;
-                while let Some(i) = buf[start..].iter().position(|&b| b == b'\n') {
-                    process_line(
-                        &buf[start..start + i],
-                        &mut data,
-                        channel,
-                        &extract_delta,
-                        &mut full_response,
-                        &mut usage,
-                    )?;
-                    start += i + 1;
-                }
-                buf.drain(..start);
-            }
+    while let Some(bytes) = stream.next().await {
+        buf.extend_from_slice(&bytes?);
+        let mut start = 0;
+        while let Some(i) = buf[start..].iter().position(|&b| b == b'\n') {
+            process_line(
+                &buf[start..start + i],
+                &mut data,
+                on_delta,
+                &extract_delta,
+                &mut full_response,
+                &mut usage,
+            )?;
+            start += i + 1;
         }
+        buf.drain(..start);
     }
     if !buf.is_empty() {
         process_line(
             &buf,
             &mut data,
-            channel,
+            on_delta,
             &extract_delta,
             &mut full_response,
             &mut usage,
         )?;
     }
     if let Some(d) = data {
-        dispatch(&d, channel, &extract_delta, &mut full_response, &mut usage)?;
+        dispatch(&d, on_delta, &extract_delta, &mut full_response, &mut usage)?;
     }
 
     Ok(StreamOutcome {
@@ -77,7 +63,7 @@ pub async fn stream_sse(
 fn process_line(
     line: &[u8],
     data: &mut Option<Vec<u8>>,
-    channel: &Channel<StreamEvent>,
+    on_delta: &mut impl FnMut(String) -> Result<(), LlmError>,
     extract_delta: &impl Fn(&serde_json::Value) -> Option<String>,
     full_response: &mut String,
     usage: &mut Option<serde_json::Value>,
@@ -85,7 +71,7 @@ fn process_line(
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.is_empty() {
         if let Some(d) = data.take() {
-            dispatch(&d, channel, extract_delta, full_response, usage)?;
+            dispatch(&d, on_delta, extract_delta, full_response, usage)?;
         }
     } else if let Some(value) = line.strip_prefix(b"data:") {
         let value = value.strip_prefix(b" ").unwrap_or(value);
@@ -102,7 +88,7 @@ fn process_line(
 
 fn dispatch(
     payload: &[u8],
-    channel: &Channel<StreamEvent>,
+    on_delta: &mut impl FnMut(String) -> Result<(), LlmError>,
     extract_delta: &impl Fn(&serde_json::Value) -> Option<String>,
     full_response: &mut String,
     usage: &mut Option<serde_json::Value>,
@@ -120,9 +106,7 @@ fn dispatch(
     if let Some(delta) = extract_delta(&parsed) {
         if !delta.is_empty() {
             full_response.push_str(&delta);
-            channel
-                .send(StreamEvent::Chunk { delta })
-                .map_err(|e| LlmError::Channel(e.to_string()))?;
+            on_delta(delta)?;
         }
     }
     Ok(())
@@ -187,30 +171,22 @@ pub fn extract_streaming_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use tauri::ipc::InvokeResponseBody;
 
     async fn run(chunks: Vec<Vec<u8>>) -> Result<(StreamOutcome, Vec<String>), LlmError> {
         let body = reqwest::Body::wrap_stream(futures_util::stream::iter(
             chunks.into_iter().map(Ok::<_, std::io::Error>),
         ));
         let response = reqwest::Response::from(tauri::http::Response::new(body));
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let sink = events.clone();
-        let channel = Channel::<StreamEvent>::new(move |body| {
-            match body {
-                InvokeResponseBody::Json(s) => sink.lock().unwrap().push(s),
-                InvokeResponseBody::Raw(_) => panic!("StreamEvent serializes to json"),
-            }
-            Ok(())
-        });
-        let (cancel_tx, mut cancel_rx) = oneshot::channel();
-        let outcome = stream_sse(response, &channel, &mut cancel_rx, |v| {
-            extract_by_path(v, "choices[0].delta.content")
-        })
+        let mut events = Vec::new();
+        let outcome = stream_sse(
+            response,
+            &mut |d| {
+                events.push(d);
+                Ok(())
+            },
+            |v| extract_by_path(v, "choices[0].delta.content"),
+        )
         .await;
-        drop(cancel_tx);
-        let events = events.lock().unwrap().clone();
         outcome.map(|o| (o, events))
     }
 

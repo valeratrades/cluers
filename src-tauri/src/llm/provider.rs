@@ -17,14 +17,12 @@
 
 use crate::db::schema::AttachedFile;
 use crate::llm::{
-    commands::{ProviderInput, StreamChatRequest},
+    commands::{Chat, ProviderInput},
     secrets::{ProviderKind, Secrets},
-    stream, LlmError, StreamEvent,
+    stream, LlmError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::ipc::Channel;
-use tokio::sync::oneshot;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -427,9 +425,8 @@ pub(crate) fn method(s: &str) -> Result<reqwest::Method, LlmError> {
 pub async fn stream_custom(
     http: &reqwest::Client,
     secrets: &Secrets,
-    request: StreamChatRequest,
-    channel: &Channel<StreamEvent>,
-    cancel_rx: &mut oneshot::Receiver<()>,
+    request: Chat,
+    on_delta: &mut impl FnMut(String) -> Result<(), LlmError>,
 ) -> Result<String, LlmError> {
     // An attachment the template has no slot for would be silently
     // dropped by `expand_one_array` — reject it up front instead, like
@@ -490,17 +487,12 @@ pub async fn stream_custom(
     }
     req_builder = req_builder.header("Content-Type", "application/json");
 
-    let send_fut = if method == reqwest::Method::GET {
+    let response = if method == reqwest::Method::GET {
         req_builder.send()
     } else {
         req_builder.json(&body).send()
-    };
-
-    let response = tokio::select! {
-        biased;
-        _ = &mut *cancel_rx => return Err(LlmError::Cancelled),
-        r = send_fut => r?,
-    };
+    }
+    .await?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -513,17 +505,13 @@ pub async fn stream_custom(
         let content =
             stream::extract_by_path(&json, &p.response_content_path).unwrap_or_default();
         if !content.is_empty() {
-            channel
-                .send(StreamEvent::Chunk {
-                    delta: content.clone(),
-                })
-                .map_err(|e| LlmError::Channel(e.to_string()))?;
+            on_delta(content.clone())?;
         }
         return Ok(content);
     }
 
     let path = p.response_content_path.clone();
-    let outcome = stream::stream_sse(response, channel, cancel_rx, move |parsed| {
+    let outcome = stream::stream_sse(response, on_delta, move |parsed| {
         stream::extract_streaming_delta(parsed, &path)
     })
     .await?;
