@@ -6,13 +6,7 @@ import {
   ChangeEvent,
   ClipboardEvent,
 } from "react";
-// import {
-//   AttachedFile,
-//   ChatMessage,
-//   ChatConversation,
-//   CompletionState,
-//   ScreenshotConfig,
-// } from "@/types";
+import { AttachedFile, ChatMessage, ScreenshotConfig } from "@/types";
 
 /**
  * Type definition for the useCompletion hook return value
@@ -39,7 +33,7 @@ export interface UseCompletionReturn {
 
   // File attachment management
   /** Array of currently attached files */
-  attachedFiles: any[];
+  attachedFiles: AttachedFile[];
   /** Function to add a file to attachments */
   addFile: (file: File) => Promise<void>;
   /** Function to remove a file by its ID */
@@ -73,7 +67,7 @@ export interface UseCompletionReturn {
   /** ID of the currently active conversation, null for new conversation */
   currentConversationId: string | null;
   /** Array of messages in the current conversation */
-  conversationHistory: any[];
+  conversationHistory: ChatMessage[];
   /** Function to start a new conversation (clears current state) */
   startNewConversation: () => void;
 
@@ -89,9 +83,9 @@ export interface UseCompletionReturn {
 
   // Screenshot functionality
   /** Current screenshot configuration settings */
-  screenshotConfiguration: any;
+  screenshotConfiguration: ScreenshotConfig;
   /** Function to update screenshot configuration */
-  setScreenshotConfiguration: Dispatch<SetStateAction<any>>;
+  setScreenshotConfiguration: Dispatch<SetStateAction<ScreenshotConfig>>;
   /** Function to handle screenshot submission with optional prompt */
   handleScreenshotSubmit: (base64: string, prompt?: string) => Promise<void>;
 

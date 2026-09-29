@@ -25,6 +25,7 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
   });
   const [cursorPosition, setCursorPosition] = useState({ x: 0, y: 0 });
   const [cursorVisible, setCursorVisible] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const selectionRef = useRef<HTMLDivElement>(null);
 
@@ -32,9 +33,9 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
   const handleCancel = async () => {
     setIsSelecting(false);
     try {
-      await invoke("close_overlay_window", { reason: "User cancelled" });
-    } catch {
-      // Error ignored
+      await invoke("close_overlay_window");
+    } catch (e) {
+      setError(`Failed to close overlay: ${e}`);
     }
   };
 
@@ -58,9 +59,8 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
         coords,
         monitorIndex,
       });
-    } catch {
-      // Error ignored
-      console.error("Error capturing selected area");
+    } catch (e) {
+      setError(`Capture failed: ${e}`);
     }
   };
 
@@ -171,8 +171,17 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
         {/* Instructions - Show on all monitors so users always see them */}
         <div className="fixed top-5 left-1/2 transform -translate-x-1/2 bg-black/70 text-white px-6 py-3 rounded-lg font-sans text-sm pointer-events-none z-[5000] shadow-2xl backdrop-blur-sm">
           <div className="flex items-center gap-2">
-            <span className="font-semibold">Screen Capture:</span>
-            <span>Click and drag to select area · Press ESC to cancel</span>
+            {error ? (
+              <>
+                <span className="text-red-400 font-semibold">{error}</span>
+                <span>Press ESC to close</span>
+              </>
+            ) : (
+              <>
+                <span className="font-semibold">Screen Capture:</span>
+                <span>Click and drag to select area · Press ESC to cancel</span>
+              </>
+            )}
           </div>
         </div>
 

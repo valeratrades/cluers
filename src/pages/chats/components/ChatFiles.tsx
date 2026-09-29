@@ -15,9 +15,10 @@ import {
 } from "lucide-react";
 import { MAX_FILES } from "@/config";
 import { useApp } from "@/contexts";
+import { AttachedFile } from "@/types";
 
 interface ChatFilesProps {
-  attachedFiles: any[];
+  attachedFiles: AttachedFile[];
   handleFileSelect: (e: React.ChangeEvent<HTMLInputElement>) => void;
   removeFile: (fileId: string) => void;
   onRemoveAllFiles: () => void;
