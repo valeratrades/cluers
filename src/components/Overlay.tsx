@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { MousePointer2 } from "lucide-react";
 
@@ -27,8 +27,6 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
   const [cursorVisible, setCursorVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const selectionRef = useRef<HTMLDivElement>(null);
-
   // Handle cancellation (ESC key, cancel button)
   const handleCancel = async () => {
     setIsSelecting(false);
@@ -47,7 +45,7 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
     height: number
   ) => {
     try {
-      const scaleFactor = window.devicePixelRatio || 1;
+      const scaleFactor = window.devicePixelRatio;
       const coords: SelectionCoords = {
         x: Math.round(x * scaleFactor),
         y: Math.round(y * scaleFactor),
@@ -134,7 +132,7 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
 
   // Handle ESC key
   const handleEscapeKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape" || e.keyCode === 27) {
+    if (e.key === "Escape") {
       e.preventDefault();
       e.stopImmediatePropagation();
       handleCancel();
@@ -143,16 +141,8 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
 
   // Event listeners setup
   useEffect(() => {
-    // ESC key listeners (multiple levels for reliability)
-    document.addEventListener("keydown", handleEscapeKey, true);
-    document.body.addEventListener("keydown", handleEscapeKey, true);
     window.addEventListener("keydown", handleEscapeKey, true);
-
-    return () => {
-      document.removeEventListener("keydown", handleEscapeKey, true);
-      document.body.removeEventListener("keydown", handleEscapeKey, true);
-      window.removeEventListener("keydown", handleEscapeKey, true);
-    };
+    return () => window.removeEventListener("keydown", handleEscapeKey, true);
   }, []);
 
   return (
@@ -187,7 +177,6 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
 
         {/* Cancel Button - Show on all monitors for easy access */}
         <button
-          onClick={handleCancel}
           onMouseDown={(e) => {
             e.preventDefault();
             e.stopPropagation();
@@ -201,7 +190,6 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
 
         {/* Selection Rectangle */}
         <div
-          ref={selectionRef}
           className="absolute border-2 border-primary-foreground bg-primary/10 rounded-3xl rounded-br-none pointer-events-none"
           style={{
             left: selectionStyle.left,
@@ -213,7 +201,6 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
           }}
         />
         <div
-          ref={selectionRef}
           className="absolute border-[0.5px] border-black bg-primary/5 rounded-3xl rounded-br-none pointer-events-none"
           style={{
             left: selectionStyle.left,
