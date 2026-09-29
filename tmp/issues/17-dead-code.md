@@ -10,3 +10,5 @@ Confirmed unused at audit time (re-verify; earlier phases may have changed it):
 - `useHistory.selectedConversationId` (unless 09 wired it)
 - package.json: `moment`, `@bany/curl-to-json`, `react-error-boundary`, `recharts` — remove any with no remaining importer.
 Then a fresh sweep for unused exports / Tauri commands / deps. Reduce `pub` surface where possible.
+
+Added after phase 1 (issue 06 findings): `src/components/Overlay.tsx` Cancel button fires `handleCancel` twice; `ref={selectionRef}` duplicated; `devicePixelRatio || 1` fallback.

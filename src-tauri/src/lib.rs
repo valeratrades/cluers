@@ -81,7 +81,7 @@ pub fn run() {
     {
         builder = builder.plugin(tauri_nspanel::init());
     }
-    let mut builder = builder
+    let builder = builder
         .invoke_handler(tauri::generate_handler![
             get_app_version,
             js_log,
@@ -152,7 +152,7 @@ pub fn run() {
             init(app.app_handle());
             let app_handle = app.handle();
             if app_handle.get_webview_window("dashboard").is_none() {
-                if let Err(e) = window::create_dashboard_window(&app_handle) {
+                if let Err(e) = window::create_dashboard_window(app_handle) {
                     eprintln!("Failed to pre-create dashboard window on startup: {}", e);
                 }
             }

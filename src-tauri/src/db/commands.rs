@@ -56,7 +56,7 @@ pub async fn delete_conversation(db: State<'_, Db>, id: String) -> Result<(), Db
 
 #[tauri::command]
 pub async fn delete_all_conversations(db: State<'_, Db>) -> Result<(), DbError> {
-    db.with_conn(|c| queries::delete_all_conversations(c)).await
+    db.with_conn(queries::delete_all_conversations).await
 }
 
 // -- system prompts ------------------------------------------------------

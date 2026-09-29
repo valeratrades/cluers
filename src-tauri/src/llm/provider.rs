@@ -65,11 +65,10 @@ pub fn parse_curl(input: &str) -> Result<ParsedCurl, LlmError> {
             "--url" => {
                 url = Some(iter.next().ok_or(LlmError::InvalidCurl("missing --url value"))?);
             }
-            other if !other.starts_with('-') => {
-                if url.is_none() {
+            other if !other.starts_with('-')
+                && url.is_none() => {
                     url = Some(other.to_string());
                 }
-            }
             // Flags we don't model (e.g. `-i`, `--compressed`) are skipped.
             _ => {}
         }
@@ -381,106 +380,6 @@ fn expand_one_array(
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn check(
-        template: &str,
-        files: &[(&str, &str, &str)],
-        expected: serde_json::Value,
-    ) {
-        let mut body: serde_json::Value = serde_json::from_str(template).unwrap();
-        let attached: Vec<AttachedFile> = files
-            .iter()
-            .map(|(name, mime, base64)| AttachedFile {
-                id: "t".into(),
-                name: (*name).into(),
-                mime: (*mime).into(),
-                base64: (*base64).into(),
-                size: 0,
-            })
-            .collect();
-        build_messages(&mut body, &[], "hello", &attached);
-        assert_eq!(body, expected);
-    }
-
-    // The user-content shapes below mirror src/config/ai-providers.constants.ts.
-    const OPENAI: &str = r#"{
-        "messages": [
-            {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
-            {"role": "user", "content": [
-                {"type": "text", "text": "{{TEXT}}"},
-                {"type": "image_url", "image_url": {"url": "data:{{IMAGE_MIME}};base64,{{IMAGE}}"}},
-                {"type": "file", "file": {"filename": "{{DOCUMENT_NAME}}", "file_data": "data:application/pdf;base64,{{DOCUMENT}}"}}
-            ]}
-        ]
-    }"#;
-
-    const CLAUDE: &str = r#"{
-        "messages": [
-            {"role": "user", "content": [
-                {"type": "text", "text": "{{TEXT}}"},
-                {"type": "image", "source": {"type": "base64", "media_type": "{{IMAGE_MIME}}", "data": "{{IMAGE}}"}},
-                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "{{DOCUMENT}}"}}
-            ]}
-        ]
-    }"#;
-
-    #[test]
-    fn no_attachments_drops_attachment_slots() {
-        check(
-            OPENAI,
-            &[],
-            serde_json::json!({
-                "messages": [
-                    {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
-                    {"role": "user", "content": [{"type": "text", "text": "hello"}]}
-                ]
-            }),
-        );
-    }
-
-    #[test]
-    fn openai_pdf_expands_file_part() {
-        check(
-            OPENAI,
-            &[("report.pdf", "application/pdf", "UERG")],
-            serde_json::json!({
-                "messages": [
-                    {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": "hello"},
-                        {"type": "file", "file": {"filename": "report.pdf", "file_data": "data:application/pdf;base64,UERG"}}
-                    ]}
-                ]
-            }),
-        );
-    }
-
-    #[test]
-    fn claude_pdf_and_image_expand() {
-        check(
-            CLAUDE,
-            &[
-                ("shot.png", "image/png", "SU1H"),
-                ("a.pdf", "application/pdf", "UERG"),
-                ("b.pdf", "application/pdf", "UERHMg=="),
-            ],
-            serde_json::json!({
-                "messages": [
-                    {"role": "user", "content": [
-                        {"type": "text", "text": "hello"},
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "SU1H"}},
-                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "UERG"}},
-                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "UERHMg=="}}
-                    ]}
-                ]
-            }),
-        );
-    }
-}
-
 /// Custom-provider stream entrypoint (the non-Pluely path).
 pub async fn stream_custom(
     http: &reqwest::Client,
@@ -618,4 +517,104 @@ pub async fn stream_custom(
     })
     .await?;
     Ok(outcome.full_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(
+        template: &str,
+        files: &[(&str, &str, &str)],
+        expected: serde_json::Value,
+    ) {
+        let mut body: serde_json::Value = serde_json::from_str(template).unwrap();
+        let attached: Vec<AttachedFile> = files
+            .iter()
+            .map(|(name, mime, base64)| AttachedFile {
+                id: "t".into(),
+                name: (*name).into(),
+                mime: (*mime).into(),
+                base64: (*base64).into(),
+                size: 0,
+            })
+            .collect();
+        build_messages(&mut body, &[], "hello", &attached);
+        assert_eq!(body, expected);
+    }
+
+    // The user-content shapes below mirror src/config/ai-providers.constants.ts.
+    const OPENAI: &str = r#"{
+        "messages": [
+            {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "{{TEXT}}"},
+                {"type": "image_url", "image_url": {"url": "data:{{IMAGE_MIME}};base64,{{IMAGE}}"}},
+                {"type": "file", "file": {"filename": "{{DOCUMENT_NAME}}", "file_data": "data:application/pdf;base64,{{DOCUMENT}}"}}
+            ]}
+        ]
+    }"#;
+
+    const CLAUDE: &str = r#"{
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "{{TEXT}}"},
+                {"type": "image", "source": {"type": "base64", "media_type": "{{IMAGE_MIME}}", "data": "{{IMAGE}}"}},
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "{{DOCUMENT}}"}}
+            ]}
+        ]
+    }"#;
+
+    #[test]
+    fn no_attachments_drops_attachment_slots() {
+        check(
+            OPENAI,
+            &[],
+            serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
+                    {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+                ]
+            }),
+        );
+    }
+
+    #[test]
+    fn openai_pdf_expands_file_part() {
+        check(
+            OPENAI,
+            &[("report.pdf", "application/pdf", "UERG")],
+            serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "hello"},
+                        {"type": "file", "file": {"filename": "report.pdf", "file_data": "data:application/pdf;base64,UERG"}}
+                    ]}
+                ]
+            }),
+        );
+    }
+
+    #[test]
+    fn claude_pdf_and_image_expand() {
+        check(
+            CLAUDE,
+            &[
+                ("shot.png", "image/png", "SU1H"),
+                ("a.pdf", "application/pdf", "UERG"),
+                ("b.pdf", "application/pdf", "UERHMg=="),
+            ],
+            serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "hello"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "SU1H"}},
+                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "UERG"}},
+                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "UERHMg=="}}
+                    ]}
+                ]
+            }),
+        );
+    }
 }
