@@ -2,10 +2,11 @@ import { Button } from "@/components";
 import { LaptopMinimalIcon, Loader2, MousePointer2Icon } from "lucide-react";
 import { MAX_FILES } from "@/config";
 import { useApp } from "@/contexts";
+import { AttachedFile, ScreenshotConfig } from "@/types";
 
 interface ChatScreenshotProps {
-  screenshotConfiguration: any;
-  attachedFiles: any[];
+  screenshotConfiguration: ScreenshotConfig;
+  attachedFiles: AttachedFile[];
   isLoading: boolean;
   captureScreenshot: () => Promise<void>;
   isScreenshotLoading: boolean;

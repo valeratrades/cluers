@@ -171,8 +171,8 @@ export const Input = ({
               {/* Conversation History - Separate scroll, no auto-scroll */}
               {keepEngaged && conversationHistory.length > 1 && (
                 <div className="space-y-3 pt-3">
-                  {conversationHistory
-                    .sort((a, b) => b?.timestamp - a?.timestamp)
+                  {[...conversationHistory]
+                    .sort((a, b) => b.timestamp - a.timestamp)
                     .map((message, index) => {
                       if (!isLoading && index === 0) {
                         return null;
