@@ -163,3 +163,92 @@ pub fn extract_streaming_delta(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tauri::ipc::InvokeResponseBody;
+
+    async fn run(chunks: Vec<Vec<u8>>) -> Result<(StreamOutcome, Vec<String>), LlmError> {
+        let body = reqwest::Body::wrap_stream(futures_util::stream::iter(
+            chunks.into_iter().map(Ok::<_, std::io::Error>),
+        ));
+        let response = reqwest::Response::from(tauri::http::Response::new(body));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let channel = Channel::<StreamEvent>::new(move |body| {
+            match body {
+                InvokeResponseBody::Json(s) => sink.lock().unwrap().push(s),
+                InvokeResponseBody::Raw(_) => panic!("StreamEvent serializes to json"),
+            }
+            Ok(())
+        });
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        let outcome = stream_sse(response, &channel, &mut cancel_rx, |v| {
+            extract_by_path(v, "choices[0].delta.content")
+        })
+        .await;
+        drop(cancel_tx);
+        let events = events.lock().unwrap().clone();
+        outcome.map(|o| (o, events))
+    }
+
+    #[tokio::test]
+    async fn utf8_split_at_every_offset() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"café 日本 🎉\"}}]}\n\ndata: [DONE]\n\n"
+            .as_bytes()
+            .to_vec();
+        let (whole, whole_events) = run(vec![body.clone()]).await.unwrap();
+        assert_eq!(whole.full_response, "café 日本 🎉");
+        assert_eq!(whole_events.len(), 1);
+
+        let mut splits: Vec<Vec<Vec<u8>>> = (1..body.len())
+            .map(|i| vec![body[..i].to_vec(), body[i..].to_vec()])
+            .collect();
+        splits.push(body.iter().map(|b| vec![*b]).collect());
+        for chunks in splits {
+            let (o, events) = run(chunks).await.unwrap();
+            assert_eq!(o.full_response, whole.full_response);
+            assert_eq!(events, whole_events);
+        }
+    }
+
+    #[tokio::test]
+    async fn frames() {
+        let d = |s: &str| format!("{{\"choices\":[{{\"delta\":{{\"content\":\"{s}\"}}}}]}}");
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (format!("data: {}\r\n\r\ndata: {}\r\n\r\n", d("a"), d("b")).into_bytes(), "ab"),
+            (b"data: {\"choices\":[{\"delta\":\ndata: {\"content\":\"x\"}}]}\n\n".to_vec(), "x"),
+            (
+                format!(": keepalive\nevent: foo\nid: 1\nretry: 10\ndata: {}\n\n", d("y")).into_bytes(),
+                "y",
+            ),
+            (b"data: [DONE]\n\n".to_vec(), ""),
+            (format!("data: {}\n\ndata: {}", d("p"), d("q")).into_bytes(), "pq"),
+        ];
+        for (input, expected) in cases {
+            let (o, _) = run(vec![input.clone()]).await.unwrap();
+            assert_eq!(o.full_response, expected, "{}", String::from_utf8_lossy(&input));
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_captured() {
+        let (o, _) = run(vec![b"data: {\"choices\":[],\"usage\":{\"total_tokens\":3}}\n\n".to_vec()])
+            .await
+            .unwrap();
+        assert_eq!(o.usage, Some(serde_json::json!({"total_tokens": 3})));
+    }
+
+    #[tokio::test]
+    async fn invalid_frames_error() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"\xff\"}}]}\n\n".to_vec(),
+            b"data: {nope\n\n".to_vec(),
+        ];
+        for input in cases {
+            assert!(matches!(run(vec![input]).await, Err(LlmError::Json(_))));
+        }
+    }
+}
