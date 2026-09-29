@@ -81,7 +81,7 @@ helpers; the renderer never sees a secret value after it's been set.
 src-tauri/src/llm/
 ├── mod.rs           LlmState (reqwest::Client + cancel registry); LlmError
 ├── commands.rs      #[tauri::command] surface
-├── secrets.rs       keyring-rs wrappers + one-time legacy bridge
+├── secrets.rs       keyring-rs wrappers + `Secrets` write-through cache
 ├── provider.rs      curl parsing, variable substitution, message builder
 ├── stream.rs        SSE chunking and `responseContentPath` extraction
 └── pluely.rs        Pluely-hosted path: /api/response config, user activity
@@ -108,19 +108,17 @@ src-tauri/src/llm/
 ### Secret storage
 
 `keyring-rs` v3 (Keychain on macOS, Credential Manager on Windows,
-libsecret on Linux). Namespacing:
+libsecret on Linux). One entry per provider:
 
-| Domain                  | Service                          | Account                            |
-|-------------------------|----------------------------------|------------------------------------|
-| Provider secrets        | `pluely.provider.<provider_id>`  | `<UPPERCASE_VAR_NAME>`             |
-| Pluely license          | `pluely.license`                 | `license_key` / `instance_id`      |
-| Pluely selected model   | `pluely.license`                 | `selected_model` (JSON)            |
-| Migration marker        | `pluely.meta`                    | `keychain_migrated_v1`             |
+| Domain           | Service                         | Account   | Value                    |
+|------------------|---------------------------------|-----------|--------------------------|
+| Provider secrets | `pluely.provider.<provider_id>` | `secrets` | JSON map `{name: value}` |
 
-The JS surface is set/list-names/delete only — `get_provider_secret` is
-not exposed to the renderer. A names-list helper keychain entry per
-provider lets `list_provider_secret_names` work without relying on a
-platform-specific "list items by service" call.
+`Secrets` (in `LlmState`) is a write-through cache, so the keychain is read
+at most once per provider per run. The Pluely `selected_model` is a
+preference and lives in the SQLite `settings` table. The JS surface is
+set / list-names / delete / delete-all; secret values are never exposed to
+the renderer.
 
 ### Errors
 
