@@ -5,7 +5,7 @@ mod db;
 mod llm;
 mod shortcuts;
 mod window;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tauri::Manager;
 #[cfg(target_os = "macos")]
 use tauri::{AppHandle, WebviewWindow};
@@ -23,7 +23,7 @@ use tauri_nspanel::{cocoa::appkit::NSWindowCollectionBehavior, panel_delegate, W
 #[derive(Default)]
 pub struct AudioState {
     capture: tokio::sync::Mutex<Option<speaker::Capture>>,
-    vad_config: Arc<Mutex<VadConfig>>,
+    vad: tokio::sync::watch::Sender<VadConfig>,
 }
 
 #[tauri::command]
@@ -136,10 +136,9 @@ pub fn run() {
             speaker::start_system_audio_capture,
             speaker::stop_system_audio_capture,
             speaker::system_audio_control,
-            speaker::manual_stop_continuous,
             speaker::check_system_audio_access,
             speaker::request_system_audio_access,
-            speaker::get_vad_config,
+            speaker::default_vad_config,
             speaker::update_vad_config,
             speaker::calibrate_vad_thresholds,
             speaker::get_input_devices,
