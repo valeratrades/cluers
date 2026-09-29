@@ -216,10 +216,9 @@ async fn perform_user_audio_transcription(
         {
             return Ok(text.to_string());
         }
-        return Ok(json.to_string());
     }
 
-    Ok(body_text)
+    Err(format!("no transcript in response: {body_text}"))
 }
 
 #[tauri::command]

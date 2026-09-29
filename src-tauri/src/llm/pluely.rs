@@ -3,12 +3,10 @@
 
 use crate::api::{get_api_access_key, get_app_endpoint};
 use crate::db::{queries, Db};
-use crate::llm::{commands::StreamChatRequest, stream, LlmError, StreamEvent};
+use crate::llm::{commands::Chat, stream, LlmError};
 use serde::{Deserialize, Serialize};
-use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_machine_uid::MachineUidExt;
-use tokio::sync::oneshot;
 
 pub const SETTING_SELECTED_MODEL: &str = "pluely_selected_model";
 
@@ -237,9 +235,8 @@ async fn user_activity(
 pub async fn stream_pluely(
     app: &AppHandle,
     http: &reqwest::Client,
-    request: StreamChatRequest,
-    channel: &Channel<StreamEvent>,
-    cancel_rx: &mut oneshot::Receiver<()>,
+    request: Chat,
+    on_delta: &mut impl FnMut(String) -> Result<(), LlmError>,
 ) -> Result<String, LlmError> {
     let selected_model = selected_model_get(app).await?;
     let (provider_name, model_name) = selected_model
@@ -308,26 +305,22 @@ pub async fn stream_pluely(
     }
 
     let error_rules = api_config.errors.clone().unwrap_or_default();
-    let send_fut = http
+    let response = match http
         .post(&api_config.url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_config.user_token))
         .json(&body)
-        .send();
-
-    let response = tokio::select! {
-        biased;
-        _ = &mut *cancel_rx => return Err(LlmError::Cancelled),
-        r = send_fut => match r {
-            Ok(r) => r,
-            Err(e) => {
-                let final_msg = map_api_error_message(&error_rules, &[e.to_string()]);
-                report_api_error(
-                    app, http, e.to_string(), "/api/chat".to_string(),
-                    model_name.clone(), provider_name.clone(),
-                ).await;
-                return Err(LlmError::PluelyConfig(final_msg));
-            }
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let final_msg = map_api_error_message(&error_rules, &[e.to_string()]);
+            report_api_error(
+                app, http, e.to_string(), "/api/chat".to_string(),
+                model_name.clone(), provider_name.clone(),
+            ).await;
+            return Err(LlmError::PluelyConfig(final_msg));
         }
     };
 
@@ -356,7 +349,7 @@ pub async fn stream_pluely(
         return Err(LlmError::PluelyConfig(final_msg));
     }
 
-    let outcome = stream::stream_sse(response, channel, cancel_rx, |parsed| {
+    let outcome = stream::stream_sse(response, on_delta, |parsed| {
         parsed
             .get("choices")
             .and_then(|c| c.as_array())

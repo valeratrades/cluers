@@ -4,8 +4,9 @@
 //!   frontend uses to drive both the Pluely-hosted path and arbitrary
 //!   custom provider templates. Streaming is over a Tauri `Channel<T>`.
 //! - `transcribe` is the STT counterpart (`stt::transcribe`), same routing.
-//! - Cancellation is `tokio::select!` against an `oneshot::Receiver`
-//!   whose `Sender` lives in `LlmState` keyed by `request_id`. Duplicate
+//! - `stream_chat` cancellation is an outer `tokio::select!` against an
+//!   `oneshot::Receiver` whose `Sender` lives in `LlmState` keyed by
+//!   `request_id`; dropping the stream future cancels it. Duplicate
 //!   in-flight ids are rejected; cancel is idempotent.
 //! - Custom-provider secrets (API keys etc.) live in the OS keychain via
 //!   `secrets.rs`. Non-secret preferences such as the Pluely-hosted

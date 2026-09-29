@@ -98,7 +98,9 @@ src-tauri/src/llm/
   is dropped when `stream_chat` returns.
 - **Concurrency**: structured. `stream_chat` registers a
   `oneshot::Sender` in `LlmState.cancels` keyed by request id, then
-  `tokio::select!`s between the streaming future and the receiver. No
+  `tokio::select!`s between `complete(..)` and the receiver; dropping the
+  future is the cancellation. The `stream_*` paths only see an `on_delta`
+  callback, so the capture task streams through the same `complete`. No
   detached `tokio::spawn` / `tauri::async_runtime::spawn`. The
   registration is an RAII guard owning the id until the stream exits
   (even after cancel), so a duplicate in-flight `request_id` is rejected
@@ -142,9 +144,10 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
 
 ## `src-tauri/src/speaker/` — capture lifecycle
 
-- `AudioState.capture: tokio::sync::Mutex<Option<JoinHandle<()>>>` is the
-  single lifecycle state. Live capture = unfinished handle; a task that ends
-  on its own reads as idle. No separate flag.
+- `AudioState.capture: tokio::sync::Mutex<Option<Capture>>` is the single
+  lifecycle state; `Capture` is `{task, control}`. Live capture = unfinished
+  task; a task that ends on its own reads as idle. No separate flag.
+  `system_audio_control` sends `Config`/`Prompt` into the live task.
 - `start` while live is `Err("Capture already running")`; `stop` is idempotent
   and aborts *and awaits* the task, so the stream is dropped and the device
   released before it returns. No sleep-based sequencing.
@@ -153,9 +156,18 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
 - Calibration holds the slot while sampling, so a concurrent start waits.
 - `vad.rs` is a pure segmenter (no Tauri, no clocks): samples + sample rate in,
   `VadEvent`s out. `VadConfig` durations are in ms and validated before use, so
-  behaviour is identical across sample rates. `run_vad_capture` only forwards
-  events to IPC. The spec is `tests/vad.rs` plus the fixtures, regenerated with
-  `nix develop -c src-tauri/tests/fixtures/vad/gen.sh`.
+  behaviour is identical across sample rates. The spec is `tests/vad.rs` plus
+  the fixtures, regenerated with `nix develop -c src-tauri/tests/fixtures/vad/gen.sh`.
+- `turn.rs` is the pure turn machine (sans-IO: segments, transcripts, replies
+  and the audio clock in; asks and `TurnEvent`s out). It decides when a turn
+  closes, joins its fragments chronologically, carries SKIPped text into the
+  next ask and orders history. The spec is `tests/turn.rs`.
+- The capture task (`drive`) owns every STT and LLM future: one answer at a
+  time, FIFO, never cancelled by a newer turn. Stopping the capture drops
+  them all. Events reach the renderer over the `Channel<TurnEvent>` passed
+  to each `start_system_audio_capture`.
+- Session memory (history, SKIP carry) lives in the renderer and is seeded
+  into each start; the renderer persists answered turns via `append_turn`.
 
 ## Global shortcuts
 

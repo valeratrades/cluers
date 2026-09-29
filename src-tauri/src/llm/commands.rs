@@ -1,9 +1,8 @@
 //! Tauri command surface for the LLM subsystem.
 //!
-//! `stream_chat` is the sole streaming entrypoint; it routes between
-//! `pluely::stream_pluely` and `provider::stream_custom` internally based
-//! on `request.provider.is_pluely_hosted`. Cancellation is per-request
-//! via the `cancel_chat` command and the `LlmState` cancel registry.
+//! `stream_chat` is the renderer's streaming entrypoint; it and the system-audio
+//! capture task both go through `complete`. Cancellation of `stream_chat` is
+//! per-request via the `cancel_chat` command and the `LlmState` cancel registry.
 
 use crate::db::Db;
 use crate::db::schema::AttachedFile;
@@ -15,7 +14,7 @@ use tauri::{AppHandle, State};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StreamChatRequest {
+pub struct Chat {
     pub provider: ProviderInput,
     pub message: String,
     #[serde(default)]
@@ -24,6 +23,13 @@ pub struct StreamChatRequest {
     pub history: Vec<provider::HistoryMessage>,
     #[serde(default)]
     pub attached_files: Vec<AttachedFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamChatRequest {
+    #[serde(flatten)]
+    pub chat: Chat,
     pub request_id: String,
 }
 
@@ -43,6 +49,38 @@ pub struct ProviderInput {
     pub user_variables: HashMap<String, String>,
 }
 
+/// Routes to the Pluely-hosted or custom path. Text attachments are inlined into the message
+/// so both paths see them uniformly; only images and PDFs survive as structured attachments.
+pub(crate) async fn complete(
+    app: &AppHandle,
+    llm: &LlmState,
+    mut chat: Chat,
+    on_delta: &mut impl FnMut(String) -> Result<(), LlmError>,
+) -> Result<String, LlmError> {
+    let (binary, text): (Vec<_>, Vec<_>) = chat
+        .attached_files
+        .drain(..)
+        .partition(|f| f.mime.starts_with("image/") || f.mime == "application/pdf");
+    chat.attached_files = binary;
+    for f in &text {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&f.base64)
+            .map_err(|e| LlmError::TextAttachment(f.name.clone(), e.to_string()))?;
+        let content = String::from_utf8(bytes)
+            .map_err(|_| LlmError::TextAttachment(f.name.clone(), "not valid UTF-8".into()))?;
+        chat.message = format!(
+            "{}\n\n--- attached file: {} ---\n{}",
+            chat.message, f.name, content
+        );
+    }
+    if chat.provider.is_pluely_hosted {
+        pluely::stream_pluely(app, &llm.http, chat, on_delta).await
+    } else {
+        provider::stream_custom(&llm.http, &llm.secrets, chat, on_delta).await
+    }
+}
+
 #[tauri::command]
 pub async fn stream_chat(
     app: AppHandle,
@@ -50,73 +88,36 @@ pub async fn stream_chat(
     request: StreamChatRequest,
     channel: Channel<StreamEvent>,
 ) -> Result<String, String> {
-    let request_id = request.request_id.clone();
+    let request_id = request.request_id;
     let mut reg = state
         .cancels
         .register(request_id.clone())
         .map_err(|e| e.to_string())?;
 
-    let http = state.http.clone();
-    let is_pluely = request.provider.is_pluely_hosted;
-
-    // Text attachments are inlined into the message here so both streaming
-    // paths see them uniformly; only images and PDFs survive as structured
-    // attachments.
-    let mut request = request;
-    let (binary, text): (Vec<_>, Vec<_>) = request
-        .attached_files
-        .drain(..)
-        .partition(|f| f.mime.starts_with("image/") || f.mime == "application/pdf");
-    request.attached_files = binary;
-    let inlined = text.iter().try_for_each(|f| {
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&f.base64)
-            .map_err(|e| LlmError::TextAttachment(f.name.clone(), e.to_string()))?;
-        let content = String::from_utf8(bytes)
-            .map_err(|_| LlmError::TextAttachment(f.name.clone(), "not valid UTF-8".into()))?;
-        request.message = format!(
-            "{}\n\n--- attached file: {} ---\n{}",
-            request.message, f.name, content
-        );
-        Ok(())
-    });
-
-    let result = match inlined {
-        Err(e) => Err(e),
-        Ok(()) => {
-            if is_pluely {
-                pluely::stream_pluely(&app, &http, request, &channel, &mut reg.rx).await
-            } else {
-                provider::stream_custom(&http, &state.secrets, request, &channel, &mut reg.rx)
-                    .await
-            }
-        }
+    let mut on_delta = |delta| {
+        channel
+            .send(StreamEvent::Chunk { delta })
+            .map_err(|e| LlmError::Channel(e.to_string()))
     };
-
+    let result = tokio::select! {
+        biased;
+        _ = &mut reg.rx => Err(LlmError::Cancelled),
+        r = complete(&app, &state, request.chat, &mut on_delta) => r,
+    };
     drop(reg);
 
-    match result {
-        Ok(full) => {
-            channel
-                .send(StreamEvent::Done {
-                    full_response: full,
-                    request_id: request_id.clone(),
-                })
-                .map_err(|e| e.to_string())?;
-            Ok(request_id)
-        }
-        Err(LlmError::Cancelled) => {
-            channel
-                .send(StreamEvent::Done {
-                    full_response: String::new(),
-                    request_id: request_id.clone(),
-                })
-                .map_err(|e| e.to_string())?;
-            Ok(request_id)
-        }
-        Err(e) => Err(e.to_string()),
-    }
+    let full_response = match result {
+        Ok(full) => full,
+        Err(LlmError::Cancelled) => String::new(),
+        Err(e) => return Err(e.to_string()),
+    };
+    channel
+        .send(StreamEvent::Done {
+            full_response,
+            request_id: request_id.clone(),
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(request_id)
 }
 
 #[derive(Debug, Deserialize)]
