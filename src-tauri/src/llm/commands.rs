@@ -3,8 +3,7 @@
 //! `stream_chat` is the sole streaming entrypoint; it routes between
 //! `pluely::stream_pluely` and `provider::stream_custom` internally based
 //! on `request.provider.is_pluely_hosted`. Cancellation is per-request
-//! via the `cancel_chat` command and a `oneshot::Sender` stored in
-//! `LlmState`.
+//! via the `cancel_chat` command and the `LlmState` cancel registry.
 
 use crate::db::Db;
 use crate::db::schema::AttachedFile;
@@ -13,7 +12,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
-use tokio::sync::oneshot;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,22 +51,17 @@ pub async fn stream_chat(
     channel: Channel<StreamEvent>,
 ) -> Result<String, String> {
     let request_id = request.request_id.clone();
-    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
-    {
-        let mut cancels = state
-            .cancels
-            .lock()
-            .expect("LlmState::cancels mutex poisoned");
-        cancels.insert(request_id.clone(), cancel_tx);
-    }
+    let mut reg = state
+        .cancels
+        .register(request_id.clone())
+        .map_err(|e| e.to_string())?;
 
     let http = state.http.clone();
     let is_pluely = request.provider.is_pluely_hosted;
 
     // Text attachments are inlined into the message here so both streaming
     // paths see them uniformly; only images and PDFs survive as structured
-    // attachments. Errors must flow through `result` — an early return
-    // would leave the JS-side generator waiting on the channel forever.
+    // attachments.
     let mut request = request;
     let (binary, text): (Vec<_>, Vec<_>) = request
         .attached_files
@@ -93,21 +86,15 @@ pub async fn stream_chat(
         Err(e) => Err(e),
         Ok(()) => {
             if is_pluely {
-                pluely::stream_pluely(&app, &http, request, &channel, &mut cancel_rx).await
+                pluely::stream_pluely(&app, &http, request, &channel, &mut reg.rx).await
             } else {
-                provider::stream_custom(&http, &state.secrets, request, &channel, &mut cancel_rx)
+                provider::stream_custom(&http, &state.secrets, request, &channel, &mut reg.rx)
                     .await
             }
         }
     };
 
-    {
-        let mut cancels = state
-            .cancels
-            .lock()
-            .expect("LlmState::cancels mutex poisoned");
-        cancels.remove(&request_id);
-    }
+    drop(reg);
 
     match result {
         Ok(full) => {
@@ -128,36 +115,13 @@ pub async fn stream_chat(
                 .map_err(|e| e.to_string())?;
             Ok(request_id)
         }
-        Err(e) => {
-            let msg = e.to_string();
-            channel
-                .send(StreamEvent::Error {
-                    message: msg.clone(),
-                    request_id,
-                })
-                .map_err(|err| err.to_string())?;
-            Err(msg)
-        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
 #[tauri::command]
 pub fn cancel_chat(state: State<'_, LlmState>, request_id: String) {
-    let sender = {
-        let mut cancels = state
-            .cancels
-            .lock()
-            .expect("LlmState::cancels mutex poisoned");
-        cancels.remove(&request_id)
-    };
-    if let Some(tx) = sender {
-        // Race: if the stream already completed (and dropped its
-        // Receiver) between our `remove` and this `send`, `send` returns
-        // Err. That outcome is indistinguishable from "we successfully
-        // cancelled an in-flight stream" from the caller's point of
-        // view, and is the correct interpretation of the race.
-        let _: Result<(), ()> = tx.send(());
-    }
+    state.cancels.cancel(&request_id)
 }
 
 #[tauri::command]

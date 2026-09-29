@@ -70,8 +70,9 @@ export interface StreamChatRequest {
 
 type StreamChunk =
   | { kind: "chunk"; delta: string }
-  | { kind: "done"; fullResponse: string; requestId: string }
-  | { kind: "error"; message: string; requestId: string };
+  | { kind: "done"; fullResponse: string; requestId: string };
+
+type Msg = StreamChunk | { kind: "failed"; error: unknown };
 
 export interface Model {
   id: string;
@@ -90,17 +91,18 @@ export function generateRequestId(): string {
 
 /**
  * Stream an LLM chat turn. The generator yields token deltas as they
- * arrive and returns when the stream completes. On error, it throws.
- * Cancellation is by calling `cancelChat(request.requestId)` from
- * another async context.
+ * arrive and returns when the stream completes. Any failure, including
+ * the command rejecting before streaming (e.g. duplicate `requestId`),
+ * is thrown. Cancellation is by calling `cancelChat(request.requestId)`
+ * from another async context.
  */
 export async function* streamChat(
   request: StreamChatRequest
 ): AsyncGenerator<string, void, void> {
   const channel = new Channel<StreamChunk>();
-  const queue: StreamChunk[] = [];
-  let pending: ((msg: StreamChunk) => void) | null = null;
-  channel.onmessage = (msg) => {
+  const queue: Msg[] = [];
+  let pending: ((msg: Msg) => void) | null = null;
+  const deliver = (msg: Msg) => {
     if (pending) {
       const resolve = pending;
       pending = null;
@@ -109,34 +111,31 @@ export async function* streamChat(
       queue.push(msg);
     }
   };
+  channel.onmessage = deliver;
+  invoke("stream_chat", { request, channel }).catch((error) =>
+    deliver({ kind: "failed", error }) // unread if the consumer abandoned the stream
+  );
 
-  // Start the stream. Rust returns the requestId synchronously after
-  // registering the cancellation handle, then proceeds to drive the
-  // channel until a terminal event is sent.
-  const pump = invoke<string>("stream_chat", { request, channel });
-
-  try {
-    while (true) {
-      const msg: StreamChunk = queue.length
-        ? queue.shift()!
-        : await new Promise<StreamChunk>((r) => {
-            pending = r;
-          });
-      if (msg.kind === "chunk") {
-        yield msg.delta;
-      } else if (msg.kind === "done") {
-        return;
-      } else {
-        throw new Error(msg.message);
-      }
+  while (true) {
+    const msg: Msg = queue.length
+      ? queue.shift()!
+      : await new Promise<Msg>((r) => {
+          pending = r;
+        });
+    if (msg.kind === "chunk") {
+      yield msg.delta;
+    } else if (msg.kind === "done") {
+      return;
+    } else {
+      throw new Error(String(msg.error));
     }
-  } finally {
-    // Surface any invoke-level failure that didn't make it through the
-    // channel (e.g. the command rejected before opening the stream).
-    await pump.catch(() => {});
   }
 }
 
+/**
+ * Idempotent: unknown/finished ids are a no-op. Rejects only on IPC
+ * failure (a bug) — do not catch.
+ */
 export function cancelChat(requestId: string): Promise<void> {
   return invoke("cancel_chat", { requestId });
 }

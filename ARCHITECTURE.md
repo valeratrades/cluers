@@ -96,8 +96,12 @@ src-tauri/src/llm/
   `oneshot::Sender` in `LlmState.cancels` keyed by request id, then
   `tokio::select!`s between the streaming future and the receiver. No
   detached `tokio::spawn` / `tauri::async_runtime::spawn`. The
-  `cancel_chat(request_id)` command pulls the sender out of the map
-  and fires it.
+  registration is an RAII guard owning the id until the stream exits
+  (even after cancel), so a duplicate in-flight `request_id` is rejected
+  with `DuplicateRequestId`. `cancel_chat(request_id)` fires the sender;
+  it is an idempotent no-op for unknown or finished ids.
+- **Termination**: the channel carries `Chunk`s then `Done`; failures
+  are the command's `Err` (the renderer listens to the invoke rejection).
 - **HTTP**: a single `reqwest::Client` lives in `LlmState`. SSE bodies
   are parsed via `bytes_stream()` + newline buffering; deltas are
   extracted with the provider's `response_content_path` JSON path.
@@ -126,6 +130,7 @@ platform-specific "list items by service" call.
 
 `LlmError` is a `thiserror` enum (`Reqwest`, `Keychain`,
 `MissingVariable`, `InvalidCurl`, `PluelyUnlicensed`, `PluelyConfig`,
-`ProviderApi { status, body }`, `CurlParse`, `Json`, `Cancelled`) with
+`ProviderApi { status, body }`, `CurlParse`, `Json`, `DuplicateRequestId`,
+`Cancelled`) with
 a manual `serde::Serialize` impl emitting `self.to_string()`. The
 previous fire-and-forget `report_api_error` spawns are awaited inline.
