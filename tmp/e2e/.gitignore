@@ -1,0 +1,6 @@
+*
+!.gitignore
+!run.sh
+!inner.sh
+!test.py
+!mock.py

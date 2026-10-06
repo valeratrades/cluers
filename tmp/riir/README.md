@@ -4,10 +4,7 @@ The 2026-09-29 stabilization pass (Linux only) closed issues 01-19 in five phase
 
 ## Open
 
-| # | Issue | Blocked on |
-|---|---|---|
-| 20 | Keyboard focus stuck in pluely | Owner repro on sway |
-| 21 | Push-to-talk recorded in Rust | Nothing, ready to plan |
+None. Issues 20 (overlay input region) and 21 (push-to-talk in Rust) closed after `v0.1.14`; see `git log --grep "issue/2"`.
 
 ## Known limits (accepted trade-offs, not scheduled)
 
@@ -16,10 +13,11 @@ Each needs a decision before it becomes an issue.
 - **Barge-in.** If you talk over the interviewer mid-question, it doesn't count as taking the turn. `turn.rs` judges echo by timing, and real detection needs an echo canceller (e.g. webrtc AEC). Until then the 2s `TURN_GAP_MS` ends the turn.
 - **User speech is never transcribed.** The LLM history lacks what you answered, which saves STT cost. Flip it if follow-up answers need that context.
 - **Answers run one at a time and are never cancelled.** A follow-up question waits for the current answer to finish.
+- **Push-to-talk is off during a capture.** The shortcut is ignored while capture mode hides the completion row.
 - **Startup shortcut gap.** Shortcut config lives in webview localStorage, so presses before the webview boots are dropped. Fixing it means moving the config to SQLite.
 - **Wayland shortcuts.** On Wayland, shortcuts work only through the CLI (`pluely --action <id>` bound in the compositor; sway lines are in ARCHITECTURE.md). There is no portal backend: wlroots has none, and it is only useful on KDE/GNOME. Hold-to-move is X11-only.
-- **Other platforms.** macOS doesn't compile (`lib.rs` reassigns a non-`mut` `builder`), and Windows is untested.
-- **App behaviour is unchecked.** Every stabilization agent ran headless. The first live session should check: a question with a mid-sentence pause gets one answer; you speaking closes the turn in about 1s; echo on speakers is ignored; continuous-mode record/send/discard; quick actions between recordings.
+- **Other platforms.** macOS and Windows are untested; the macOS `builder` compile error is fixed but was never compiled.
+- **App behaviour is checked headlessly only.** `tmp/e2e/run.sh` drives the real app in a nested headless sway over WebDriver, with mock STT/LLM servers and null-sink audio. A live session on real hardware has not been done.
 
 ## How to continue
 
