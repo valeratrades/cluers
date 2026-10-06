@@ -89,9 +89,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_machine_uid::init());
     #[cfg(target_os = "macos")]
-    {
-        builder = builder.plugin(tauri_nspanel::init());
-    }
+    let builder = builder.plugin(tauri_nspanel::init());
     let builder = builder
         .invoke_handler(tauri::generate_handler![
             get_app_version,
@@ -186,11 +184,8 @@ pub fn run() {
             Ok(())
         });
 
-    // Add macOS-specific permissions plugin
     #[cfg(target_os = "macos")]
-    {
-        builder = builder.plugin(tauri_plugin_macos_permissions::init());
-    }
+    let builder = builder.plugin(tauri_plugin_macos_permissions::init());
 
     builder
         .run(tauri::generate_context!())
