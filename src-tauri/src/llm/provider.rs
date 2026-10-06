@@ -382,7 +382,7 @@ fn expand_one_array(
     out
 }
 
-/// user_variables (uppercased) ∪ keychain secrets of `kind`; keychain wins.
+/// user_variables (uppercased) ∪ keychain secrets of `kind`; keychain wins. A template without variables never touches the keychain.
 /// Every non-reserved `{{VAR}}` in the template must resolve to a non-blank value.
 pub(crate) async fn resolve_vars(
     secrets: &Secrets,
@@ -394,15 +394,21 @@ pub(crate) async fn resolve_vars(
         .iter()
         .map(|(k, v)| (k.to_ascii_uppercase(), v.clone()))
         .collect();
+    let needed: Vec<String> = extract_variables(&p.curl)
+        .into_iter()
+        .filter(|v| {
+            !matches!(
+                v.as_str(),
+                "SYSTEM_PROMPT" | "TEXT" | "IMAGE" | "IMAGE_MIME" | "AUDIO" | "DOCUMENT"
+                    | "DOCUMENT_NAME"
+            )
+        })
+        .collect();
+    if needed.is_empty() {
+        return Ok(vars); // keyless templates must work without a Secret Service
+    }
     vars.extend(secrets.provider(kind, &p.id).await?);
-    for v in extract_variables(&p.curl) {
-        if matches!(
-            v.as_str(),
-            "SYSTEM_PROMPT" | "TEXT" | "IMAGE" | "IMAGE_MIME" | "AUDIO" | "DOCUMENT"
-                | "DOCUMENT_NAME"
-        ) {
-            continue;
-        }
+    for v in needed {
         if vars.get(&v).is_none_or(|s| s.trim().is_empty()) {
             return Err(LlmError::MissingVariable(v));
         }
