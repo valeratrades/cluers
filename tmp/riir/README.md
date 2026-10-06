@@ -26,7 +26,7 @@ Each phase went through this loop:
 1. **Scope.** Write `NN-slug.md`: the problem, evidence (`file:line`), a concrete failure scenario, acceptance criteria, and which sibling issues own which files.
 2. **Phase.** Run issues in parallel only when they touch disjoint files. Hot spots are `speaker/commands.rs`, `useSystemAudio.ts`, `lib.rs` and `package.json`/`package-lock.json` (JSON is `binary` in `.gitattributes`, so merges need a manual pick, then `npm install`).
 3. **Plan.** One read-only Plan agent per issue writes `NN-slug.plan.md`. The orchestrator reviews the trade-offs and appends a `## Review amendments` section, which overrides the plan body.
-4. **Implement.** One fresh-context agent per plan, in its own worktree, on branch `issue/NN-slug`. Workflow worktrees fork from `master`, so the agent must run `git reset --hard riir` on its empty branch first. Inside worktrees use `nix develop path:. -c …`.
+4. **Implement.** One fresh-context agent per plan, in its own worktree, on branch `issue/NN-slug`. Workflow worktrees fork from `main`, so the agent must run `git reset --hard riir` on its empty branch first. Inside worktrees use `nix develop path:. -c …`.
 5. **Merge and release.** Merge `--no-ff` into `riir`. Run `npx tsc --noEmit -p .`, `npx vitest run`, `cargo clippy --all-targets -- -D warnings` and `cargo test` (the live-Pulse tests need PipeWire running). Bump the version in `package.json`, `tauri.conf.json`, `Cargo.toml` and `package-lock.json`, then tag `v0.1.N` and push the tag. If a phase goes bad, roll back to the previous tag and stop to sync with the owner.
 
 Test specs to extend rather than duplicate:
