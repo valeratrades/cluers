@@ -6,18 +6,6 @@ export function generateConversationTitle(userMessage: string): string {
   return userMessage.trim();
 }
 
-export async function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.readAsDataURL(blob);
-    reader.onloadend = () => {
-      const base64data = (reader.result as string)?.split(",")[1] ?? "";
-      resolve(base64data);
-    };
-    reader.onerror = reject;
-  });
-}
-
 /**
  * Enumerate `{{UPPERCASE}}` placeholders in a curl template. Used by
  * the settings UI to render the variable input form. `includeAll=true`

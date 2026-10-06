@@ -85,7 +85,7 @@ src-tauri/src/llm/
 ├── secrets.rs       keyring-rs wrappers + `Secrets` write-through cache
 ├── provider.rs      curl parsing, variable substitution, message builder
 ├── stream.rs        SSE chunking and `responseContentPath` extraction
-├── stt.rs           `transcribe`: Pluely-hosted or custom curl template (-F / --data-binary / -d)
+├── stt.rs           `stt::transcribe`: Pluely-hosted or custom curl template (-F / --data-binary / -d)
 └── pluely.rs        Pluely-hosted path: /api/response config, user activity
 ```
 
@@ -111,8 +111,8 @@ src-tauri/src/llm/
   extracted with the provider's `response_content_path` JSON path.
 - **One command for both paths.** Pluely-hosted vs custom is an
   internal branch on `provider.is_pluely_hosted`; the renderer doesn't
-  pick a transport. STT mirrors this: `transcribe` (non-streaming) routes
-  through `stt::transcribe`, which in-process callers use directly.
+  pick a transport. STT mirrors this: every caller goes through
+  `stt::transcribe`; there is no STT command, the renderer never holds audio.
 
 ### Secret storage
 
@@ -172,6 +172,11 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
 - The mic is captured through Pulse (`@DEFAULT_SOURCE@` or a named source),
   next to the monitor. VAD mode requires it; there is no cpal. Continuous
   mode records system audio only.
+- Push-to-talk (`speaker/push_to_talk.rs`) is the only other mic consumer
+  and the renderer captures no audio. `record_push_to_talk` owns its own
+  Pulse stream for the whole call (no spawn) and returns the transcript;
+  `finish_push_to_talk` ends it. It is independent of the capture slot, so
+  it runs alongside a VAD session as a second Pulse stream.
 - Both channels go through their own `Segmenter` in lockstep on one sample
   clock (the system sample count); interviewer events are fed first. A
   device that stops delivering for 2s while the other keeps going ends the

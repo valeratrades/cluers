@@ -6,7 +6,7 @@
 
 use crate::db::Db;
 use crate::db::schema::AttachedFile;
-use crate::llm::{pluely, provider, secrets::ProviderKind, stt, LlmError, LlmState, StreamEvent};
+use crate::llm::{pluely, provider, secrets::ProviderKind, LlmError, LlmState, StreamEvent};
 use serde::Deserialize;
 use std::collections::HashMap;
 use tauri::ipc::Channel;
@@ -118,29 +118,6 @@ pub async fn stream_chat(
         })
         .map_err(|e| e.to_string())?;
     Ok(request_id)
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TranscribeRequest {
-    pub provider: ProviderInput,
-    pub audio_base64: String,
-    pub mime: String,
-}
-
-#[tauri::command]
-pub async fn transcribe(
-    app: AppHandle,
-    state: State<'_, LlmState>,
-    request: TranscribeRequest,
-) -> Result<String, String> {
-    use base64::Engine as _;
-    let audio = base64::engine::general_purpose::STANDARD
-        .decode(&request.audio_base64)
-        .map_err(|e| format!("audio base64: {e}"))?;
-    stt::transcribe(&app, &state, &request.provider, &audio, &request.mime)
-        .await
-        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

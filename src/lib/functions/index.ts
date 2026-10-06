@@ -1,3 +1,2 @@
-export * from "./stt.function";
 export * from "./common.function";
 export * from "./pluely.api";

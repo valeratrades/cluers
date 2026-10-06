@@ -66,6 +66,7 @@ pub fn run() {
     });
     let builder = builder
         .manage(AudioState::default())
+        .manage(speaker::PushToTalk::default())
         .manage(CaptureState::default())
         .manage(llm::LlmState::new())
         .manage(shortcuts::MoveWindowState::default())
@@ -106,7 +107,6 @@ pub fn run() {
             shortcuts::set_app_icon_visibility,
             shortcuts::set_always_on_top,
             shortcuts::exit_app,
-            llm::commands::transcribe,
             api::fetch_models,
             api::fetch_prompts,
             api::generate_system_prompt_via_api,
@@ -130,6 +130,8 @@ pub fn run() {
             db::commands::delete_system_prompt,
             speaker::start_system_audio_capture,
             speaker::stop_system_audio_capture,
+            speaker::record_push_to_talk,
+            speaker::finish_push_to_talk,
             speaker::system_audio_control,
             speaker::check_system_audio_access,
             speaker::request_system_audio_access,

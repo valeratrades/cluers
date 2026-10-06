@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
 
-const STT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const STT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Live per-chunk metrics emitted to the UI so users can see why VAD does or
 /// does not trigger on their setup.
@@ -571,7 +571,7 @@ async fn drive(
     }
 }
 
-fn normalize_audio_level(samples: &[f32], target_rms: f32) -> Vec<f32> {
+pub(super) fn normalize_audio_level(samples: &[f32], target_rms: f32) -> Vec<f32> {
     if samples.is_empty() {
         return Vec::new();
     }
@@ -598,7 +598,7 @@ fn normalize_audio_level(samples: &[f32], target_rms: f32) -> Vec<f32> {
         .collect()
 }
 
-fn samples_to_wav(sample_rate: u32, mono_f32: &[f32]) -> Vec<u8> {
+pub(super) fn samples_to_wav(sample_rate: u32, mono_f32: &[f32]) -> Vec<u8> {
     assert!(!mono_f32.is_empty(), "segments are never empty");
     let mut cursor = Cursor::new(Vec::new());
     let spec = WavSpec {

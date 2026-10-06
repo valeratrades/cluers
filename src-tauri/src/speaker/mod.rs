@@ -19,11 +19,13 @@ mod linux;
 use linux::{SpeakerInput as PlatformSpeakerInput, SpeakerStream as PlatformSpeakerStream};
 
 mod commands;
+mod push_to_talk;
 pub mod turn;
 pub mod vad;
 
 // Re-export commands for tauri handler
 pub use commands::*;
+pub use push_to_talk::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioDevice {

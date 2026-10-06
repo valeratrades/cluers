@@ -12,7 +12,7 @@ use crate::llm::{
     LlmError, LlmState,
 };
 
-/// Entry point for both the `transcribe` command and in-process callers.
+/// Entry point for every STT caller.
 /// `Ok("")` means the provider heard no speech.
 pub async fn transcribe(
     app: &AppHandle,
