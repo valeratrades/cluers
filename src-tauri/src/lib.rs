@@ -95,6 +95,7 @@ pub fn run() {
             get_app_version,
             js_log,
             window::set_window_height,
+            window::set_input_region,
             window::open_dashboard,
             capture::capture_to_base64,
             capture::start_screen_capture,

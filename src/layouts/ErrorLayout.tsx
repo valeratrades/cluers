@@ -9,7 +9,7 @@ export const ErrorLayout = ({
   message?: string;
 }) => {
   return isCompact ? (
-    <Card className="flex flex-row w-screen h-screen items-center justify-between p-4">
+    <Card data-input-region className="flex flex-row w-screen h-screen items-center justify-between p-4">
       <div className="flex size-8 items-center justify-center rounded-xl bg-foreground">
         <SparklesIcon className="size-5 text-background" />
       </div>

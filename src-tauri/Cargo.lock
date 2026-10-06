@@ -3810,6 +3810,7 @@ dependencies = [
  "cidre",
  "dotenv",
  "futures-util",
+ "gtk",
  "hound",
  "image",
  "keyring",

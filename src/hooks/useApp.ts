@@ -3,6 +3,7 @@ import { useTitles, useSystemAudio, useGlobalShortcutListeners } from "@/hooks";
 import { listen } from "@tauri-apps/api/event";
 import { getShortcutsConfig } from "@/lib/storage";
 import { invoke } from "@tauri-apps/api/core";
+import { getPlatform } from "@/lib";
 
 export const useApp = () => {
   const systemAudio = useSystemAudio();
@@ -22,6 +23,45 @@ export const useApp = () => {
         await invoke("js_log", { msg: `shortcut init failed: ${error}` });
       }
     })();
+  }, []);
+
+  // the window is larger than what it paints; clicks on its transparent rest must reach the app below
+  useEffect(() => {
+    if (getPlatform() !== "linux") return;
+    let frame = 0;
+    let sent = "";
+    const update = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const rects = [
+          ...document.querySelectorAll(
+            "[data-input-region], [data-radix-popper-content-wrapper]"
+          ),
+        ]
+          .map((el) => el.getBoundingClientRect())
+          .filter((r) => r.width > 0 && r.height > 0)
+          .map(({ x, y, width, height }) => ({ x, y, width, height }));
+        if (JSON.stringify(rects) === sent) return;
+        sent = JSON.stringify(rects);
+        invoke("set_input_region", { rects }).catch((e) =>
+          invoke("js_log", { msg: `set_input_region failed: ${e}` })
+        );
+      });
+    };
+    const mutations = new MutationObserver(update);
+    mutations.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+    });
+    const resizes = new ResizeObserver(update);
+    resizes.observe(document.body);
+    update();
+    return () => {
+      cancelAnimationFrame(frame);
+      mutations.disconnect();
+      resizes.disconnect();
+    };
   }, []);
 
   const handleSelectConversation = (conversation: any) => {

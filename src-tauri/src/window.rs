@@ -49,6 +49,49 @@ pub fn set_window_height(window: tauri::WebviewWindow, height: u32) -> Result<()
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+pub struct Rect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// Only these rects take pointer input; clicks elsewhere fall through to the window below.
+#[tauri::command]
+pub fn set_input_region(window: tauri::WebviewWindow, rects: Vec<Rect>) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let w = window.clone();
+        window
+            .run_on_main_thread(move || {
+                use gtk::prelude::WidgetExt;
+                let region = gtk::cairo::Region::create();
+                for r in &rects {
+                    let (x, y) = (r.x.floor() as i32, r.y.floor() as i32);
+                    let rect = gtk::cairo::RectangleInt::new(
+                        x,
+                        y,
+                        (r.x + r.width).ceil() as i32 - x,
+                        (r.y + r.height).ceil() as i32 - y,
+                    );
+                    region.union_rectangle(&rect).expect("cairo region out of memory");
+                }
+                match w.gtk_window() {
+                    Ok(gtk) => gtk.input_shape_combine_region(Some(&region)),
+                    Err(e) => tracing::error!("set_input_region: {e}"), // on the GTK thread, nobody to return it to
+                }
+            })
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err(format!(
+        "input regions are Linux-only ({} rects for {})",
+        rects.len(),
+        window.label()
+    ))
+}
+
 #[tauri::command]
 pub fn open_dashboard(app: tauri::AppHandle) -> Result<(), String> {
     show_dashboard_window(&app)
