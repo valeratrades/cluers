@@ -230,3 +230,12 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
   bindsym ctrl+shift+a exec pluely --action audio_recording
   bindsym ctrl+shift+s exec pluely --action screenshot
   ```
+
+## Overlay input region
+
+The main window is larger than what it paints (GTK floors it at 200px; it
+grows to 600px for popovers). On Linux only the painted parts take input:
+`useApp` sends the rects of `[data-input-region]` elements and Radix
+popper wrappers to `set_input_region`, which sets the GTK input shape.
+Anything else painted in the main window must carry `data-input-region`,
+or clicks on it fall through to the app below.
