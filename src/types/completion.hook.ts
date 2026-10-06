@@ -53,12 +53,7 @@ export interface UseCompletionReturn {
   /** Direct state setter for advanced use cases */
   setState: Dispatch<SetStateAction<any>>;
 
-  // Push-to-talk microphone
-  /** Whether push-to-talk is recording */
-  isRecording: boolean;
-  /** Function to toggle push-to-talk */
-  setIsRecording: Dispatch<SetStateAction<boolean>>;
-  /** Whether microphone is currently open/active */
+  /** Push-to-talk popover; open means recording once STT is configured */
   micOpen: boolean;
   /** Function to control microphone state */
   setMicOpen: Dispatch<SetStateAction<boolean>>;

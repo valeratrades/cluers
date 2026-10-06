@@ -7,20 +7,19 @@ import { useApp } from "@/contexts";
 export const Audio = ({
   micOpen,
   setMicOpen,
-  isRecording,
-  setIsRecording,
   submit,
 }: UseCompletionReturn) => {
   const { selectedSttProvider, pluelyApiEnabled } = useApp();
 
   const configured = pluelyApiEnabled || !!selectedSttProvider.provider;
+  const recording = micOpen && configured;
+  const keepRecording = (e: Event) => recording && e.preventDefault(); // only Stop or Esc end a recording
 
   return (
     <Popover open={micOpen} onOpenChange={setMicOpen}>
       <PopoverTrigger asChild>
         <Button
           size="icon"
-          onClick={() => setIsRecording(!isRecording)}
           className="cursor-pointer"
           title="Toggle voice input"
         >
@@ -31,8 +30,9 @@ export const Audio = ({
       <PopoverContent
         align="end"
         side="bottom"
-        className={`w-80 p-3 ${configured && !isRecording ? "hidden" : ""}`}
+        className="w-80 p-3"
         sideOffset={8}
+        onInteractOutside={keepRecording}
       >
         {!configured ? (
           <div className="text-sm select-none">
@@ -48,15 +48,15 @@ export const Audio = ({
               enable voice input.
             </span>
           </div>
-        ) : isRecording ? (
+        ) : (
           <AudioRecorder
             onTranscriptionComplete={(t) => {
-              setIsRecording(false);
+              setMicOpen(false);
               submit(t);
             }}
-            onCancel={() => setIsRecording(false)}
+            onCancel={() => setMicOpen(false)}
           />
-        ) : null}
+        )}
       </PopoverContent>
     </Popover>
   );

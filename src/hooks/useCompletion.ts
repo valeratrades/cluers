@@ -51,7 +51,6 @@ export const useCompletion = () => {
     conversationHistory: [],
   });
   const [micOpen, setMicOpen] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
   const [messageHistoryOpen, setMessageHistoryOpen] = useState(false);
   const [keepEngaged, setKeepEngaged] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -383,10 +382,7 @@ export const useCompletion = () => {
     return () => window.removeEventListener("keydown", handleToggleShortcut);
   }, [isPopoverOpen]);
 
-  const toggleRecording = useCallback(() => {
-    setIsRecording(!isRecording);
-    setMicOpen(!micOpen);
-  }, [isRecording, micOpen]);
+  const toggleRecording = useCallback(() => setMicOpen((open) => !open), []);
 
   // register callbacks for global shortcuts
   useEffect(() => {
@@ -417,8 +413,6 @@ export const useCompletion = () => {
     cancel,
     reset,
     setState,
-    isRecording,
-    setIsRecording,
     micOpen,
     setMicOpen,
     currentConversationId: state.currentConversationId,
