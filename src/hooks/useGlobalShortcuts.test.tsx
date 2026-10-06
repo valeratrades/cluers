@@ -39,7 +39,7 @@ test.each(cases)("%s fires once per emit and stops after unmount", async (event,
     const shortcuts = useGlobalShortcuts();
     useGlobalShortcuts();
     useEffect(() => register(shortcuts, hit), [shortcuts]);
-    useGlobalShortcutListeners();
+    useGlobalShortcutListeners(() => false);
     return null;
   };
   const root = createRoot(document.createElement("div"));

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTitles, useSystemAudio, useGlobalShortcutListeners } from "@/hooks";
 import { listen } from "@tauri-apps/api/event";
 import { getShortcutsConfig } from "@/lib/storage";
@@ -12,7 +12,9 @@ export const useApp = () => {
   useTitles();
 
   const [shortcutError, setShortcutError] = useState<string | null>(null);
-  useGlobalShortcutListeners();
+  const capturing = useRef(false);
+  capturing.current = systemAudio.capturing;
+  useGlobalShortcutListeners(() => capturing.current);
 
   useEffect(() => {
     (async () => {

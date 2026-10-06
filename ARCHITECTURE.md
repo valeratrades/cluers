@@ -175,8 +175,10 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
 - Push-to-talk (`speaker/push_to_talk.rs`) is the only other mic consumer
   and the renderer captures no audio. `record_push_to_talk` owns its own
   Pulse stream for the whole call (no spawn) and returns the transcript;
-  `finish_push_to_talk` ends it. It is independent of the capture slot, so
-  it runs alongside a VAD session as a second Pulse stream.
+  `finish_push_to_talk` ends it. It is independent of the capture slot (a
+  second Pulse stream would work), but the renderer ignores the shortcut
+  while a capture runs: capture mode hides the completion row whose popover
+  would show the answer.
 - Both channels go through their own `Segmenter` in lockstep on one sample
   clock (the system sample count); interviewer events are fed first. A
   device that stops delivering for 2s while the other keeps going ends the
