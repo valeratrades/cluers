@@ -5,13 +5,12 @@ import {
   PopoverTrigger,
   Button,
   ScrollArea,
-  Markdown,
 } from "@/components";
 import { ChatMessage } from "@/types/completion";
+import { MessageBubble } from "../MessageBubble";
 
 interface MessageHistoryProps {
   conversationHistory: ChatMessage[];
-  currentConversationId: string | null;
   onStartNewConversation: () => void;
   messageHistoryOpen: boolean;
   setMessageHistoryOpen: (open: boolean) => void;
@@ -83,30 +82,14 @@ export const MessageHistory = ({
 
         <ScrollArea className="h-[calc(100vh-10rem)]">
           <div className="p-4 space-y-4">
-            {conversationHistory
-              .sort((a, b) => b?.timestamp - a?.timestamp)
+            {[...conversationHistory]
+              .sort((a, b) => b.timestamp - a.timestamp)
               .map((message) => (
-                <div
+                <MessageBubble
                   key={message.id}
-                  className={`p-3 rounded-lg ${
-                    message.role === "user"
-                      ? "bg-primary/10 border-l-4 border-primary"
-                      : "bg-muted/50"
-                  }`}
-                >
-                  <div className="flex items-center gap-2 mb-2">
-                    <span className="text-xs font-medium text-muted-foreground uppercase">
-                      {message.role === "user" ? "You" : "AI"}
-                    </span>
-                    <span className="text-xs text-muted-foreground">
-                      {new Date(message.timestamp).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })}
-                    </span>
-                  </div>
-                  <Markdown>{message.content}</Markdown>
-                </div>
+                  message={message}
+                  userLabel="You"
+                />
               ))}
           </div>
         </ScrollArea>

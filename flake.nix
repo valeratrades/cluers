@@ -3,7 +3,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/549bd84d6279f9852cae6225e372cc67fb91a4c1";
     rust-overlay.url = "github:oxalica/rust-overlay/adf987c76af8d17b8256d23631bcf203f81e1a63";
     flake-parts.url = "github:hercules-ci/flake-parts/0678d8986be1661af6bb555f3489f2fdfc31f6ff";
-    v_flakes.url = "github:valeratrades/v_flakes/a5dc46fbbf76ae92fb6f96147a008d0429f9848d";
+    v_flakes.url = "github:valeratrades/v_flakes?ref=v1.6";
   };
 
   outputs = inputs@{ self, nixpkgs, rust-overlay, flake-parts, v_flakes, ... }:
@@ -31,6 +31,14 @@
             syncFork = true;
           };
 
+          combined = v_flakes.utils.combine [
+            github
+            { shellHook = v_flakes.utils.mkShellHook ''
+                cp -f ${(files.gitattributes) { inherit pkgs; lfs = false; }} ./.gitattributes
+              '';
+            }
+          ];
+
           linuxDeps = with pkgs; [
             # Tauri/WebKit runtime
             webkitgtk_4_1
@@ -49,9 +57,26 @@
           ];
 
           systemDeps = lib.optionals pkgs.stdenv.isLinux linuxDeps;
+
+          dev = pkgs.writeShellApplication {
+            name = "pluely-dev";
+            runtimeInputs = [ rust pkgs.nodejs_22 pkgs.pkg-config pkgs.openssl ] ++ systemDeps;
+            text = ''
+              export LD_LIBRARY_PATH="${lib.makeLibraryPath systemDeps}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export RUST_BACKTRACE=1
+              npm install --legacy-peer-deps
+              exec npm run tauri dev "$@"
+            '';
+          };
         in
         {
           _module.args.pkgs = pkgs;
+
+          # `nix run .#dev` — npm install + tauri dev with runtime libs on LD_LIBRARY_PATH
+          apps.dev = {
+            type = "app";
+            program = "${dev}/bin/pluely-dev";
+          };
 
           # `nix build` — runs npm install then tauri build
           packages.default = pkgs.stdenv.mkDerivation {
@@ -64,13 +89,13 @@
             npmDeps = pkgs.fetchNpmDeps {
               src = ./.;
               fetcherVersion = 2;
-              hash = "sha256-CNeyHQqGhm112a59+mTgWHkTxvkyM8iSNc35/XQZ4Po=";
+              hash = "sha256-PMBkc5PHR8K1bhLbMiE51p/XciCOPn9DCTrZG8s9iMw=";
             };
 
             npmFlags = [ "--legacy-peer-deps" ];
             cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
               src = ./src-tauri;
-              hash = "sha256-C3a4ZId21VRN6EDbbAVLRRPiX+B3MLQ2R/24fLUeXGE=";
+              hash = "sha256-fl5sJud2Dic1spafCX8U6ypLJsfP1nSh51kld1MyeQ4=";
             };
 
             nativeBuildInputs = [
@@ -100,16 +125,17 @@
               pkgs.nodejs_22
               pkgs.pkg-config
               pkgs.openssl
-            ] ++ systemDeps ++ github.enabledPackages;
+              pkgs.espeak-ng # VAD fixture generator (src-tauri/tests/fixtures/vad/gen.sh)
+              pkgs.sox
+            ] ++ systemDeps ++ combined.enabledPackages;
 
             env = {
               RUST_BACKTRACE = 1;
               RUST_LIB_BACKTRACE = 0;
+              RUSTUP_TOOLCHAIN = "${rust}"; # ~/.cargo/bin rustup proxies shadow PATH for cargo subcommands
             };
 
-            shellHook = github.shellHook + ''
-              cp -f ${(files.gitattributes) { inherit pkgs; lfs = false; }} ./.gitattributes
-            '';
+            shellHook = combined.shellHook;
           };
         };
     };

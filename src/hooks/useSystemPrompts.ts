@@ -1,15 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   createSystemPrompt,
-  getAllSystemPrompts,
-  updateSystemPrompt,
+  listSystemPrompts,
+  editSystemPrompt,
   deleteSystemPrompt,
 } from "@/lib/database";
-import type {
-  SystemPrompt,
-  SystemPromptInput,
-  UpdateSystemPromptInput,
-} from "@/types";
+import type { SystemPrompt } from "@/types";
 import { DEFAULT_SYSTEM_PROMPT, STORAGE_KEYS } from "@/config";
 import { safeLocalStorage } from "@/lib";
 import { useApp } from "@/contexts";
@@ -35,7 +31,7 @@ export const useSystemPrompts = () => {
     try {
       setIsLoading(true);
       setError(null);
-      const result = await getAllSystemPrompts();
+      const result = await listSystemPrompts();
       setPrompts(result);
     } catch (err) {
       const errorMessage =
@@ -51,10 +47,10 @@ export const useSystemPrompts = () => {
    * Create a new system prompt
    */
   const createPrompt = useCallback(
-    async (input: SystemPromptInput): Promise<SystemPrompt> => {
+    async (name: string, prompt: string): Promise<SystemPrompt> => {
       try {
         setError(null);
-        const result = await createSystemPrompt(input);
+        const result = await createSystemPrompt(name, prompt);
         await fetchPrompts(); // Refresh list
         return result;
       } catch (err) {
@@ -74,11 +70,12 @@ export const useSystemPrompts = () => {
   const updatePrompt = useCallback(
     async (
       id: number,
-      input: UpdateSystemPromptInput
+      name?: string,
+      prompt?: string
     ): Promise<SystemPrompt> => {
       try {
         setError(null);
-        const result = await updateSystemPrompt(id, input);
+        const result = await editSystemPrompt(id, name, prompt);
         await fetchPrompts(); // Refresh list
         return result;
       } catch (err) {

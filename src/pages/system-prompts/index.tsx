@@ -101,16 +101,10 @@ const SystemPrompts = () => {
 
       if (form.id) {
         // Update existing prompt
-        await updatePrompt(form.id, {
-          name: form.name,
-          prompt: form.prompt,
-        });
+        await updatePrompt(form.id, form.name, form.prompt);
       } else {
         // Create new prompt
-        const newPrompt = await createPrompt({
-          name: form.name,
-          prompt: form.prompt,
-        });
+        const newPrompt = await createPrompt(form.name, form.prompt);
         // Auto-select the newly created prompt
         handleSelectPrompt(newPrompt.id);
       }
@@ -231,7 +225,7 @@ const SystemPrompts = () => {
                 </CardHeader>
                 <div className="absolute bottom-2 left-4 w-full flex items-center justify-between">
                   <span className="text-[10px] lg:text-xs text-muted-foreground select-none">
-                    {prompt.created_at}
+                    {prompt.createdAt}
                   </span>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild className="mr-6">

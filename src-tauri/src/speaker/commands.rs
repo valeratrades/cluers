@@ -1,53 +1,30 @@
 // Pluely AI Speech Detection, and capture system audio (speaker output) as a stream of f32 samples.
+use crate::db::schema::AttachedFile;
+use crate::llm::commands::{complete, Chat, ProviderInput};
+use crate::llm::provider::HistoryMessage;
+use crate::llm::{stt, LlmError, LlmState};
+use crate::speaker::turn::{Input, Output, Speaker, TurnEvent, Turns, SKIP_INSTRUCTION, SKIP_WORDS};
+use crate::speaker::vad::{
+    apply_noise_gate, calculate_audio_metrics, Segmenter, VadConfig, VadEvent,
+};
 use crate::speaker::{AudioDevice, SpeakerInput};
 use anyhow::Result;
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use futures_util::StreamExt;
+use futures_util::future::{BoxFuture, OptionFuture};
+use futures_util::stream::{self, FuturesUnordered};
+use futures_util::{FutureExt, Stream, StreamExt};
 use hound::{WavSpec, WavWriter};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-// Memory ordering choice for capture state:
-// `Acquire` on the load side and `Release` on the store side establish a
-// happens-before relationship - any thread that observes `is_capturing == true`
-// is guaranteed to see all the side-effects that preceded the store, and vice versa.
-// `AcqRel` on compare_exchange combines both for the success case.
-use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Listener, Manager};
+use std::task::Poll;
+use std::time::Duration;
+use tauri::ipc::Channel;
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_shell::ShellExt;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tracing::{error, warn};
 
-// VAD Configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VadConfig {
-    pub enabled: bool,
-    pub hop_size: usize,
-    pub sensitivity_rms: f32,
-    pub peak_threshold: f32,
-    pub silence_chunks: usize,
-    pub min_speech_chunks: usize,
-    pub pre_speech_chunks: usize,
-    pub noise_gate_threshold: f32,
-    pub max_recording_duration_secs: u64,
-}
-
-impl Default for VadConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            hop_size: 1024,
-            sensitivity_rms: 0.012, // Much less sensitive - only real speech
-            peak_threshold: 0.035,  // Higher threshold - filters clicks/noise
-            silence_chunks: 45,     // ~1.0s of silence before stopping
-            min_speech_chunks: 7,   // ~0.16s - captures short answers
-            pre_speech_chunks: 12,  // ~0.27s - enough to catch word start
-            noise_gate_threshold: 0.003, // Stronger noise filtering
-            max_recording_duration_secs: 180, // 3 minutes default
-        }
-    }
-}
+pub(super) const STT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Live per-chunk metrics emitted to the UI so users can see why VAD does or
 /// does not trigger on their setup.
@@ -71,421 +48,530 @@ pub struct VadCalibration {
     pub noise_gate_threshold: f32,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfig {
+    stt: ProviderInput,
+    ai: ProviderInput,
+    system_prompt: String,
+    attached_files: Vec<AttachedFile>,
+}
+
+/// Renderer-held session memory, seeded into each capture.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Session {
+    config: SessionConfig,
+    history: Vec<HistoryMessage>,
+    carry: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Control {
+    Config { config: Box<SessionConfig> },
+    Prompt { text: String },
+    Record { action: Record },
+}
+
+/// Continuous-mode recording actions.
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub enum Record {
+    Start,
+    Send,
+    Discard,
+}
+
+/// Payload of `continuous-recording-stopped`.
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+enum Stopped {
+    Sent,
+    Limit,
+    Discarded,
+}
+
+pub(crate) struct Capture {
+    task: JoinHandle<()>,
+    control: mpsc::UnboundedSender<Control>,
+    record: mpsc::UnboundedSender<Record>,
+}
+
 #[tauri::command]
 pub async fn start_system_audio_capture(
     app: AppHandle,
-    vad_config: Option<VadConfig>,
+    vad_config: VadConfig,
     device_id: Option<String>,
+    mic_device_id: Option<String>,
+    session: Session,
+    events: Channel<TurnEvent>,
 ) -> Result<(), String> {
     let state = app.state::<crate::AudioState>();
-
-    // Atomic entry guard: flips false -> true exactly once. Concurrent callers
-    // that lose the CAS race exit immediately without setting up any resources.
-    if state
-        .is_capturing
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        warn!("Capture already running");
-        return Err("Capture already running".to_string());
-    }
-
-    // From here on, any error path must reset is_capturing back to false.
-    // Wrap the setup in a closure so we can roll back on failure with one path.
-    let setup = (|| -> Result<_, String> {
-        // Update VAD config if provided
-        if let Some(config) = vad_config {
-            let mut vad_cfg = state
-                .vad_config
-                .lock()
-                .map_err(|e| format!("Failed to acquire VAD config lock: {}", e))?;
-            *vad_cfg = config;
-        }
-
-        let input = SpeakerInput::new_with_device(device_id).map_err(|e| {
-            error!("Failed to create speaker input: {}", e);
-            format!("Failed to access system audio: {}", e)
-        })?;
-
-        let stream = input.stream();
-        let sr = stream.sample_rate();
-
-        // Validate sample rate
-        if !(8000..=96000).contains(&sr) {
-            error!("Invalid sample rate: {}", sr);
-            return Err(format!(
-                "Invalid sample rate: {}. Expected 8000-96000 Hz",
-                sr
-            ));
-        }
-
-        let vad_config = state
-            .vad_config
-            .lock()
-            .map_err(|e| format!("Failed to read VAD config: {}", e))?
-            .clone();
-
-        Ok((stream, sr, vad_config))
-    })();
-
-    let (stream, sr, vad_config) = match setup {
-        Ok(v) => v,
-        Err(e) => {
-            // Roll back the entry guard so the next start can proceed.
-            state.is_capturing.store(false, Ordering::Release);
-            return Err(e);
-        }
-    };
-
     let app_clone = app.clone();
+    state
+        .start(|control, record| {
+            vad_config.validate()?;
+            state.vad.send_replace(vad_config.clone());
+            let vad = state.vad.subscribe();
+            let record = (!vad_config.enabled).then_some(record);
 
-    // Emit capture started event
-    if let Err(e) = app_clone.emit("capture-started", sr) {
-        error!("Failed to emit capture-started: {}", e);
-    }
+            // opened first: open skew then only delays the mic, so echo never precedes its source
+            let mic = vad_config
+                .enabled
+                .then(|| SpeakerInput::microphone(mic_device_id))
+                .transpose()
+                .map_err(|e| {
+                    error!("Failed to open microphone: {e:#}");
+                    format!("Failed to access microphone: {e}")
+                })?
+                .map(SpeakerInput::stream);
 
-    let state_clone = app.state::<crate::AudioState>();
-    let task = tokio::spawn(async move {
-        if vad_config.enabled {
-            run_vad_capture(app_clone.clone(), stream, sr, vad_config).await;
-        } else {
-            run_continuous_capture(app_clone.clone(), stream, sr, vad_config).await;
-        }
+            let input = SpeakerInput::new_with_device(device_id).map_err(|e| {
+                error!("Failed to create speaker input: {}", e);
+                format!("Failed to access system audio: {}", e)
+            })?;
 
-        let state = app_clone.state::<crate::AudioState>();
-        {
-            if let Ok(mut guard) = state.stream_task.lock() {
-                *guard = None;
-            };
-        }
-        // Also clear `is_capturing` so the next start isn't blocked by stale state
-        // when the task ends naturally (max duration, safety cap, stream EOF, etc.)
-        state.is_capturing.store(false, Ordering::Release);
-    });
+            let stream = input.stream();
+            let sr = stream.sample_rate();
 
-    *state_clone
-        .stream_task
-        .lock()
-        .map_err(|e| format!("Failed to store task: {}", e))? = Some(task);
+            if !(8000..=96000).contains(&sr) {
+                error!("Invalid sample rate: {}", sr);
+                return Err(format!(
+                    "Invalid sample rate: {}. Expected 8000-96000 Hz",
+                    sr
+                ));
+            }
 
-    Ok(())
+            let vads = mic
+                .map(|mic| -> Result<_, String> {
+                    assert_eq!(mic.sample_rate(), sr, "both Pulse streams request 44.1kHz");
+                    Ok((
+                        mic,
+                        Segmenter::new(&vad_config, sr)?,
+                        Segmenter::new(&vad_config, sr)?,
+                    ))
+                })
+                .transpose()?;
+
+            Ok(async move {
+                let app = app_clone;
+                let mut stream = stream;
+                let Some((mut mic, mut sys_seg, mut mic_seg)) = vads else {
+                    let record = record.expect("kept in continuous mode");
+                    let audio = recordings(&app, &mut stream, record, sr, vad.clone());
+                    drive(&app, sr, vad, audio, session, control, events).await;
+                    report_stream_error(&app, stream.error());
+                    return;
+                };
+                // ponytail: one sample clock for both devices; under plain PulseAudio (no PipeWire rate matching) clock drift is ~0.2s/h worst case. Resync on timestamps if long sessions show it.
+                let (mut seen, mut stalled, mut live) = (0u64, None, vad.clone());
+                let audio = lockstep(&mut stream, &mut mic, 2 * sr as usize, &mut stalled)
+                    .map(|(s, m)| {
+                        if live.has_changed().expect("AudioState owns the sender") {
+                            let c = live.borrow_and_update().clone();
+                            sys_seg.reconfigure(&c).expect("validated by update_vad_config");
+                            mic_seg.reconfigure(&c).expect("validated by update_vad_config");
+                        }
+                        seen += s.len() as u64;
+                        let mut ev: Vec<_> = sys_seg
+                            .push(&s)
+                            .into_iter()
+                            .map(|e| (Speaker::Interviewer, e))
+                            .collect();
+                        ev.extend(mic_seg.push(&m).into_iter().map(|e| (Speaker::User, e))); // interviewer first: echo never precedes its source
+                        (ev, seen * 1000 / sr as u64)
+                    });
+                drive(&app, sr, vad, audio, session, control, events).await;
+                report_stream_error(&app, stream.error());
+                report_stream_error(&app, mic.error().map(|e| e.context("Microphone")));
+                report_stream_error(&app, stalled.map(anyhow::Error::msg));
+            })
+        })
+        .await
 }
 
-// VAD-enabled capture - OPTIMIZED for real-time speech detection
-async fn run_vad_capture(
-    app: AppHandle,
-    stream: impl StreamExt<Item = f32> + Unpin,
+/// Pairs system and mic samples in equal-length chunks. Ends when either ends, or with `stalled` set once one side runs `max_lag` samples ahead.
+fn lockstep<'a, S: Stream<Item = f32> + Unpin + 'a>(
+    sys: S,
+    mic: S,
+    max_lag: usize,
+    stalled: &'a mut Option<String>,
+) -> impl Stream<Item = (Vec<f32>, Vec<f32>)> + 'a {
+    let (mut sys, mut mic) = (sys.ready_chunks(4096), mic.ready_chunks(4096));
+    let (mut sys_buf, mut mic_buf) = (Vec::new(), Vec::new());
+    stream::poll_fn(move |cx| loop {
+        let mut progressed = false;
+        for (side, buf) in [(&mut sys, &mut sys_buf), (&mut mic, &mut mic_buf)] {
+            match side.poll_next_unpin(cx) {
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(c)) => {
+                    buf.extend(c);
+                    progressed = true;
+                }
+                Poll::Pending => {}
+            }
+        }
+        let n = sys_buf.len().min(mic_buf.len());
+        for (lagging, ahead) in [("Microphone", &sys_buf), ("System audio", &mic_buf)] {
+            if ahead.len() - n > max_lag {
+                *stalled = Some(format!(
+                    "{lagging} stopped delivering audio while the other device kept going"
+                ));
+                return Poll::Ready(None);
+            }
+        }
+        if n > 0 {
+            return Poll::Ready(Some((
+                sys_buf.drain(..n).collect(),
+                mic_buf.drain(..n).collect(),
+            )));
+        }
+        if !progressed {
+            return Poll::Pending;
+        }
+    })
+}
+
+fn report_stream_error(app: &AppHandle, e: Option<anyhow::Error>) {
+    let Some(e) = e else { return };
+    error!("System audio capture ended: {e:#}");
+    emit(app, "capture-error", format!("{e:#}"));
+}
+
+fn emit<R: Runtime>(app: &AppHandle<R>, event: &str, payload: impl Serialize + Clone) {
+    if let Err(e) = app.emit(event, payload) {
+        error!("Failed to emit {event}: {e}");
+    }
+}
+
+#[tauri::command]
+pub async fn system_audio_control(app: AppHandle, control: Control) -> Result<(), String> {
+    app.state::<crate::AudioState>().control(control).await
+}
+
+/// Continuous mode: one segment per recording, started and ended by `actions`. Ends when either source ends.
+fn recordings<'a, R: Runtime>(
+    app: &'a AppHandle<R>,
+    samples: impl Stream<Item = f32> + Unpin + 'a,
+    mut actions: mpsc::UnboundedReceiver<Record>,
     sr: u32,
-    config: VadConfig,
-) {
-    let mut stream = stream;
-    let mut buffer: VecDeque<f32> = VecDeque::new();
-    let mut pre_speech: VecDeque<f32> =
-        VecDeque::with_capacity(config.pre_speech_chunks * config.hop_size);
-    let mut speech_buffer = Vec::new();
-    let mut in_speech = false;
-    let mut silence_chunks = 0;
-    let mut speech_chunks = 0;
-    let max_samples = sr as usize * 30; // 30s safety cap per utterance
-
-    // Throttle metrics emission to ~10 Hz regardless of sample rate / hop size.
-    let metrics_interval = Duration::from_millis(100);
-    let mut last_metrics_emit = Instant::now()
-        .checked_sub(metrics_interval)
-        .unwrap_or_else(Instant::now);
-
-    while let Some(sample) = stream.next().await {
-        buffer.push_back(sample);
-
-        // Process in fixed chunks for VAD analysis
-        while buffer.len() >= config.hop_size {
-            let mut mono = Vec::with_capacity(config.hop_size);
-            for _ in 0..config.hop_size {
-                if let Some(v) = buffer.pop_front() {
-                    mono.push(v);
-                }
+    vad: watch::Receiver<VadConfig>,
+) -> impl Stream<Item = (Vec<(Speaker, VadEvent)>, u64)> + 'a {
+    let mut samples = samples.ready_chunks(4096);
+    let (mut buf, mut start, mut seen): (Option<Vec<f32>>, u64, u64) = (None, 0, 0);
+    let finish = move |samples: Vec<f32>,
+                       start: u64,
+                       how: Stopped,
+                       cfg: &VadConfig|
+          -> Option<(Vec<(Speaker, VadEvent)>, u64)> {
+        let ms = |s: u64| s * 1000 / sr as u64;
+        let (start_ms, end_ms) = (ms(start), ms(start + samples.len() as u64));
+        let discard = |why: &str| {
+            emit(app, "speech-discarded", why);
+            emit(app, "continuous-recording-stopped", Stopped::Discarded);
+            None
+        };
+        if end_ms - start_ms < (cfg.min_speech_ms as u64).max(1) {
+            return discard("recording too short"); // max(1): keeps segment ids unique for Turns
+        }
+        let (_, peak) = calculate_audio_metrics(&samples);
+        if peak < cfg.noise_gate_threshold {
+            warn!(
+                "Continuous recording contained no audible signal (peak {peak:.6}, gate {:.6})",
+                cfg.noise_gate_threshold
+            );
+            return discard(
+                "recording was silent - check that audio is routed to the captured device",
+            );
+        }
+        emit(app, "continuous-recording-stopped", how);
+        let samples = apply_noise_gate(&samples, cfg.noise_gate_threshold);
+        let segment = VadEvent::Segment {
+            samples,
+            start_ms,
+            end_ms,
+        };
+        Some((vec![(Speaker::Interviewer, segment)], end_ms))
+    };
+    stream::poll_fn(move |cx| loop {
+        match actions.poll_recv(cx) {
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Ready(Some(Record::Start)) => {
+                if buf.is_none() {
+                    buf = Some(Vec::new());
+                    start = seen;
+                    emit(
+                        app,
+                        "continuous-recording-start",
+                        vad.borrow().max_recording_duration_secs,
+                    );
+                } // else Enter and a click raced
+                continue;
             }
-
-            // Apply noise gate BEFORE VAD (critical for accuracy)
-            let mono = apply_noise_gate(&mono, config.noise_gate_threshold);
-
-            let (rms, peak) = calculate_audio_metrics(&mono);
-            let is_speech =
-                rms > config.sensitivity_rms || peak > config.peak_threshold;
-
-            // Throttled metrics emission so the UI can render a live meter.
-            if last_metrics_emit.elapsed() >= metrics_interval {
-                last_metrics_emit = Instant::now();
-                if let Err(e) = app.emit(
-                    "vad-metrics",
-                    VadMetrics {
-                        rms,
-                        peak,
-                        sensitivity_rms: config.sensitivity_rms,
-                        peak_threshold: config.peak_threshold,
-                        noise_gate_threshold: config.noise_gate_threshold,
-                        in_speech,
-                    },
-                ) {
-                    error!("Failed to emit vad-metrics: {}", e);
-                }
-            }
-
-            if is_speech {
-                if !in_speech {
-                    // Speech START detected
-                    in_speech = true;
-                    speech_chunks = 0;
-
-                    // Include pre-speech buffer for natural sound
-                    speech_buffer.extend(pre_speech.drain(..));
-
-                    if let Err(e) = app.emit("speech-start", ()) {
-                        error!("Failed to emit speech-start: {}", e);
-                    }
-                }
-
-                speech_chunks += 1;
-                speech_buffer.extend_from_slice(&mono);
-                silence_chunks = 0; // Reset silence counter on any speech
-
-                // Safety cap: force emit if exceeds 30s
-                if speech_buffer.len() > max_samples {
-                    let normalized_buffer = normalize_audio_level(&speech_buffer, 0.1);
-                    match samples_to_wav_b64(sr, &normalized_buffer) {
-                        Ok(b64) => {
-                            if let Err(e) = app.emit("speech-detected", b64) {
-                                error!("Failed to emit speech-detected (max-samples cap): {}", e);
-                            }
-                        }
-                        Err(e) => error!("Failed to encode speech (max-samples cap): {}", e),
-                    }
-                    speech_buffer.clear();
-                    in_speech = false;
-                    speech_chunks = 0;
-                }
-            } else {
-                // Silence detected
-                if in_speech {
-                    silence_chunks += 1;
-
-                    // Continue collecting during silence (important for natural speech)
-                    speech_buffer.extend_from_slice(&mono);
-
-                    // Check if silence duration exceeds threshold
-                    if silence_chunks >= config.silence_chunks {
-                        // Verify minimum speech duration
-                        if speech_chunks >= config.min_speech_chunks && !speech_buffer.is_empty() {
-                            // Trim trailing silence (keep ~0.15s for natural ending)
-                            let silence_duration_samples = silence_chunks * config.hop_size;
-                            let keep_silence_samples = (sr as usize) * 15 / 100; // 0.15s
-                            let trim_amount =
-                                silence_duration_samples.saturating_sub(keep_silence_samples);
-
-                            if speech_buffer.len() > trim_amount {
-                                speech_buffer.truncate(speech_buffer.len() - trim_amount);
-                            }
-
-                            // Emit complete speech segment
-                            let normalized_buffer = normalize_audio_level(&speech_buffer, 0.1);
-                            match samples_to_wav_b64(sr, &normalized_buffer) {
-                                Ok(b64) => {
-                                    if let Err(e) = app.emit("speech-detected", b64) {
-                                        error!("Failed to emit speech-detected: {}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to encode speech to WAV: {}", e);
-                                    if let Err(emit_err) =
-                                        app.emit("audio-encoding-error", "Failed to encode speech")
-                                    {
-                                        error!(
-                                            "Failed to emit audio-encoding-error: {}",
-                                            emit_err
-                                        );
-                                    }
-                                }
-                            }
-                        } else if let Err(e) = app.emit(
-                            "speech-discarded",
-                            "Audio too short (likely background noise)",
-                        ) {
-                            error!("Failed to emit speech-discarded: {}", e);
-                        }
-
-                        // Reset for next speech detection
-                        speech_buffer.clear();
-                        in_speech = false;
-                        silence_chunks = 0;
-                        speech_chunks = 0;
+            Poll::Ready(Some(action)) => {
+                let Some(b) = buf.take() else { continue }; // raced the limit auto-send
+                if let Record::Send = action {
+                    if let Some(item) = finish(b, start, Stopped::Sent, &vad.borrow()) {
+                        return Poll::Ready(Some(item));
                     }
                 } else {
-                    // Not in speech yet - maintain rolling pre-speech buffer
-                    pre_speech.extend(mono.into_iter());
-
-                    // Trim excess (maintain fixed size)
-                    while pre_speech.len() > config.pre_speech_chunks * config.hop_size {
-                        pre_speech.pop_front();
-                    }
-
-                    // Periodically shrink capacity to prevent memory bloat
-                    if pre_speech.len() == config.pre_speech_chunks * config.hop_size {
-                        pre_speech.shrink_to_fit();
-                    }
+                    emit(app, "continuous-recording-stopped", Stopped::Discarded);
                 }
+                continue;
             }
+            Poll::Pending => {}
+        }
+        let chunk = match samples.poll_next_unpin(cx) {
+            Poll::Ready(Some(chunk)) => chunk,
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => return Poll::Pending,
+        };
+        seen += chunk.len() as u64;
+        let Some(b) = &mut buf else { continue };
+        let limit = sr as usize * vad.borrow().max_recording_duration_secs as usize;
+        let before = b.len() / sr as usize;
+        b.extend(chunk);
+        b.truncate(limit);
+        for secs in before + 1..=b.len() / sr as usize {
+            emit(app, "recording-progress", secs);
+        }
+        if b.len() == limit {
+            let b = buf.take().expect("matched Some above");
+            if let Some(item) = finish(b, start, Stopped::Limit, &vad.borrow()) {
+                return Poll::Ready(Some(item));
+            }
+        }
+    })
+}
+
+impl crate::AudioState {
+    /// `Record` goes to the continuous recorder, everything else to `drive`.
+    async fn control(&self, control: Control) -> Result<(), String> {
+        let slot = self.capture.lock().await;
+        let c = slot.as_ref().ok_or("System audio capture is not running")?;
+        // SendError only hands our own message back; a closed receiver is the whole error
+        match control {
+            Control::Record { action } => c.record.send(action).map_err(|_| {
+                "Continuous recording is not available (auto-detect mode or capture ended)"
+                    .to_string()
+            }),
+            other => c
+                .control
+                .send(other)
+                .map_err(|_| "System audio capture is not running".to_string()),
+        }
+    }
+
+    /// Locks the capture slot; Err if a capture is live. A finished capture is reaped.
+    async fn lock_idle(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<Capture>>, String> {
+        let mut slot = self.capture.lock().await;
+        if let Some(done) = slot.take_if(|c| c.task.is_finished()) {
+            reap(done.task).await;
+        }
+        if slot.is_some() {
+            warn!("Capture already running");
+            return Err("Capture already running".to_string());
+        }
+        Ok(slot)
+    }
+
+    async fn start<F>(
+        &self,
+        open: impl FnOnce(
+            mpsc::UnboundedReceiver<Control>,
+            mpsc::UnboundedReceiver<Record>,
+        ) -> Result<F, String>,
+    ) -> Result<(), String>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut slot = self.lock_idle().await?;
+        let (control, control_rx) = mpsc::unbounded_channel();
+        let (record, record_rx) = mpsc::unbounded_channel();
+        *slot = Some(Capture {
+            task: tokio::spawn(open(control_rx, record_rx)?),
+            control,
+            record,
+        });
+        Ok(())
+    }
+
+    async fn stop(&self) {
+        let mut slot = self.capture.lock().await;
+        if let Some(c) = slot.take() {
+            c.task.abort();
+            reap(c.task).await;
         }
     }
 }
 
-// Continuous capture (VAD disabled)
-async fn run_continuous_capture(
-    app: AppHandle,
-    stream: impl StreamExt<Item = f32> + Unpin,
+async fn reap(task: JoinHandle<()>) {
+    if let Err(e) = task.await {
+        if e.is_panic() {
+            std::panic::resume_unwind(e.into_panic());
+        } // Cancelled is our own abort
+    }
+}
+
+/// Segment -> STT -> turn -> LLM loop. Owns every STT and LLM future, so aborting the task cancels them.
+async fn drive(
+    app: &AppHandle,
     sr: u32,
-    config: VadConfig,
+    mut vad: watch::Receiver<VadConfig>,
+    mut audio: impl Stream<Item = (Vec<(Speaker, VadEvent)>, u64)> + Unpin,
+    session: Session,
+    mut control: mpsc::UnboundedReceiver<Control>,
+    events: Channel<TurnEvent>,
 ) {
-    let mut stream = stream;
-    let max_samples = (sr as u64 * config.max_recording_duration_secs) as usize;
+    let llm = app.state::<LlmState>();
+    let llm: &LlmState = &llm;
+    let Session {
+        mut config,
+        history,
+        carry,
+    } = session;
+    let mut vad_cfg = vad.borrow_and_update().clone();
+    let continuous = !vad_cfg.enabled;
+    let mut turns = Turns::new(history, carry, &vad_cfg);
+    let mut transcripts = FuturesUnordered::<BoxFuture<'_, (u64, Result<String, String>)>>::new();
+    let mut answer: Option<BoxFuture<'_, Result<String, LlmError>>> = None;
+    let mut audio_done = false;
 
-    // Pre-allocate buffer to prevent reallocations
-    let mut audio_buffer = Vec::with_capacity(max_samples);
-    let start_time = Instant::now();
-    let max_duration = Duration::from_secs(config.max_recording_duration_secs);
-
-    // Atomic flag for manual stop
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_flag_for_listener = stop_flag.clone();
-
-    // Listen for manual stop event
-    let stop_listener = app.listen("manual-stop-continuous", move |_| {
-        stop_flag_for_listener.store(true, Ordering::Release);
-    });
-
-    // Emit recording started
-    if let Err(e) = app.emit(
-        "continuous-recording-start",
-        config.max_recording_duration_secs,
-    ) {
-        error!("Failed to emit continuous-recording-start: {}", e);
-    }
-
-    // Accumulate audio - check stop flag on EVERY sample for immediate response
     loop {
-        // Check stop flag FIRST on every iteration for immediate stopping
-        if stop_flag.load(Ordering::Acquire) {
-            break;
+        if audio_done && transcripts.is_empty() && answer.is_none() {
+            return;
         }
-
-        tokio::select! {
-            sample_opt = stream.next() => {
-                match sample_opt {
-                    Some(sample) => {
-                        if stop_flag.load(Ordering::Acquire) {
-                            break;
-                        }
-
-                        audio_buffer.push(sample);
-
-                        let elapsed = start_time.elapsed();
-
-                        // Emit progress every second
-                        if audio_buffer.len() % (sr as usize) == 0 {
-                            if let Err(e) = app.emit("recording-progress", elapsed.as_secs()) {
-                                error!("Failed to emit recording-progress: {}", e);
+        let inputs = tokio::select! {
+            chunk = audio.next(), if !audio_done => match chunk {
+                None => {
+                    audio_done = true;
+                    vec![Input::Flush]
+                }
+                Some((vad_events, now_ms)) => {
+                    let mut inputs = Vec::new();
+                    for (speaker, ev) in vad_events {
+                        match ev {
+                            VadEvent::SpeechStart { start_ms } => {
+                                inputs.push(Input::SpeechStart { speaker, at_ms: start_ms })
                             }
+                            VadEvent::Segment { samples, start_ms, end_ms } => {
+                                if speaker == Speaker::Interviewer {
+                                    let wav = samples_to_wav(sr, &normalize_audio_level(&samples, 0.1));
+                                    let provider = config.stt.clone();
+                                    transcripts.push(
+                                        async move {
+                                            let text = match tokio::time::timeout(
+                                                STT_TIMEOUT,
+                                                stt::transcribe(app, llm, &provider, &wav, "audio/wav"),
+                                            )
+                                            .await
+                                            {
+                                                Ok(r) => r.map_err(|e| format!("Transcription failed: {e}")),
+                                                Err(_) => Err("Speech transcription timed out (30s)".to_string()),
+                                            };
+                                            (start_ms, text)
+                                        }
+                                        .boxed(),
+                                    );
+                                }
+                                inputs.push(Input::Segment { speaker, start_ms, end_ms });
+                                if continuous {
+                                    inputs.push(Input::Flush); // each recording is one turn
+                                }
+                            }
+                            VadEvent::Discarded { .. } => {
+                                if speaker == Speaker::Interviewer {
+                                    emit(app, "speech-discarded", "Audio too short (likely background noise)");
+                                }
+                                inputs.push(Input::Discarded { speaker });
+                            }
+                            VadEvent::Metrics { .. } if speaker == Speaker::User => {} // meters and calibration are about system audio
+                            VadEvent::Metrics { rms, peak, in_speech } => emit(
+                                app,
+                                "vad-metrics",
+                                VadMetrics {
+                                    rms,
+                                    peak,
+                                    sensitivity_rms: vad_cfg.sensitivity_rms,
+                                    peak_threshold: vad_cfg.peak_threshold,
+                                    noise_gate_threshold: vad_cfg.noise_gate_threshold,
+                                    in_speech,
+                                },
+                            ),
                         }
+                    }
+                    inputs.push(Input::Tick { now_ms });
+                    inputs
+                }
+            },
+            Some((start_ms, text)) = transcripts.next() => vec![Input::Transcript { start_ms, text }],
+            Some(reply) = OptionFuture::from(answer.as_mut()) => {
+                answer = None;
+                vec![Input::Reply(reply.map_err(|e| e.to_string()))]
+            }
+            Some(c) = control.recv() => match c {
+                Control::Config { config: c } => {
+                    config = *c;
+                    Vec::new()
+                }
+                Control::Prompt { text } => vec![Input::Prompt(text)],
+                Control::Record { .. } => unreachable!("AudioState::control routes it to the recorder"),
+            },
+            Ok(()) = vad.changed() => {
+                vad_cfg = vad.borrow_and_update().clone();
+                turns.reconfigure(&vad_cfg);
+                Vec::new()
+            }
+        };
 
-                        // Check size limit (safety)
-                        if audio_buffer.len() >= max_samples {
-                            break;
+        for input in inputs {
+            for out in turns.push(input) {
+                match out {
+                    Output::Ask { message, history } => {
+                        assert!(answer.is_none(), "Turns asks one at a time");
+                        let chat = Chat {
+                            provider: config.ai.clone(),
+                            message,
+                            system_prompt: Some(format!("{}\n\n{SKIP_INSTRUCTION}", config.system_prompt)),
+                            history,
+                            attached_files: config.attached_files.clone(),
+                        };
+                        let events = events.clone();
+                        answer = Some(
+                            async move {
+                                let (mut full, mut sent) = (String::new(), 0);
+                                let mut on_delta = |d: String| {
+                                    full.push_str(&d);
+                                    if SKIP_WORDS.iter().any(|w| w.starts_with(full.trim())) {
+                                        return Ok(()); // may still become a skip word, which never reaches the screen
+                                    }
+                                    let delta = full[sent..].to_string();
+                                    sent = full.len();
+                                    events
+                                        .send(TurnEvent::Delta { delta })
+                                        .map_err(|e| LlmError::Channel(e.to_string()))
+                                };
+                                complete(app, llm, chat, &mut on_delta).await
+                            }
+                            .boxed(),
+                        );
+                    }
+                    Output::Event(e) => {
+                        if let Err(err) = events.send(e) {
+                            error!("Turn event channel closed, ending capture: {err}"); // its renderer is gone
+                            return;
                         }
-
-                        // Check time limit
-                        if elapsed >= max_duration {
-                            break;
-                        }
-                    },
-                    None => {
-                        warn!("Audio stream ended unexpectedly");
-                        break;
                     }
                 }
             }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
-            }
         }
-    }
-
-    // Clean up event listener (CRITICAL)
-    app.unlisten(stop_listener);
-
-    // Process and emit audio
-    if !audio_buffer.is_empty() {
-        // let duration = start_time.elapsed().as_secs_f32();
-
-        // Apply noise gate
-        let cleaned_audio = apply_noise_gate(&audio_buffer, config.noise_gate_threshold);
-        let cleaned_audio = normalize_audio_level(&cleaned_audio, 0.1);
-
-        match samples_to_wav_b64(sr, &cleaned_audio) {
-            Ok(b64) => {
-                if let Err(e) = app.emit("speech-detected", b64) {
-                    error!("Failed to emit speech-detected (continuous): {}", e);
-                }
-            }
-            Err(e) => {
-                error!("Failed to encode continuous audio: {}", e);
-                if let Err(emit_err) = app.emit("audio-encoding-error", e) {
-                    error!("Failed to emit audio-encoding-error: {}", emit_err);
-                }
-            }
-        }
-    } else {
-        warn!("No audio captured in continuous mode");
-        if let Err(e) = app.emit("audio-encoding-error", "No audio recorded") {
-            error!("Failed to emit audio-encoding-error: {}", e);
-        }
-    }
-
-    if let Err(e) = app.emit("continuous-recording-stopped", ()) {
-        error!("Failed to emit continuous-recording-stopped: {}", e);
     }
 }
 
-// Apply noise gate
-fn apply_noise_gate(samples: &[f32], threshold: f32) -> Vec<f32> {
-    const KNEE_RATIO: f32 = 3.0; // Compression ratio for soft knee
-
-    samples
-        .iter()
-        .map(|&s| {
-            let abs = s.abs();
-            if abs < threshold {
-                s * (abs / threshold).powf(1.0 / KNEE_RATIO)
-            } else {
-                s
-            }
-        })
-        .collect()
-}
-
-// Calculate RMS and peak (optimized)
-fn calculate_audio_metrics(chunk: &[f32]) -> (f32, f32) {
-    let mut sumsq = 0.0f32;
-    let mut peak = 0.0f32;
-
-    for &v in chunk {
-        let a = v.abs();
-        peak = peak.max(a);
-        sumsq += v * v;
-    }
-
-    let rms = (sumsq / chunk.len() as f32).sqrt();
-    (rms, peak)
-}
-
-fn normalize_audio_level(samples: &[f32], target_rms: f32) -> Vec<f32> {
+pub(super) fn normalize_audio_level(samples: &[f32], target_rms: f32) -> Vec<f32> {
     if samples.is_empty() {
         return Vec::new();
     }
@@ -512,22 +598,8 @@ fn normalize_audio_level(samples: &[f32], target_rms: f32) -> Vec<f32> {
         .collect()
 }
 
-// Convert samples to WAV base64 (with proper error handling)
-fn samples_to_wav_b64(sample_rate: u32, mono_f32: &[f32]) -> Result<String, String> {
-    // Validate sample rate
-    if !(8000..=96000).contains(&sample_rate) {
-        error!("Invalid sample rate: {}", sample_rate);
-        return Err(format!(
-            "Invalid sample rate: {}. Expected 8000-96000 Hz",
-            sample_rate
-        ));
-    }
-
-    // Validate buffer
-    if mono_f32.is_empty() {
-        return Err("Empty audio buffer".to_string());
-    }
-
+pub(super) fn samples_to_wav(sample_rate: u32, mono_f32: &[f32]) -> Vec<u8> {
+    assert!(!mono_f32.is_empty(), "segments are never empty");
     let mut cursor = Cursor::new(Vec::new());
     let spec = WavSpec {
         channels: 1,
@@ -535,64 +607,18 @@ fn samples_to_wav_b64(sample_rate: u32, mono_f32: &[f32]) -> Result<String, Stri
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-
-    let mut writer = WavWriter::new(&mut cursor, spec).map_err(|e| {
-        error!("Failed to create WAV writer: {}", e);
-        e.to_string()
-    })?;
-
+    let mut writer = WavWriter::new(&mut cursor, spec).expect("writing to a Vec cannot fail");
     for &s in mono_f32 {
-        let clamped = s.clamp(-1.0, 1.0);
-        let sample_i16 = (clamped * i16::MAX as f32) as i16;
-        writer.write_sample(sample_i16).map_err(|e| e.to_string())?;
+        let sample_i16 = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        writer.write_sample(sample_i16).expect("writing to a Vec cannot fail");
     }
-
-    writer.finalize().map_err(|e| e.to_string())?;
-
-    Ok(B64.encode(cursor.into_inner()))
+    writer.finalize().expect("writing to a Vec cannot fail");
+    cursor.into_inner()
 }
 
 #[tauri::command]
 pub async fn stop_system_audio_capture(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<crate::AudioState>();
-
-    // Abort task in separate scope (Send trait fix)
-    {
-        let mut guard = state
-            .stream_task
-            .lock()
-            .map_err(|e| format!("Failed to acquire task lock: {}", e))?;
-
-        if let Some(task) = guard.take() {
-            task.abort();
-        }
-    }
-
-    // LONGER delay for proper cleanup (300ms instead of 150ms)
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-    // Mark as not capturing
-    state.is_capturing.store(false, Ordering::Release);
-
-    // Additional cleanup delay (CRITICAL for mic indicator)
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-    // Emit stopped event
-    if let Err(e) = app.emit("capture-stopped", ()) {
-        error!("Failed to emit capture-stopped: {}", e);
-    }
-    Ok(())
-}
-
-/// Manual stop for continuous recording
-#[tauri::command]
-pub async fn manual_stop_continuous(app: AppHandle) -> Result<(), String> {
-    if let Err(e) = app.emit("manual-stop-continuous", ()) {
-        error!("Failed to emit manual-stop-continuous: {}", e);
-    }
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-
+    app.state::<crate::AudioState>().stop().await;
     Ok(())
 }
 
@@ -602,7 +628,7 @@ pub fn check_system_audio_access(_app: AppHandle) -> Result<bool, String> {
         Ok(_) => Ok(true),
         Err(e) => {
             error!("System audio access check failed: {}", e);
-            Ok(false)
+            Ok(false) // IPC contract is a bool; the cause is only logged
         }
     }
 }
@@ -632,34 +658,20 @@ pub async fn request_system_audio_access(app: AppHandle) -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
-        let commands = ["pavucontrol", "gnome-control-center sound"];
-        let mut opened = false;
-
-        for cmd in &commands {
-            if app.shell().command(cmd).spawn().is_ok() {
-                opened = true;
-                break;
-            }
-        }
-
-        if !opened {
-            warn!("Failed to open audio settings on Linux");
+        let commands: [(&str, &[&str]); 2] =
+            [("pavucontrol", &[]), ("gnome-control-center", &["sound"])];
+        // A failed spawn only means that app isn't installed; try the next one.
+        if !commands
+            .iter()
+            .any(|(cmd, args)| app.shell().command(cmd).args(*args).spawn().is_ok())
+        {
+            return Err(
+                "No audio settings app found (tried pavucontrol, gnome-control-center)".into(),
+            );
         }
     }
 
     Ok(())
-}
-
-// VAD Configuration Management
-#[tauri::command]
-pub async fn get_vad_config(app: AppHandle) -> Result<VadConfig, String> {
-    let state = app.state::<crate::AudioState>();
-    let config = state
-        .vad_config
-        .lock()
-        .map_err(|e| format!("Failed to get VAD config: {}", e))?
-        .clone();
-    Ok(config)
 }
 
 /// Sample ambient audio for `duration_secs` and derive proposed VAD thresholds
@@ -679,9 +691,7 @@ pub async fn calibrate_vad_thresholds(
     }
 
     let state = app.state::<crate::AudioState>();
-    if state.is_capturing.load(Ordering::Acquire) {
-        return Err("Stop the current capture before calibrating.".to_string());
-    }
+    let idle = state.lock_idle().await?;
 
     let input = SpeakerInput::new_with_device(device_id).map_err(|e| {
         error!("Calibration: failed to open audio source: {}", e);
@@ -694,46 +704,42 @@ pub async fn calibrate_vad_thresholds(
         return Err(format!("Invalid sample rate: {}", sr));
     }
 
-    let hop_size: usize = 1024;
-    let target_chunks = ((sr as usize * duration_secs as usize) / hop_size).max(8);
-    let mut buffer: VecDeque<f32> = VecDeque::new();
+    const HOP: usize = 1024;
+    let target_chunks = ((sr as usize * duration_secs as usize) / HOP).max(8);
     let mut floor_samples: Vec<f32> = Vec::with_capacity(target_chunks);
-
-    // Hard timeout so a misbehaving source can't hang the UI.
-    let deadline = Instant::now() + Duration::from_secs(duration_secs + 2);
-
-    while floor_samples.len() < target_chunks {
-        if Instant::now() >= deadline {
-            break;
+    let sampling = async {
+        let mut chunks = (&mut stream).ready_chunks(4096);
+        let mut pending = Vec::new();
+        while floor_samples.len() < target_chunks {
+            let chunk = chunks.next().await.ok_or("Audio source ended during calibration")?;
+            pending.extend(chunk);
+            let n = pending.len() / HOP * HOP;
+            floor_samples.extend(pending[..n].chunks_exact(HOP).map(|h| calculate_audio_metrics(h).0));
+            pending.drain(..n);
         }
-        match stream.next().await {
-            Some(sample) => {
-                buffer.push_back(sample);
-                while buffer.len() >= hop_size && floor_samples.len() < target_chunks {
-                    let mut mono = Vec::with_capacity(hop_size);
-                    for _ in 0..hop_size {
-                        if let Some(v) = buffer.pop_front() {
-                            mono.push(v);
-                        }
-                    }
-                    let (rms, _peak) = calculate_audio_metrics(&mono);
-                    floor_samples.push(rms);
-                }
-            }
-            None => break,
-        }
+        floor_samples.truncate(target_chunks);
+        Ok::<_, &str>(())
+    };
+    let sampled = tokio::time::timeout(Duration::from_secs(duration_secs + 2), sampling).await;
+    let ended = stream.error();
+    drop(stream);
+    drop(idle); // release device before admitting a start
+    match sampled {
+        Err(_) => return Err(format!("Calibration timed out: the source delivered no audio for {}s", duration_secs + 2)),
+        Ok(Err(e)) => return Err(match ended {
+            Some(cause) => format!("{e}: {cause:#}"),
+            None => e.to_string(),
+        }),
+        Ok(Ok(())) => {}
     }
 
-    if floor_samples.is_empty() {
-        return Err(
-            "No audio captured during calibration — is the source actually producing sound?"
-                .to_string(),
-        );
+    if floor_samples.iter().any(|r| r.is_nan()) {
+        return Err("Audio source produced NaN samples".to_string());
     }
 
     // Use the 90th-percentile RMS as the noise-floor "ceiling" so a single
     // transient (keystroke, mouse click) doesn't blow out the result.
-    floor_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    floor_samples.sort_by(f32::total_cmp);
     let idx = ((floor_samples.len() as f32) * 0.9) as usize;
     let noise_floor = floor_samples[idx.min(floor_samples.len() - 1)];
 
@@ -762,40 +768,15 @@ pub async fn calibrate_vad_thresholds(
 
 #[tauri::command]
 pub async fn update_vad_config(app: AppHandle, config: VadConfig) -> Result<(), String> {
-    // Validate config
-    if config.sensitivity_rms < 0.0 || config.sensitivity_rms > 1.0 {
-        return Err("Invalid sensitivity_rms: must be 0.0-1.0".to_string());
-    }
-    if config.max_recording_duration_secs > 3600 {
-        return Err("Invalid max_recording_duration_secs: must be <= 3600 (1 hour)".to_string());
-    }
-
-    let state = app.state::<crate::AudioState>();
-    *state
-        .vad_config
-        .lock()
-        .map_err(|e| format!("Failed to update VAD config: {}", e))? = config;
-
+    config.validate()?;
+    app.state::<crate::AudioState>().vad.send_replace(config);
     Ok(())
 }
 
+/// The single source of VAD defaults.
 #[tauri::command]
-pub async fn get_capture_status(app: AppHandle) -> Result<bool, String> {
-    let state = app.state::<crate::AudioState>();
-    Ok(state.is_capturing.load(Ordering::Acquire))
-}
-
-#[tauri::command]
-pub fn get_audio_sample_rate(_app: AppHandle) -> Result<u32, String> {
-    let input = SpeakerInput::new().map_err(|e| {
-        error!("Failed to create speaker input: {}", e);
-        format!("Failed to access system audio: {}", e)
-    })?;
-
-    let stream = input.stream();
-    let sr = stream.sample_rate();
-
-    Ok(sr)
+pub fn default_vad_config() -> VadConfig {
+    VadConfig::default()
 }
 
 #[tauri::command]
@@ -812,4 +793,300 @@ pub fn get_output_devices() -> Result<Vec<AudioDevice>, String> {
         error!("Failed to get output devices: {}", e);
         format!("Failed to get output devices: {}", e)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::AudioState;
+    use futures_util::{Stream, StreamExt};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    #[derive(Default)]
+    struct Counters {
+        now: AtomicUsize,
+        max: AtomicUsize,
+    }
+
+    struct FakeStream {
+        live: Arc<Counters>,
+        remaining: Option<usize>,
+    }
+
+    impl FakeStream {
+        fn new(live: Arc<Counters>, remaining: Option<usize>) -> Self {
+            let now = live.now.fetch_add(1, Ordering::SeqCst) + 1;
+            live.max.fetch_max(now, Ordering::SeqCst);
+            Self { live, remaining }
+        }
+    }
+
+    impl Drop for FakeStream {
+        fn drop(&mut self) {
+            self.live.now.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Stream for FakeStream {
+        type Item = f32;
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<f32>> {
+            match &mut self.remaining {
+                None => Poll::Pending,
+                Some(0) => Poll::Ready(None),
+                Some(n) => {
+                    *n -= 1;
+                    Poll::Ready(Some(0.0))
+                }
+            }
+        }
+    }
+
+    async fn start(
+        state: &AudioState,
+        live: &Arc<Counters>,
+        remaining: Option<usize>,
+    ) -> Result<(), String> {
+        let live = live.clone();
+        state
+            .start(|control, record| {
+                drop(record); // like the VAD path
+                let mut s = FakeStream::new(live, remaining);
+                Ok(async move {
+                    while s.next().await.is_some() {}
+                    drop(control);
+                })
+            })
+            .await
+    }
+
+    #[derive(Debug)]
+    enum Op {
+        Start,
+        StartFinite(usize),
+        WaitFinished,
+        Stop,
+        Prompt,
+        Record,
+    }
+
+    #[tokio::test]
+    async fn lifecycle() {
+        use Op::*;
+        // (ops, per-op success, live streams at end, max concurrent streams)
+        let cases: &[(&[Op], &[bool], usize, usize)] = &[
+            (&[Start, Stop, Start], &[true, true, true], 1, 1),
+            (&[Start, Start], &[true, false], 1, 1),
+            (&[Stop, Stop], &[true, true], 0, 0),
+            (
+                &[StartFinite(10), WaitFinished, Start],
+                &[true, true, true],
+                1,
+                1,
+            ),
+            (&[Start, Stop], &[true, true], 0, 1),
+            (&[Start, Prompt], &[true, true], 1, 1),
+            (&[Start, Record], &[true, false], 1, 1),
+            (&[Prompt, Record], &[false, false], 0, 0),
+        ];
+        for (ops, expected, now, max) in cases {
+            let state = AudioState::default();
+            let live = Arc::new(Counters::default());
+            let mut got = Vec::new();
+            for op in *ops {
+                got.push(match op {
+                    Start => start(&state, &live, None).await.is_ok(),
+                    StartFinite(n) => start(&state, &live, Some(*n)).await.is_ok(),
+                    WaitFinished => {
+                        while live.now.load(Ordering::SeqCst) != 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        true
+                    }
+                    Stop => {
+                        state.stop().await;
+                        true
+                    }
+                    Prompt => state
+                        .control(super::Control::Prompt { text: "q".into() })
+                        .await
+                        .is_ok(),
+                    Record => state
+                        .control(super::Control::Record {
+                            action: super::Record::Start,
+                        })
+                        .await
+                        .is_ok(),
+                });
+            }
+            assert_eq!(&got[..], *expected, "{ops:?}");
+            assert_eq!(
+                live.now.load(Ordering::SeqCst),
+                *now,
+                "{ops:?} live streams"
+            );
+            assert_eq!(live.max.load(Ordering::SeqCst), *max, "{ops:?} max streams");
+            state.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn lockstep_errs_naming_the_stalled_device() {
+        let feed = |n: usize| futures_util::stream::iter(vec![0.0f32; n]).chain(futures_util::stream::pending());
+        for (sys, mic, want) in [
+            (20_000, 100, "Microphone stopped"),
+            (100, 20_000, "System audio stopped"),
+        ] {
+            let (mut paired, mut stalled) = (0, None);
+            let mut pairs = super::lockstep(feed(sys), feed(mic), 5000, &mut stalled);
+            while let Some((s, m)) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), pairs.next())
+                    .await
+                    .expect("a stall ends the stream instead of waiting")
+            {
+                assert_eq!(s.len(), m.len());
+                paired += s.len();
+            }
+            drop(pairs);
+            assert_eq!(paired, 100);
+            let err = stalled.expect("stall reported");
+            assert!(err.starts_with(want), "{err}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_stop_start_never_orphans() {
+        let state = Arc::new(AudioState::default());
+        let live = Arc::new(Counters::default());
+        for _ in 0..20 {
+            let (s1, s2, s3) = (state.clone(), state.clone(), state.clone());
+            let l = live.clone();
+            let stop1 = tokio::spawn(async move { s1.stop().await });
+            let stop2 = tokio::spawn(async move { s2.stop().await });
+            let start = tokio::spawn(async move {
+                if let Err(e) = start(&s3, &l, None).await {
+                    assert_eq!(e, "Capture already running"); // lost the race to a live capture, which is allowed
+                }
+            });
+            stop1.await.unwrap();
+            stop2.await.unwrap();
+            start.await.unwrap();
+        }
+        state.stop().await;
+        assert_eq!(
+            live.now.load(Ordering::SeqCst),
+            0,
+            "orphaned capture still live"
+        );
+        assert!(
+            live.max.load(Ordering::SeqCst) <= 1,
+            "two captures ran at once"
+        );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        Loud(u64),
+        Quiet(u64),
+        Act(super::Record),
+        Max(u64),
+    }
+
+    #[test]
+    fn recordings() {
+        use super::Record::{Discard, Send, Start};
+        use futures_util::FutureExt;
+        use std::sync::Mutex;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        use tauri::Listener;
+        use Step::*;
+        const SR: u32 = 44100;
+        type Log = Arc<Mutex<Vec<String>>>;
+        type Segment = (u64, u64, usize); // (start_ms, end_ms, n_samples)
+        type Case = (&'static str, &'static [Step], &'static [Segment], &'static [&'static str], &'static [u64]); // (name, script, segments, stopped reasons, progress seconds)
+        #[rustfmt::skip]
+        let cases: &[Case] = &[
+            ("between start and send", &[Loud(1000), Act(Start), Loud(2000), Act(Send)], &[(1000, 3000, 88200)], &["sent"], &[1, 2]),
+            ("discard", &[Act(Start), Loud(1000), Act(Discard)], &[], &["discarded"], &[1]),
+            ("limit auto-sends", &[Max(1), Act(Start), Loud(1500), Act(Send)], &[(0, 1000, 44100)], &["limit"], &[1]),
+            ("send while idle", &[Act(Send)], &[], &[], &[]),
+            ("silent recording", &[Act(Start), Quiet(1000), Act(Send)], &[], &["discarded"], &[1]),
+            ("shorter than min_speech_ms", &[Act(Start), Loud(50), Act(Send)], &[], &["discarded"], &[]),
+            ("start while recording", &[Act(Start), Loud(1000), Act(Start), Loud(1000), Act(Send)], &[(0, 2000, 88200)], &["sent"], &[1, 2]),
+            ("progress", &[Act(Start), Loud(2500)], &[], &[], &[1, 2]),
+            ("live max change", &[Act(Start), Loud(500), Max(1), Loud(600)], &[(0, 1000, 44100)], &["limit"], &[1]),
+        ];
+        for (name, script, want_segs, want_stopped, want_progress) in cases {
+            let app = mock_builder().build(mock_context(noop_assets())).unwrap();
+            let log = |event: &'static str| -> Log {
+                let got = Log::default();
+                let sink = got.clone();
+                app.listen_any(event, move |e| {
+                    sink.lock()
+                        .unwrap()
+                        .push(e.payload().trim_matches('"').to_string())
+                });
+                got
+            };
+            let (stopped, progress, discarded) = (
+                log("continuous-recording-stopped"),
+                log("recording-progress"),
+                log("speech-discarded"),
+            );
+            let (samples_tx, mut samples_rx) = tokio::sync::mpsc::unbounded_channel::<f32>();
+            let (actions_tx, actions_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (vad_tx, vad_rx) = tokio::sync::watch::channel(crate::vad::VadConfig {
+                enabled: false,
+                ..Default::default()
+            });
+            let samples = futures_util::stream::poll_fn(move |cx| samples_rx.poll_recv(cx));
+            let mut out = Box::pin(super::recordings(
+                app.handle(),
+                samples,
+                actions_rx,
+                SR,
+                vad_rx,
+            ));
+            let mut segs = Vec::new();
+            for step in *script {
+                let n = |ms: u64| ms * SR as u64 / 1000;
+                match *step {
+                    Loud(ms) => (0..n(ms))
+                        .for_each(|i| samples_tx.send(if i % 2 == 0 { 0.5 } else { -0.5 }).unwrap()),
+                    Quiet(ms) => (0..n(ms)).for_each(|_| samples_tx.send(0.0).unwrap()),
+                    Act(a) => actions_tx.send(a).unwrap(),
+                    Max(secs) => vad_tx.send_modify(|c| c.max_recording_duration_secs = secs),
+                }
+                while let Some(item) = out.next().now_or_never() {
+                    let (events, _) = item.expect("sources are still open");
+                    for (_, ev) in events {
+                        let crate::vad::VadEvent::Segment {
+                            samples,
+                            start_ms,
+                            end_ms,
+                        } = ev
+                        else {
+                            panic!("{name}: recordings only yield segments");
+                        };
+                        segs.push((start_ms, end_ms, samples.len()));
+                    }
+                }
+            }
+            assert_eq!(&segs, want_segs, "{name}: segments");
+            assert_eq!(*stopped.lock().unwrap(), *want_stopped, "{name}: stopped");
+            let progress: Vec<u64> = progress
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.parse().unwrap())
+                .collect();
+            assert_eq!(&progress, want_progress, "{name}: progress");
+            assert_eq!(
+                discarded.lock().unwrap().len(),
+                usize::from(matches!(*name, "silent recording" | "shorter than min_speech_ms")),
+                "{name}: speech-discarded"
+            );
+        }
+    }
 }

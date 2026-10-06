@@ -19,9 +19,13 @@ mod linux;
 use linux::{SpeakerInput as PlatformSpeakerInput, SpeakerStream as PlatformSpeakerStream};
 
 mod commands;
+mod push_to_talk;
+pub mod turn;
+pub mod vad;
 
 // Re-export commands for tauri handler
 pub use commands::*;
+pub use push_to_talk::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioDevice {
@@ -85,6 +89,17 @@ impl SpeakerInput {
         Ok(Self { inner })
     }
 
+    pub fn microphone(device_id: Option<String>) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        return Ok(Self {
+            inner: PlatformSpeakerInput::microphone(device_id)?,
+        });
+        #[cfg(not(target_os = "linux"))]
+        Err(anyhow::anyhow!(
+            "Microphone capture ({device_id:?}) is only implemented on Linux"
+        ))
+    }
+
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     pub fn new() -> Result<Self> {
         Err(anyhow::anyhow!(
@@ -144,5 +159,14 @@ impl SpeakerStream {
 
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         0
+    }
+
+    /// Why the stream ended on its own, if the backend knows.
+    pub fn error(&self) -> Option<anyhow::Error> {
+        #[cfg(target_os = "linux")]
+        return self.inner.error();
+
+        #[cfg(not(target_os = "linux"))]
+        None // macOS/Windows producers don't report failures yet
     }
 }

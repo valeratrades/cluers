@@ -41,95 +41,92 @@ export const RecordingPanel = ({
             </div>
           )}
 
-          {/* Buttons - Always at top when not working */}
-          {!isWorking && (
-            <>
-              <div className="flex gap-2">
-                {!isRecording ? (
+          <>
+            <div className="flex gap-2">
+              {!isRecording ? (
+                <Button
+                  onClick={onStartRecording}
+                  className="flex-1 gap-1.5"
+                  size="sm"
+                >
+                  <MicIcon className="w-3.5 h-3.5" />
+                  Start Recording
+                </Button>
+              ) : (
+                <>
                   <Button
-                    onClick={onStartRecording}
-                    className="flex-1 gap-1.5"
+                    onClick={onIgnore}
+                    variant="outline"
                     size="sm"
+                    className="flex-1 gap-1"
                   >
-                    <MicIcon className="w-3.5 h-3.5" />
-                    Start Recording
+                    <XIcon className="w-3 h-3" />
+                    Discard
                   </Button>
-                ) : (
-                  <>
-                    <Button
-                      onClick={onIgnore}
-                      variant="outline"
-                      size="sm"
-                      className="flex-1 gap-1"
-                    >
-                      <XIcon className="w-3 h-3" />
-                      Discard
-                    </Button>
-                    <Button
-                      onClick={onStopAndSend}
-                      size="sm"
-                      className="flex-1 gap-1"
-                    >
-                      <StopCircleIcon className="w-3 h-3" />
-                      Stop & Send
-                    </Button>
-                  </>
-                )}
-              </div>
-
-              {/* Progress bar when recording */}
-              {isRecording && (
-                <div className="space-y-1">
-                  <div className="w-full bg-muted rounded-full h-1">
-                    <div
-                      className="bg-red-500 h-1 rounded-full transition-all duration-500"
-                      style={{
-                        width: `${(recordingProgress / maxDuration) * 100}%`,
-                      }}
-                    />
-                  </div>
-                  <div className="flex justify-between text-[9px] text-muted-foreground">
-                    <span className="flex items-center gap-1">
-                      <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-                      Recording {recordingProgress}s
-                    </span>
-                    <span>{maxDuration}s max</span>
-                  </div>
-                </div>
+                  <Button
+                    onClick={onStopAndSend}
+                    size="sm"
+                    className="flex-1 gap-1"
+                  >
+                    <StopCircleIcon className="w-3 h-3" />
+                    Stop & Send
+                  </Button>
+                </>
               )}
+            </div>
 
-              {/* Keyboard hints - bottom right */}
-              <div className="flex justify-end gap-3 text-[8px] text-muted-foreground/60">
-                {!isRecording ? (
+            {/* Progress bar when recording */}
+            {isRecording && (
+              <div className="space-y-1">
+                <div className="w-full bg-muted rounded-full h-1">
+                  <div
+                    className="bg-red-500 h-1 rounded-full transition-all duration-500"
+                    style={{
+                      width: `${(recordingProgress / maxDuration) * 100}%`,
+                    }}
+                  />
+                </div>
+                <div className="flex justify-between text-[9px] text-muted-foreground">
+                  <span className="flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                    Recording {recordingProgress}s
+                  </span>
+                  <span>{maxDuration}s max</span>
+                </div>
+              </div>
+            )}
+
+            {/* Keyboard hints - bottom right */}
+            <div className="flex justify-end gap-3 text-[8px] text-muted-foreground/60">
+              {!isRecording ? (
+                <span>
+                  <kbd className="px-1 py-0.5 rounded bg-muted font-mono">
+                    Space
+                  </kbd>{" "}
+                  /{" "}
+                  <kbd className="px-1 py-0.5 rounded bg-muted font-mono">
+                    Enter
+                  </kbd>{" "}
+                  start
+                </span>
+              ) : (
+                <>
                   <span>
-                    <kbd className="px-1 py-0.5 rounded bg-muted font-mono">
-                      Space
-                    </kbd>{" "}
-                    /{" "}
                     <kbd className="px-1 py-0.5 rounded bg-muted font-mono">
                       Enter
                     </kbd>{" "}
-                    start
+                    send
                   </span>
-                ) : (
-                  <>
-                    <span>
-                      <kbd className="px-1 py-0.5 rounded bg-muted font-mono">
-                        Enter
-                      </kbd>{" "}
-                      send
-                    </span>
-                    <span>
-                      <kbd className="px-1 py-0.5 rounded bg-muted font-mono">
-                        Esc
-                      </kbd>{" "}
-                      discard
-                    </span>
-                  </>
-                )}
-              </div>
-            </>
-          )}
+                  <span>
+                    <kbd className="px-1 py-0.5 rounded bg-muted font-mono">
+                      Esc
+                    </kbd>{" "}
+                    discard
+                  </span>
+                </>
+              )}
+            </div>
+          </>
         </div>
       )}
     </div>

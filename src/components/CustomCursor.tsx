@@ -27,17 +27,10 @@ export const CustomCursor = () => {
       }
     };
 
-    const handleMouseLeave = () => {
+    const hide = () => {
       isVisibleRef.current = false;
       if (cursorRef.current) {
         cursorRef.current.style.opacity = "0";
-      }
-    };
-
-    const handleWindowBlur = () => {
-      isVisibleRef.current = false;
-      if (cursorRef.current) {
-        cursorRef.current.style.display = "0";
       }
     };
 
@@ -46,13 +39,13 @@ export const CustomCursor = () => {
 
     // Add event listeners
     document.addEventListener("mousemove", handleMouseMove, { passive: true });
-    document.addEventListener("mouseleave", handleMouseLeave);
-    window.addEventListener("blur", handleWindowBlur);
+    document.addEventListener("mouseleave", hide);
+    window.addEventListener("blur", hide);
 
     return () => {
       document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseleave", handleMouseLeave);
-      window.removeEventListener("blur", handleWindowBlur);
+      document.removeEventListener("mouseleave", hide);
+      window.removeEventListener("blur", hide);
       cancelAnimationFrame(rafId);
     };
   }, []);

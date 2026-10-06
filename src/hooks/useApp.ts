@@ -1,9 +1,9 @@
-import { useEffect, useState } from "react";
-import { useTitles, useSystemAudio } from "@/hooks";
+import { useEffect, useRef, useState } from "react";
+import { useTitles, useSystemAudio, useGlobalShortcutListeners } from "@/hooks";
 import { listen } from "@tauri-apps/api/event";
-import { safeLocalStorage, migrateLocalStorageToSQLite } from "@/lib";
 import { getShortcutsConfig } from "@/lib/storage";
 import { invoke } from "@tauri-apps/api/core";
+import { getPlatform } from "@/lib";
 
 export const useApp = () => {
   const systemAudio = useSystemAudio();
@@ -11,51 +11,59 @@ export const useApp = () => {
   // Initialize title management
   useTitles();
 
-  // Initialize shortcuts from localStorage on app startup
-  useEffect(() => {
-    const initializeShortcuts = async () => {
-      try {
-        const config = getShortcutsConfig();
-        await invoke("update_shortcuts", { config });
-      } catch (error) {
-        console.error("Failed to initialize shortcuts:", error);
-      }
-    };
+  const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const capturing = useRef(false);
+  capturing.current = systemAudio.capturing;
+  useGlobalShortcutListeners(() => capturing.current);
 
-    initializeShortcuts();
+  useEffect(() => {
+    (async () => {
+      try {
+        await invoke("update_shortcuts", { config: getShortcutsConfig() });
+      } catch (error) {
+        setShortcutError(`${error}`);
+        await invoke("js_log", { msg: `shortcut init failed: ${error}` });
+      }
+    })();
   }, []);
 
-  // Migrate localStorage chat history to SQLite on app startup
+  // the window is larger than what it paints; clicks on its transparent rest must reach the app below
   useEffect(() => {
-    const runMigration = async () => {
-      try {
-        // Early exit: Check if migration already completed
-        const migrationKey = "chat_history_migrated_to_sqlite";
-        const alreadyMigrated =
-          safeLocalStorage.getItem(migrationKey) === "true";
-
-        if (alreadyMigrated) {
-          return; // Migration already complete, skip
-        }
-
-        const result = await migrateLocalStorageToSQLite();
-
-        if (result.success) {
-          if (result.migratedCount > 0) {
-            console.log(
-              `Successfully migrated ${result.migratedCount} conversations to SQLite`
-            );
-          }
-        } else if (result.error) {
-          // Migration failed - log error
-          console.error("Migration error:", result.error);
-        }
-      } catch (error) {
-        // Critical error during migration
-        console.error("Critical migration failure:", error);
-      }
+    if (getPlatform() !== "linux") return;
+    let frame = 0;
+    let sent = "";
+    const update = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const rects = [
+          ...document.querySelectorAll(
+            "[data-input-region], [data-radix-popper-content-wrapper]"
+          ),
+        ]
+          .map((el) => el.getBoundingClientRect())
+          .filter((r) => r.width > 0 && r.height > 0)
+          .map(({ x, y, width, height }) => ({ x, y, width, height }));
+        if (JSON.stringify(rects) === sent) return;
+        sent = JSON.stringify(rects);
+        invoke("set_input_region", { rects }).catch((e) =>
+          invoke("js_log", { msg: `set_input_region failed: ${e}` })
+        );
+      });
     };
-    runMigration();
+    const mutations = new MutationObserver(update);
+    mutations.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+    });
+    const resizes = new ResizeObserver(update);
+    resizes.observe(document.body);
+    update();
+    return () => {
+      cancelAnimationFrame(frame);
+      mutations.disconnect();
+      resizes.disconnect();
+    };
   }, []);
 
   const handleSelectConversation = (conversation: any) => {
@@ -105,51 +113,10 @@ export const useApp = () => {
     };
   }, []);
 
-  useEffect(() => {
-    const handleShortcutRegistrationError = (
-      event: Event | CustomEvent<Array<[string, string, string]>>
-    ) => {
-      const detail =
-        (event as CustomEvent<Array<[string, string, string]>>)?.detail ?? [];
-
-      if (!detail.length) {
-        return;
-      }
-
-      const formatted = detail
-        .map(([action, key, error]) => ({ action, key, error }))
-        .filter(({ action, key }) => action && key);
-
-      if (!formatted.length) {
-        return;
-      }
-
-      console.warn(
-        "Some shortcuts could not be registered:",
-        formatted.map(({ action, key, error }) => ({
-          action,
-          key,
-          error,
-        }))
-      );
-    };
-
-    window.addEventListener(
-      "shortcutRegistrationError",
-      handleShortcutRegistrationError as EventListener
-    );
-
-    return () => {
-      window.removeEventListener(
-        "shortcutRegistrationError",
-        handleShortcutRegistrationError as EventListener
-      );
-    };
-  }, []);
-
   return {
     isHidden,
     setIsHidden,
+    shortcutError,
     handleSelectConversation,
     handleNewConversation,
     systemAudio,

@@ -1,316 +1,216 @@
 use base64::Engine;
 use image::codecs::png::PngEncoder;
-use image::{ColorType, GenericImageView, ImageEncoder};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::{thread, time::Duration};
-use tauri::Emitter;
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use image::{ColorType, GenericImageView, ImageEncoder, RgbaImage};
+use serde::Deserialize;
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
+use tokio::time::{sleep, Duration};
 use xcap::Monitor;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct SelectionCoords {
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct MonitorInfo {
-    pub image: image::RgbaImage,
-}
-
-// Store captured images from all monitors temporarily for cropping
+#[derive(Default)]
 pub struct CaptureState {
-    pub captured_monitors: Arc<Mutex<HashMap<usize, MonitorInfo>>>,
-    pub overlay_active: Arc<AtomicBool>,
+    images: Mutex<Vec<RgbaImage>>, // index = monitor index sent to overlay-{idx}
 }
 
-impl Default for CaptureState {
-    fn default() -> Self {
-        Self {
-            captured_monitors: Arc::default(),
-            overlay_active: Arc::new(AtomicBool::new(false)),
-        }
-    }
-}
-
-#[tauri::command]
-pub async fn start_screen_capture(app: tauri::AppHandle) -> Result<(), String> {
-    // Get all monitors
-    let capture_monitors = Monitor::all().map_err(|e| format!("Failed to get monitors: {}", e))?;
-
-    if capture_monitors.is_empty() {
-        return Err("No monitors found".to_string());
-    }
-
-    // Get monitor layout info from Tauri for accurate sizing/positioning
-    let tauri_monitors = app
-        .available_monitors()
-        .map_err(|e| format!("Failed to get monitor layout: {}", e))?;
-
-    if tauri_monitors.len() != capture_monitors.len() {
-        eprintln!(
-            "Monitor count mismatch between capture ({}) and layout ({}); falling back to capture dimensions",
-            capture_monitors.len(),
-            tauri_monitors.len()
-        );
-    }
-
-    let state = app.state::<CaptureState>();
-    if state.overlay_active.load(Ordering::SeqCst) {
-        // Attempt to clean up any stale overlays before proceeding
-        let _ = close_overlay_window(app.clone());
-    }
-    state.overlay_active.store(true, Ordering::SeqCst);
-    let mut captured_monitors = HashMap::new();
-
-    // Capture all monitors and store their info
-    for (idx, monitor) in capture_monitors.iter().enumerate() {
-        let captured_image = monitor.capture_image().map_err(|e| {
-            state.overlay_active.store(false, Ordering::SeqCst);
-            format!("Failed to capture monitor {}: {}", idx, e)
-        })?;
-
-        let monitor_info = MonitorInfo {
-            image: captured_image,
-        };
-
-        captured_monitors.insert(idx, monitor_info);
-    }
-
-    // Store all captured monitors
-    *state.captured_monitors.lock().unwrap() = captured_monitors;
-
-    // Clean up any existing overlay windows before creating new ones
+fn destroy_overlays<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     for (label, window) in app.webview_windows() {
         if label.starts_with("capture-overlay-") {
-            window.destroy().ok();
+            window
+                .destroy()
+                .map_err(|e| format!("Failed to destroy overlay {label}: {e}"))?;
         }
     }
+    Ok(())
+}
 
-    // Create overlay windows for all monitors
-    for (idx, monitor) in capture_monitors.iter().enumerate() {
-        let (logical_width, logical_height, logical_x, logical_y) =
-            if let Some(display) = tauri_monitors.get(idx) {
-                let scale_factor = display.scale_factor();
-                let size = display.size();
-                let position = display.position();
+#[tauri::command]
+pub async fn start_screen_capture<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    destroy_overlays(&app)?;
 
-                // Size values are in physical pixels; convert to logical units for window placement
-                let width = size.width as f64 / scale_factor;
-                let height = size.height as f64 / scale_factor;
-                let x = position.x as f64 / scale_factor;
-                let y = position.y as f64 / scale_factor;
+    let layout = app
+        .available_monitors()
+        .map_err(|e| format!("Failed to get monitor layout: {e}"))?;
 
-                (width, height, x, y)
-            } else {
-                // Fallback to xcap monitor info if Tauri monitor data is unavailable/mismatched
-                (
-                    monitor.width() as f64,
-                    monitor.height() as f64,
-                    monitor.x() as f64,
-                    monitor.y() as f64,
-                )
-            };
+    let captures = tokio::task::spawn_blocking(|| {
+        let monitors = Monitor::all().map_err(|e| format!("Failed to get monitors: {e}"))?;
+        if monitors.is_empty() {
+            return Err("No monitors found".to_string());
+        }
+        monitors
+            .iter()
+            .enumerate()
+            .map(|(idx, m)| {
+                m.capture_image()
+                    .map(|img| (img, m.is_primary()))
+                    .map_err(|e| format!("Failed to capture monitor {idx}: {e}"))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .await
+    .expect("capture spawn_blocking join")?;
 
-        let window_label = format!("capture-overlay-{}", idx);
+    if layout.len() != captures.len() {
+        return Err(format!(
+            "monitor count mismatch: xcap {} vs tauri {}",
+            captures.len(),
+            layout.len()
+        ));
+    }
 
-        let overlay =
-            WebviewWindowBuilder::new(&app, &window_label, WebviewUrl::App("index.html".into()))
-                .title("Screen Capture")
-                .inner_size(logical_width, logical_height)
-                .position(logical_x, logical_y)
-                .transparent(true)
-                .always_on_top(true)
-                .decorations(false)
-                .skip_taskbar(true)
-                .resizable(false)
-                .closable(false)
-                .minimizable(false)
-                .maximizable(false)
-                .visible(false)
-                .focused(true)
-                .accept_first_mouse(true)
-                .build()
-                .map_err(|e| {
-                    state.overlay_active.store(false, Ordering::SeqCst);
-                    format!("Failed to create overlay window {}: {}", idx, e)
-                })?;
+    let primary = captures.iter().position(|(_, is_primary)| *is_primary);
+    *app.state::<CaptureState>().images.lock().unwrap() =
+        captures.into_iter().map(|(img, _)| img).collect();
 
-        // Wait a short moment for content to load before showing
-        thread::sleep(Duration::from_millis(100));
+    if let Err(e) = open_overlays(&app, &layout, primary).await {
+        close_overlay_window(app)?; // teardown error wins only if teardown itself fails
+        return Err(e);
+    }
+    Ok(())
+}
 
-        overlay.show().ok();
-        overlay.set_always_on_top(true).ok();
+async fn open_overlays<R: Runtime>(
+    app: &AppHandle<R>,
+    layout: &[tauri::Monitor],
+    primary: Option<usize>,
+) -> Result<(), String> {
+    for (idx, display) in layout.iter().enumerate() {
+        let scale = display.scale_factor();
+        let size = display.size();
+        let pos = display.position();
+        let label = format!("capture-overlay-{idx}");
 
-        if monitor.is_primary() {
-            overlay.set_focus().ok();
+        let overlay = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+            .title("Screen Capture")
+            .inner_size(size.width as f64 / scale, size.height as f64 / scale)
+            .position(pos.x as f64 / scale, pos.y as f64 / scale)
+            .transparent(true)
+            .always_on_top(true)
+            .decorations(false)
+            .skip_taskbar(true)
+            .resizable(false)
+            .closable(false)
+            .minimizable(false)
+            .maximizable(false)
+            .visible(false)
+            .focused(true)
+            .accept_first_mouse(true)
+            .build()
+            .map_err(|e| format!("Failed to create overlay window {idx}: {e}"))?;
+
+        sleep(Duration::from_millis(100)).await; // let content load before showing
+
+        overlay
+            .show()
+            .map_err(|e| format!("Failed to show overlay {idx}: {e}"))?;
+        overlay // some X11 WMs ignore keep-above before map
+            .set_always_on_top(true)
+            .map_err(|e| format!("Failed to raise overlay {idx}: {e}"))?;
+        if primary == Some(idx) {
             overlay
-                .request_user_attention(Some(tauri::UserAttentionType::Critical))
-                .ok();
+                .set_focus()
+                .map_err(|e| format!("Failed to focus overlay {idx}: {e}"))?;
         }
     }
 
-    // Give a moment for all windows to settle, then focus primary again
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    for (idx, monitor) in capture_monitors.iter().enumerate() {
-        if monitor.is_primary() {
-            let window_label = format!("capture-overlay-{}", idx);
-            if let Some(window) = app.get_webview_window(&window_label) {
-                window.set_focus().ok();
-            }
-            break;
-        }
+    if let Some(idx) = primary {
+        sleep(Duration::from_millis(100)).await; // later overlays may steal focus while mapping
+        app.get_webview_window(&format!("capture-overlay-{idx}"))
+            .ok_or_else(|| format!("Overlay {idx} vanished before focus"))?
+            .set_focus()
+            .map_err(|e| format!("Failed to focus overlay {idx}: {e}"))?;
     }
-
-    Ok(())
-}
-
-// close overlay window
-#[tauri::command]
-pub fn close_overlay_window(app: tauri::AppHandle) -> Result<(), String> {
-    // Get all webview windows and close those that are capture overlays
-    let webview_windows = app.webview_windows();
-
-    for (label, window) in webview_windows.iter() {
-        if label.starts_with("capture-overlay-") {
-            window.destroy().ok();
-        }
-    }
-
-    // Clear captured monitors from state
-    let state = app.state::<CaptureState>();
-    state.captured_monitors.lock().unwrap().clear();
-    state.overlay_active.store(false, Ordering::SeqCst);
-
-    // Emit an event to the main window to signal that the overlay has been closed
-    if let Some(main_window) = app.get_webview_window("main") {
-        main_window.emit("capture-closed", ()).unwrap();
-    }
-
     Ok(())
 }
 
 #[tauri::command]
-pub async fn capture_selected_area(
-    app: tauri::AppHandle,
+pub fn close_overlay_window<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    destroy_overlays(&app)?;
+    app.state::<CaptureState>().images.lock().unwrap().clear();
+    app.emit("capture-closed", ())
+        .map_err(|e| format!("Failed to emit capture-closed: {e}"))
+}
+
+#[tauri::command]
+pub async fn capture_selected_area<R: Runtime>(
+    app: AppHandle<R>,
     coords: SelectionCoords,
     monitor_index: usize,
 ) -> Result<String, String> {
-    // Get the stored captured monitors
-    let state = app.state::<CaptureState>();
-    let mut captured_monitors = state.captured_monitors.lock().unwrap();
+    let image = std::mem::take(&mut *app.state::<CaptureState>().images.lock().unwrap())
+        .into_iter()
+        .nth(monitor_index);
+    let encoded = match image {
+        None => Err(format!("No captured image for monitor {monitor_index}")),
+        Some(img) => tokio::task::spawn_blocking(move || crop_to_png_base64(img, coords))
+            .await
+            .expect("crop spawn_blocking join"),
+    };
+    match encoded {
+        Err(e) => {
+            close_overlay_window(app)?;
+            Err(e)
+        }
+        Ok(b64) => {
+            destroy_overlays(&app)?; // no capture-closed: its TS handler would drop this selection
+            app.emit("captured-selection", &b64)
+                .map_err(|e| format!("Failed to emit captured-selection event: {e}"))?;
+            Ok(b64)
+        }
+    }
+}
 
-    let monitor_info = captured_monitors.remove(&monitor_index).ok_or({
-        state.overlay_active.store(false, Ordering::SeqCst);
-        format!("No captured image found for monitor {}", monitor_index)
-    })?;
-
-    // Validate coordinates
+fn crop_to_png_base64(image: RgbaImage, coords: SelectionCoords) -> Result<String, String> {
     if coords.width == 0 || coords.height == 0 {
         return Err("Invalid selection dimensions".to_string());
     }
-
-    let img_width = monitor_info.image.width();
-    let img_height = monitor_info.image.height();
-
-    // Ensure coordinates are within bounds
+    let (img_width, img_height) = image.dimensions();
     let x = coords.x.min(img_width.saturating_sub(1));
     let y = coords.y.min(img_height.saturating_sub(1));
     let width = coords.width.min(img_width - x);
     let height = coords.height.min(img_height - y);
+    encode_png_base64(&image.view(x, y, width, height).to_image())
+}
 
-    // Crop the image to the selected area
-    let cropped = monitor_info.image.view(x, y, width, height).to_image();
-
-    // Encode to PNG and base64
+fn encode_png_base64(image: &RgbaImage) -> Result<String, String> {
     let mut png_buffer = Vec::new();
     PngEncoder::new(&mut png_buffer)
         .write_image(
-            cropped.as_raw(),
-            cropped.width(),
-            cropped.height(),
+            image.as_raw(),
+            image.width(),
+            image.height(),
             ColorType::Rgba8.into(),
         )
-        .map_err(|e| format!("Failed to encode to PNG: {}", e))?;
-
-    let base64_str = base64::engine::general_purpose::STANDARD.encode(png_buffer);
-
-    captured_monitors.clear();
-    drop(captured_monitors);
-
-    // Close all overlay windows
-    let webview_windows = app.webview_windows();
-    for (label, window) in webview_windows.iter() {
-        if label.starts_with("capture-overlay-") {
-            window.destroy().ok();
-        }
-    }
-
-    // Emit event with base64 data
-    app.emit("captured-selection", &base64_str)
-        .map_err(|e| format!("Failed to emit captured-selection event: {}", e))?;
-
-    state.overlay_active.store(false, Ordering::SeqCst);
-
-    Ok(base64_str)
+        .map_err(|e| format!("Failed to encode to PNG: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png_buffer))
 }
 
 #[tauri::command]
 pub async fn capture_to_base64(window: tauri::WebviewWindow) -> Result<String, String> {
-    let monitor_fallback = window
-        .current_monitor()
-        .ok()
-        .flatten()
-        .or_else(|| window.primary_monitor().ok().flatten());
+    let position = window
+        .outer_position()
+        .map_err(|e| format!("Failed to get window position: {e}"))?;
+    let size = window
+        .outer_size()
+        .map_err(|e| format!("Failed to get window size: {e}"))?;
+    let width = size.width.min(i32::MAX as u32) as i32;
+    let height = size.height.min(i32::MAX as u32) as i32;
+    let window_left = position.x;
+    let window_top = position.y;
+    let window_right = window_left.saturating_add(width);
+    let window_bottom = window_top.saturating_add(height);
+    let window_center_x = window_left.saturating_add(width / 2);
+    let window_center_y = window_top.saturating_add(height / 2);
 
-    let geometry = match (window.outer_position(), window.outer_size()) {
-        (Ok(position), Ok(size)) => {
-            let width = size.width.min(i32::MAX as u32) as i32;
-            let height = size.height.min(i32::MAX as u32) as i32;
-            let left = position.x;
-            let top = position.y;
-            (
-                left,
-                top,
-                left.saturating_add(width),
-                top.saturating_add(height),
-                left.saturating_add(width / 2),
-                top.saturating_add(height / 2),
-            )
-        }
-        _ => {
-            if let Some(monitor) = &monitor_fallback {
-                let position = monitor.position();
-                let size = monitor.size();
-                let width = size.width.min(i32::MAX as u32) as i32;
-                let height = size.height.min(i32::MAX as u32) as i32;
-                let left = position.x;
-                let top = position.y;
-                (
-                    left,
-                    top,
-                    left.saturating_add(width),
-                    top.saturating_add(height),
-                    left.saturating_add(width / 2),
-                    top.saturating_add(height / 2),
-                )
-            } else {
-                (0, 0, 0, 0, 0, 0)
-            }
-        }
-    };
-
-    let (window_left, window_top, window_right, window_bottom, window_center_x, window_center_y) =
-        geometry;
-
-    tauri::async_runtime::spawn_blocking(move || {
-        let monitors = Monitor::all().map_err(|e| format!("Failed to get monitors: {}", e))?;
+    tokio::task::spawn_blocking(move || {
+        let monitors = Monitor::all().map_err(|e| format!("Failed to get monitors: {e}"))?;
         if monitors.is_empty() {
             return Err("No monitors found".to_string());
         }
@@ -336,56 +236,102 @@ pub async fn capture_to_base64(window: tauri::WebviewWindow) -> Result<String, S
             }
         }
 
-        let target_idx = if let Some(idx) = best_idx {
-            idx
-        } else {
+        let target_idx = best_idx.unwrap_or_else(|| {
+            // window fully off-screen: nearest monitor centre
             let mut closest_idx = 0usize;
             let mut closest_distance = i128::MAX;
-
             for (idx, monitor) in monitors.iter().enumerate() {
                 let monitor_center_x = monitor.x().saturating_add(monitor.width() as i32 / 2);
                 let monitor_center_y = monitor.y().saturating_add(monitor.height() as i32 / 2);
                 let dx = (window_center_x - monitor_center_x) as i128;
                 let dy = (window_center_y - monitor_center_y) as i128;
                 let distance = dx * dx + dy * dy;
-
                 if distance < closest_distance {
                     closest_distance = distance;
                     closest_idx = idx;
                 }
             }
-
             closest_idx
-        };
+        });
 
-        let monitor = monitors
+        let image = monitors
             .into_iter()
-            .enumerate()
-            .find_map(|(idx, monitor)| {
-                if idx == target_idx {
-                    Some(monitor)
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| "Failed to determine target monitor".to_string())?;
-
-        let image = monitor
+            .nth(target_idx)
+            .expect("index from enumerate")
             .capture_image()
-            .map_err(|e| format!("Failed to capture image: {}", e))?;
-        let mut png_buffer = Vec::new();
-        PngEncoder::new(&mut png_buffer)
-            .write_image(
-                image.as_raw(),
-                image.width(),
-                image.height(),
-                ColorType::Rgba8.into(),
-            )
-            .map_err(|e| format!("Failed to encode to PNG: {}", e))?;
-        let base64_str = base64::engine::general_purpose::STANDARD.encode(png_buffer);
-
-        Ok(base64_str)
+            .map_err(|e| format!("Failed to capture image: {e}"))?;
+        encode_png_base64(&image)
     })
     .await
-    .map_err(|e| format!("Task panicked: {}", e))?
+    .expect("capture spawn_blocking join")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tauri::test::{mock_builder, mock_context, noop_assets, MockRuntime};
+    use tauri::Listener;
+
+    type Events = Arc<Mutex<Vec<&'static str>>>;
+
+    fn app(images: &[(u32, u32)]) -> (tauri::App<MockRuntime>, Events) {
+        let app = mock_builder()
+            .manage(CaptureState::default())
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        *app.state::<CaptureState>().images.lock().unwrap() = images
+            .iter()
+            .map(|&(w, h)| RgbaImage::new(w, h))
+            .collect();
+        let events: Events = Arc::default();
+        for name in ["capture-closed", "captured-selection"] {
+            let events = events.clone();
+            app.listen_any(name, move |_| events.lock().unwrap().push(name));
+        }
+        (app, events)
+    }
+
+    #[tokio::test]
+    async fn capture_selected_area_outcomes() {
+        let sel = |x, y, width, height| SelectionCoords {
+            x,
+            y,
+            width,
+            height,
+        };
+        #[rustfmt::skip]
+        let cases = [
+            ("index out of range", vec![(20, 20), (20, 20)], 5, sel(0, 0, 10, 10), Err(()), vec!["capture-closed"]),
+            ("zero width", vec![(20, 20), (20, 20)], 0, sel(0, 0, 0, 10), Err(()), vec!["capture-closed"]),
+            ("valid", vec![(20, 20)], 0, sel(5, 5, 10, 10), Ok((10, 10)), vec!["captured-selection"]),
+            ("overflow clamped", vec![(20, 20)], 0, sel(15, 18, 10, 10), Ok((5, 2)), vec!["captured-selection"]),
+        ];
+        for (name, images, idx, coords, expected, expected_events) in cases {
+            let (app, events) = app(&images);
+            let got = capture_selected_area(app.handle().clone(), coords, idx)
+                .await
+                .map(|b64| {
+                    let png = base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .unwrap();
+                    image::load_from_memory(&png).unwrap().dimensions()
+                })
+                .map_err(|_| ());
+            assert_eq!(got, expected, "{name}");
+            assert_eq!(*events.lock().unwrap(), expected_events, "{name}");
+            assert!(
+                app.state::<CaptureState>().images.lock().unwrap().is_empty(),
+                "{name}: images left behind"
+            );
+        }
+    }
+
+    #[test]
+    fn close_without_main_window_emits() {
+        let (app, events) = app(&[(4, 4)]);
+        close_overlay_window(app.handle().clone()).unwrap();
+        assert_eq!(*events.lock().unwrap(), vec!["capture-closed"]);
+        assert!(app.state::<CaptureState>().images.lock().unwrap().is_empty());
+    }
 }

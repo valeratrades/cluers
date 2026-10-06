@@ -1,9 +1,15 @@
 import { Button, Card, DragButton } from "@/components";
 import { RefreshCcwIcon, SparklesIcon } from "lucide-react";
 
-export const ErrorLayout = ({ isCompact }: { isCompact?: boolean }) => {
+export const ErrorLayout = ({
+  isCompact,
+  message,
+}: {
+  isCompact?: boolean;
+  message?: string;
+}) => {
   return isCompact ? (
-    <Card className="flex flex-row w-screen h-screen items-center justify-between p-4">
+    <Card data-input-region className="flex flex-row w-screen h-screen items-center justify-between p-4">
       <div className="flex size-8 items-center justify-center rounded-xl bg-foreground">
         <SparklesIcon className="size-5 text-background" />
       </div>
@@ -42,6 +48,11 @@ export const ErrorLayout = ({ isCompact }: { isCompact?: boolean }) => {
               Don't worry! Just click the reload button below to restart the
               app.
             </p>
+            {message && (
+              <p className="text-xs font-mono text-red-500 break-all select-text">
+                {message}
+              </p>
+            )}
           </div>
         </div>
 

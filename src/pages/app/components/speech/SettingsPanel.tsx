@@ -59,12 +59,12 @@ interface SettingsPanelProps {
   // VAD Config
   vadConfig: VadConfig;
   onUpdateVadConfig: (config: VadConfig) => void;
+  onResetVadConfig: () => void;
   // Calibration
   onCalibrate: (durationSecs?: number) => Promise<void> | void;
   isCalibrating: boolean;
   calibrationError: string;
   lastCalibration: VadCalibration | null;
-  isCapturing: boolean;
   // Context settings
   useSystemPrompt: boolean;
   setUseSystemPrompt: (value: boolean) => void;
@@ -75,11 +75,11 @@ interface SettingsPanelProps {
 export const SettingsPanel = ({
   vadConfig,
   onUpdateVadConfig,
+  onResetVadConfig,
   onCalibrate,
   isCalibrating,
   calibrationError,
   lastCalibration,
-  isCapturing,
   useSystemPrompt,
   setUseSystemPrompt,
   contextContent,
@@ -120,21 +120,6 @@ export const SettingsPanel = ({
       setContextContent(template.prompt);
       setSelectedTemplate("");
     }
-  };
-
-  const handleResetDefaults = () => {
-    const defaultConfig: VadConfig = {
-      enabled: vadConfig.enabled, // Keep current mode
-      hop_size: 1024,
-      sensitivity_rms: 0.012,
-      peak_threshold: 0.035,
-      silence_chunks: 45,
-      min_speech_chunks: 7,
-      pre_speech_chunks: 12,
-      noise_gate_threshold: 0.003,
-      max_recording_duration_secs: 180,
-    };
-    onUpdateVadConfig(defaultConfig);
   };
 
   return (
@@ -183,13 +168,9 @@ export const SettingsPanel = ({
                     size="sm"
                     variant="outline"
                     onClick={() => onCalibrate(3)}
-                    disabled={isCalibrating || isCapturing}
+                    disabled={isCalibrating}
                     className="h-7 text-[10px] gap-1.5"
-                    title={
-                      isCapturing
-                        ? "Stop the current capture session to calibrate"
-                        : "Sample 3s of ambient audio and set thresholds"
-                    }
+                    title="Sample 3s of ambient audio and set thresholds"
                   >
                     {isCalibrating ? (
                       <>
@@ -407,24 +388,21 @@ export const SettingsPanel = ({
                       <Label className="text-xs font-medium flex items-center justify-between">
                         <span>Silence Duration</span>
                         <span className="text-muted-foreground font-normal">
-                          {(
-                            (vadConfig.silence_chunks * vadConfig.hop_size) /
-                            44100
-                          ).toFixed(1)}
+                          {(vadConfig.silence_ms / 1000).toFixed(1)}
                           s
                         </span>
                       </Label>
                       <Slider
-                        value={[vadConfig.silence_chunks]}
+                        value={[vadConfig.silence_ms]}
                         onValueChange={([value]) =>
                           onUpdateVadConfig({
                             ...vadConfig,
-                            silence_chunks: Math.round(value),
+                            silence_ms: Math.round(value),
                           })
                         }
-                        min={20}
-                        max={180}
-                        step={5}
+                        min={500}
+                        max={4000}
+                        step={100}
                         className="w-full"
                       />
                       <p className="text-[10px] text-muted-foreground">
@@ -464,7 +442,7 @@ export const SettingsPanel = ({
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={handleResetDefaults}
+                  onClick={onResetVadConfig}
                   className="w-full text-xs"
                 >
                   <RotateCcwIcon className="w-3 h-3 mr-1.5" />

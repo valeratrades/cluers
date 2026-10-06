@@ -1,7 +1,7 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components";
-import { AudioVisualizer } from "@/pages/app/components/speech/audio-visualizer";
-import { shouldUsePluelyAPI, fetchSTT } from "@/lib";
+import { resolveProviderInput } from "@/lib/llm";
 import { useApp } from "@/contexts";
 import { StopCircle, Send } from "lucide-react";
 
@@ -10,7 +10,10 @@ interface AudioRecorderProps {
   onCancel: () => void;
 }
 
-const MAX_DURATION = 3 * 60 * 1000;
+type PttEvent = { kind: "started" } | { kind: "level"; rms: number };
+type Finish = "send" | "discard";
+
+const MAX_DURATION = 3 * 60 * 1000; // mirrors MAX_SECS in speaker/push_to_talk.rs
 
 export const AudioRecorder = ({
   onTranscriptionComplete,
@@ -18,153 +21,62 @@ export const AudioRecorder = ({
 }: AudioRecorderProps) => {
   const { selectedSttProvider, allSttProviders, selectedAudioDevices } =
     useApp();
-  const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
+  const [started, setStarted] = useState(false);
+  const [level, setLevel] = useState(0);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [duration, setDuration] = useState(0);
+  const [error, setError] = useState("");
+  const finishedRef = useRef(false);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const startTimeRef = useRef<number>(0);
-  const durationIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const maxDurationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-
-  // Cleanup function - stops all tracks and clears refs
-  const cleanup = useCallback(() => {
-    // Clear timers
-    if (durationIntervalRef.current) {
-      clearInterval(durationIntervalRef.current);
-      durationIntervalRef.current = null;
-    }
-    if (maxDurationTimeoutRef.current) {
-      clearTimeout(maxDurationTimeoutRef.current);
-      maxDurationTimeoutRef.current = null;
-    }
-
-    // Stop media recorder
-    if (mediaRecorderRef.current?.state === "recording") {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch (e) {
-        // Ignore errors when stopping
-      }
-    }
-    mediaRecorderRef.current = null;
-
-    // Stop all audio tracks - this is critical for releasing the microphone
-    const stream = streamRef.current;
-    if (stream) {
-      stream.getTracks().forEach((track) => {
-        track.stop();
-        track.enabled = false;
-      });
-      streamRef.current = null;
-    }
-
-    // Also stop from state
-    if (audioStream) {
-      audioStream.getTracks().forEach((track) => {
-        track.stop();
-        track.enabled = false;
-      });
-    }
-    setAudioStream(null);
-  }, [audioStream]);
+  const finish = (action: Finish) => {
+    if (finishedRef.current) return;
+    finishedRef.current = true;
+    invoke("finish_push_to_talk", { action }).catch((e) =>
+      setError(`Failed to stop recording: ${e}`)
+    );
+  };
 
   useEffect(() => {
-    startRecording();
-
-    // Cleanup on unmount
-    return () => {
-      cleanup();
+    let mounted = true;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const events = new Channel<PttEvent>();
+    events.onmessage = (e) => {
+      if (e.kind === "level") return setLevel(e.rms);
+      if (!mounted) return finish("discard"); // unmounted before Rust could accept it
+      const startedAt = Date.now();
+      timer = setInterval(() => setDuration(Date.now() - startedAt), 100);
+      setStarted(true);
     };
+
+    (async () => {
+      const stt = await resolveProviderInput(selectedSttProvider, allSttProviders);
+      const deviceId = selectedAudioDevices.input.id;
+      const text = await invoke<string | null>("record_push_to_talk", {
+        deviceId: deviceId === "default" ? null : deviceId,
+        stt,
+        events,
+      });
+      if (!mounted || text === null) return;
+      if (!text.trim()) throw new Error("No speech recognized");
+      onTranscriptionComplete(text);
+    })()
+      .catch((e) => mounted && setError(`${e}`))
+      .finally(() => {
+        finishedRef.current = true; // the recording is over either way
+        clearInterval(timer);
+        if (mounted) setIsTranscribing(false);
+      });
+
+    return () => {
+      mounted = false;
+      if (timer) finish("discard");
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const startRecording = async () => {
-    try {
-      const deviceId = selectedAudioDevices?.input?.id;
-
-      const audioConstraints: MediaTrackConstraints =
-        deviceId && deviceId !== "default"
-          ? { deviceId: { exact: deviceId } }
-          : {};
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: audioConstraints,
-      });
-
-      // Store in both ref and state
-      streamRef.current = stream;
-      setAudioStream(stream);
-
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm")
-        ? "audio/webm"
-        : "audio/ogg";
-
-      const recorder = new MediaRecorder(stream, { mimeType });
-      mediaRecorderRef.current = recorder;
-      audioChunksRef.current = [];
-      startTimeRef.current = Date.now();
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          audioChunksRef.current.push(e.data);
-        }
-      };
-
-      recorder.start(100);
-
-      durationIntervalRef.current = setInterval(() => {
-        setDuration(Date.now() - startTimeRef.current);
-      }, 100);
-
-      maxDurationTimeoutRef.current = setTimeout(() => {
-        if (mediaRecorderRef.current?.state === "recording") {
-          handleSend();
-        }
-      }, MAX_DURATION);
-    } catch (error) {
-      console.error("Failed to start recording:", error);
-      cleanup();
-      onCancel();
-    }
-  };
-
-  const handleStop = () => {
-    cleanup();
-    onCancel();
-  };
-
-  const handleSend = async () => {
-    if (!mediaRecorderRef.current || isTranscribing) return;
-
+  const handleSend = () => {
     setIsTranscribing(true);
-
-    const mimeType = mediaRecorderRef.current.mimeType;
-    const chunks = [...audioChunksRef.current];
-
-    // Cleanup immediately after getting chunks
-    cleanup();
-
-    try {
-      const audioBlob = new Blob(chunks, { type: mimeType });
-
-      const usePluelyAPI = await shouldUsePluelyAPI();
-      const provider = allSttProviders.find(
-        (p) => p.id === selectedSttProvider.provider
-      );
-
-      const text = await fetchSTT({
-        provider: usePluelyAPI ? undefined : provider,
-        selectedProvider: selectedSttProvider,
-        audio: audioBlob,
-      });
-
-      onTranscriptionComplete(text);
-    } catch (error) {
-      console.error("Transcription failed:", error);
-      onCancel();
-    }
+    finish("send");
   };
 
   const formatTime = (ms: number) => {
@@ -177,9 +89,20 @@ export const AudioRecorder = ({
   return (
     <div className="border bg-background rounded-lg overflow-hidden">
       <div className="h-12 relative bg-muted/20">
-        {audioStream ? (
-          <div className="h-full w-full pt-3">
-            <AudioVisualizer stream={audioStream} isRecording={true} />
+        {error ? (
+          <div className="h-full flex items-center justify-center px-4 text-xs text-red-500 truncate" title={error}>
+            {error}
+          </div>
+        ) : isTranscribing ? (
+          <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
+            Transcribing...
+          </div>
+        ) : started ? (
+          <div className="h-full flex items-center px-4">
+            <div
+              className="h-2 rounded-full bg-primary transition-[width] duration-75"
+              style={{ width: `${Math.min(100, Math.sqrt(level) * 250)}%` }}
+            />
           </div>
         ) : (
           <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
@@ -188,18 +111,20 @@ export const AudioRecorder = ({
         )}
       </div>
       <div className="flex items-center justify-between px-4 py-2.5 border-t bg-muted/5">
-        <div className="flex items-center gap-2">
+        <div className={`flex items-center gap-2 ${error ? "invisible" : ""}`}>
           <div className="h-2 w-2 bg-red-500 rounded-full animate-pulse" />
           <span className="text-sm font-mono tabular-nums font-medium">
             {formatTime(duration)}
           </span>
-          <span className="text-xs text-muted-foreground">/ 3:00</span>
+          <span className="text-xs text-muted-foreground">
+            / {formatTime(MAX_DURATION)}
+          </span>
         </div>
         <div className="flex items-center gap-2">
           <Button
             size="icon"
             variant="outline"
-            onClick={handleStop}
+            onClick={onCancel}
             disabled={isTranscribing}
             className="h-8 w-8"
             title="Stop recording"
@@ -209,7 +134,7 @@ export const AudioRecorder = ({
           <Button
             size="icon"
             onClick={handleSend}
-            disabled={isTranscribing}
+            disabled={!started || isTranscribing || !!error}
             className="h-8 w-8"
             title={isTranscribing ? "Sending..." : "Send to AI"}
           >

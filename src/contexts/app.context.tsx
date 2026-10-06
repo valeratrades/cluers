@@ -4,8 +4,12 @@ import {
   SPEECH_TO_TEXT_PROVIDERS,
   STORAGE_KEYS,
 } from "@/config";
-import { getPlatform, safeLocalStorage, trackAppStart } from "@/lib";
-import { getShortcutsConfig } from "@/lib/storage";
+import {
+  getPlatform,
+  safeLocalStorage,
+  trackAppStart,
+  pluelySelectedModelGet,
+} from "@/lib";
 import {
   getCustomizableState,
   setCustomizableState,
@@ -16,6 +20,8 @@ import {
   DEFAULT_CUSTOMIZABLE_STATE,
   CursorType,
   updateCursorType,
+  getCustomProviders,
+  migrateSttLegacyStorage,
 } from "@/lib/storage";
 import {
   AttachedFile,
@@ -24,7 +30,6 @@ import {
   TYPE_PROVIDER,
 } from "@/types";
 import { MAX_FILES } from "@/config";
-import curl2Json from "@bany/curl-to-json";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -39,40 +44,6 @@ import {
   useEffect,
   useState,
 } from "react";
-
-const validateAndProcessCurlProviders = (
-  providersJson: string,
-  providerType: "AI" | "STT"
-): TYPE_PROVIDER[] => {
-  try {
-    const parsed = JSON.parse(providersJson);
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    return parsed
-      .filter((p) => {
-        try {
-          curl2Json(p.curl);
-          return true;
-        } catch (e) {
-          return false;
-        }
-
-        return true;
-      })
-      .map((p) => {
-        const provider = { ...p, isCustom: true };
-        if (providerType === "STT" && provider.curl) {
-          provider.curl = provider.curl.replace(/AUDIO_BASE64/g, "AUDIO");
-        }
-        return provider;
-      });
-  } catch (e) {
-    console.warn(`Failed to parse custom ${providerType} providers`, e);
-    return [];
-  }
-};
 
 // Create the context
 const AppContext = createContext<IContextType | undefined>(undefined);
@@ -128,6 +99,11 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     provider: "",
     variables: {},
   });
+  const [sttMigrationError, setSttMigrationError] = useState<string | null>(
+    null
+  );
+  // rethrown during render so the root error boundary shows it
+  const [fatal, setFatal] = useState<Error | null>(null);
 
   const [screenshotConfiguration, setScreenshotConfiguration] =
     useState<ScreenshotConfig>({
@@ -140,7 +116,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   const [customizable, setCustomizable] = useState<CustomizableState>(
     DEFAULT_CUSTOMIZABLE_STATE
   );
-  const [hasActiveLicense, setHasActiveLicense] = useState<boolean>(false);
+  const [hasActiveLicense, setHasActiveLicense] = useState<boolean>(true);
   const [supportsImages, setSupportsImagesState] = useState<boolean>(() => {
     const stored = safeLocalStorage.getItem(STORAGE_KEYS.SUPPORTS_IMAGES);
     return stored === null ? true : stored === "true";
@@ -215,8 +191,13 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     (e: ChangeEvent<HTMLInputElement>) => {
       const files = Array.from(e.target.files || []);
       files.forEach((file) => {
+        // .md/.txt fall back to extension match — some platforms report an
+        // empty mime for them.
         const accepted =
-          file.type.startsWith("image/") || file.type === "application/pdf";
+          file.type.startsWith("image/") ||
+          file.type === "application/pdf" ||
+          file.type.startsWith("text/") ||
+          /\.(md|markdown|txt)$/i.test(file.name);
         if (accepted && attachedFiles.length < MAX_FILES) {
           addAttachedFile(file);
         }
@@ -253,27 +234,6 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     [attachedFiles.length, addAttachedFile]
   );
 
-  const getActiveLicenseStatus = async () => {
-    setHasActiveLicense(true);
-  };
-
-  useEffect(() => {
-    const syncLicenseState = async () => {
-      try {
-        await invoke("set_license_status", {
-          hasLicense: hasActiveLicense,
-        });
-
-        const config = getShortcutsConfig();
-        await invoke("update_shortcuts", { config });
-      } catch (error) {
-        console.error("Failed to synchronize license state:", error);
-      }
-    };
-
-    syncLicenseState();
-  }, [hasActiveLicense]);
-
   // Function to load AI, STT, system prompt and screenshot config data from storage
   const loadData = () => {
     // Load system prompt
@@ -305,23 +265,12 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       }
     }
 
-    // Load custom AI providers
-    const savedAi = safeLocalStorage.getItem(STORAGE_KEYS.CUSTOM_AI_PROVIDERS);
-    let aiList: TYPE_PROVIDER[] = [];
-    if (savedAi) {
-      aiList = validateAndProcessCurlProviders(savedAi, "AI");
+    try {
+      setCustomAiProviders(getCustomProviders("ai"));
+      setCustomSttProviders(getCustomProviders("stt"));
+    } catch (e) {
+      setFatal(e as Error);
     }
-    setCustomAiProviders(aiList);
-
-    // Load custom STT providers
-    const savedStt = safeLocalStorage.getItem(
-      STORAGE_KEYS.CUSTOM_SPEECH_PROVIDERS
-    );
-    let sttList: TYPE_PROVIDER[] = [];
-    if (savedStt) {
-      sttList = validateAndProcessCurlProviders(savedStt, "STT");
-    }
-    setCustomSttProviders(sttList);
 
     // Load selected AI provider
     const savedSelectedAi = safeLocalStorage.getItem(
@@ -416,22 +365,18 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
   // Load data on mount
   useEffect(() => {
     const initializeApp = async () => {
-      // Load license and data
-      await getActiveLicenseStatus();
-
       // Track app start
       try {
         const appVersion = await invoke<string>("get_app_version");
-        const storage = await invoke<{
-          instance_id: string;
-        }>("secure_storage_get");
-        await trackAppStart(appVersion, storage.instance_id || "");
+        await trackAppStart(appVersion);
       } catch (error) {
         console.debug("Failed to track app start:", error);
       }
     };
-    // Load data
     loadData();
+    migrateSttLegacyStorage().then(loadData, (e) =>
+      setSttMigrationError(String(e))
+    );
     initializeApp();
   }, []);
 
@@ -543,12 +488,8 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
       if (pluelyApiEnabled) {
         // For Pluely API, check the selected model's modality
         try {
-          const storage = await invoke<{
-            selected_pluely_model?: string;
-          }>("secure_storage_get");
-
-          if (storage.selected_pluely_model) {
-            const model = JSON.parse(storage.selected_pluely_model);
+          const model = await pluelySelectedModelGet();
+          if (model) {
             const hasImageSupport = model.modality?.includes("image") ?? false;
             setSupportsImages(hasImageSupport);
           } else {
@@ -707,12 +648,8 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
 
     if (enabled) {
       try {
-        const storage = await invoke<{
-          selected_pluely_model?: string;
-        }>("secure_storage_get");
-
-        if (storage.selected_pluely_model) {
-          const model = JSON.parse(storage.selected_pluely_model);
+        const model = await pluelySelectedModelGet();
+        if (model) {
           const hasImageSupport = model.modality?.includes("image") ?? false;
           setSupportsImages(hasImageSupport);
         } else {
@@ -739,6 +676,8 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     loadData();
   };
 
+  if (fatal) throw fatal;
+
   // Create the context value (extend IContextType accordingly)
   const value: IContextType = {
     systemPrompt,
@@ -751,6 +690,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     customSttProviders,
     selectedSttProvider,
     onSetSelectedSttProvider,
+    sttMigrationError,
     screenshotConfiguration,
     setScreenshotConfiguration,
     customizable,
@@ -762,7 +702,6 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     setPluelyApiEnabled,
     hasActiveLicense,
     setHasActiveLicense,
-    getActiveLicenseStatus,
     selectedAudioDevices,
     setSelectedAudioDevices,
     setCursorType,

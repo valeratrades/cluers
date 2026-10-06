@@ -1,17 +1,18 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-mod activate;
 mod api;
 mod capture;
 mod db;
+mod llm;
 mod shortcuts;
 mod window;
-use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::Manager;
+#[cfg(target_os = "macos")]
+use tauri::{AppHandle, WebviewWindow};
 use tauri_plugin_posthog::{init as posthog_init, PostHogConfig, PostHogOptions};
-use tokio::task::JoinHandle;
 mod speaker;
 use capture::CaptureState;
-use speaker::VadConfig;
+pub use speaker::turn;
+pub use speaker::vad;
+use speaker::vad::VadConfig;
 
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
@@ -19,9 +20,8 @@ use tauri_nspanel::{cocoa::appkit::NSWindowCollectionBehavior, panel_delegate, W
 
 #[derive(Default)]
 pub struct AudioState {
-    stream_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-    vad_config: Arc<Mutex<VadConfig>>,
-    is_capturing: Arc<std::sync::atomic::AtomicBool>,
+    capture: tokio::sync::Mutex<Option<speaker::Capture>>,
+    vad: tokio::sync::watch::Sender<VadConfig>,
 }
 
 #[tauri::command]
@@ -29,28 +29,50 @@ fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+// Frontend log sink: the webview console is invisible when the app is
+// launched from a terminal, so the JS side forwards diagnostics here.
+#[tauri::command]
+fn js_log(msg: String) {
+    tracing::info!(target: "js", "{msg}");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    if let Err(e) = shortcuts::cli_action(&std::env::args().collect::<Vec<_>>()) {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
+
+    // Without a subscriber every tracing::error!/warn! in the codebase is
+    // silently dropped. RUST_LOG overrides the default level.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     // Get PostHog API key
     let posthog_api_key = option_env!("POSTHOG_API_KEY").unwrap_or("").to_string();
-    let mut builder = tauri::Builder::default()
-        .plugin(
-            tauri_plugin_sql::Builder::default()
-                .add_migrations("sqlite:pluely.db", db::migrations())
-                .build(),
-        )
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "linux")]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _| {
+        shortcuts::run_cli_action(app, &argv)
+    }));
+    #[cfg(target_os = "windows")]
+    let builder = builder.manage(shortcuts::WindowVisibility {
+        is_hidden: std::sync::Mutex::new(false),
+    });
+    let builder = builder
         .manage(AudioState::default())
+        .manage(speaker::PushToTalk::default())
         .manage(CaptureState::default())
-        .manage(shortcuts::WindowVisibility {
-            is_hidden: Mutex::new(false),
-        })
-        .manage(shortcuts::RegisteredShortcuts::default())
-        .manage(shortcuts::LicenseState::default())
+        .manage(llm::LlmState::new())
         .manage(shortcuts::MoveWindowState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_http::init())
-        .plugin(tauri_plugin_keychain::init())
         .plugin(tauri_plugin_shell::init()) // Add shell plugin
         .plugin(posthog_init(PostHogConfig {
             api_key: posthog_api_key,
@@ -67,64 +89,75 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_machine_uid::init());
     #[cfg(target_os = "macos")]
-    {
-        builder = builder.plugin(tauri_nspanel::init());
-    }
-    let mut builder = builder
+    let builder = builder.plugin(tauri_nspanel::init());
+    let builder = builder
         .invoke_handler(tauri::generate_handler![
             get_app_version,
+            js_log,
             window::set_window_height,
+            window::set_input_region,
             window::open_dashboard,
-            window::toggle_dashboard,
-            window::move_window,
             capture::capture_to_base64,
             capture::start_screen_capture,
             capture::capture_selected_area,
             capture::close_overlay_window,
-            shortcuts::check_shortcuts_registered,
-            shortcuts::get_registered_shortcuts,
             shortcuts::update_shortcuts,
             shortcuts::validate_shortcut_key,
-            shortcuts::set_license_status,
             shortcuts::set_app_icon_visibility,
             shortcuts::set_always_on_top,
             shortcuts::exit_app,
-            activate::activate_license_api,
-            activate::deactivate_license_api,
-            activate::validate_license_api,
-            activate::mask_license_key_cmd,
-            activate::get_checkout_url,
-            activate::secure_storage_save,
-            activate::secure_storage_get,
-            activate::secure_storage_remove,
-            api::transcribe_audio,
-            api::chat_stream_response,
             api::fetch_models,
             api::fetch_prompts,
-            api::create_system_prompt,
-            api::check_license_status,
+            api::generate_system_prompt_via_api,
             api::get_activity,
+            llm::commands::stream_chat,
+            llm::commands::cancel_chat,
+            llm::commands::set_provider_secret,
+            llm::commands::list_provider_secret_names,
+            llm::commands::delete_provider_secret,
+            llm::commands::delete_all_provider_secrets,
+            llm::commands::pluely_selected_model_get,
+            llm::commands::pluely_selected_model_set,
+            db::commands::list_conversation_summaries,
+            db::commands::load_conversation,
+            db::commands::append_turn,
+            db::commands::delete_conversation,
+            db::commands::delete_all_conversations,
+            db::commands::list_system_prompts,
+            db::commands::create_system_prompt,
+            db::commands::edit_system_prompt,
+            db::commands::delete_system_prompt,
             speaker::start_system_audio_capture,
             speaker::stop_system_audio_capture,
-            speaker::manual_stop_continuous,
+            speaker::record_push_to_talk,
+            speaker::finish_push_to_talk,
+            speaker::system_audio_control,
             speaker::check_system_audio_access,
             speaker::request_system_audio_access,
-            speaker::get_vad_config,
+            speaker::default_vad_config,
             speaker::update_vad_config,
             speaker::calibrate_vad_thresholds,
-            speaker::get_capture_status,
-            speaker::get_audio_sample_rate,
             speaker::get_input_devices,
             speaker::get_output_devices,
         ])
         .setup(|app| {
+            // SQLite (rusqlite) state. Mirrors what tauri-plugin-sql resolved
+            // for "sqlite:pluely.db": app_config_dir() + filename.
+            let db_path = app
+                .path()
+                .app_config_dir()
+                .expect("resolve app_config_dir")
+                .join("pluely.db");
+            let db = db::Db::open(db_path).expect("open pluely.db");
+            app.manage(db);
+
             // Setup main window positioning
             window::setup_main_window(app).expect("Failed to setup main window");
             #[cfg(target_os = "macos")]
             init(app.app_handle());
             let app_handle = app.handle();
             if app_handle.get_webview_window("dashboard").is_none() {
-                if let Err(e) = window::create_dashboard_window(&app_handle) {
+                if let Err(e) = window::create_dashboard_window(app_handle) {
                     eprintln!("Failed to pre-create dashboard window on startup: {}", e);
                 }
             }
@@ -142,69 +175,18 @@ pub fn run() {
                 }
             }
 
-            // Initialize global shortcut plugin with centralized handler
             app.handle()
-                .plugin(
-                    tauri_plugin_global_shortcut::Builder::new()
-                        .with_handler(move |app, shortcut, event| {
-                            use tauri_plugin_global_shortcut::{Shortcut, ShortcutState};
-
-                            let action_id = {
-                                let state = app.state::<shortcuts::RegisteredShortcuts>();
-                                let registered = match state.shortcuts.lock() {
-                                    Ok(guard) => guard,
-                                    Err(poisoned) => {
-                                        eprintln!("Mutex poisoned in handler, recovering...");
-                                        poisoned.into_inner()
-                                    }
-                                };
-
-                                registered.iter().find_map(|(action_id, shortcut_str)| {
-                                    if let Ok(s) = shortcut_str.parse::<Shortcut>() {
-                                        if &s == shortcut {
-                                            return Some(action_id.clone());
-                                        }
-                                    }
-                                    None
-                                })
-                            };
-
-                            if let Some(action_id) = action_id {
-                                match event.state() {
-                                    ShortcutState::Pressed => {
-                                        if let Some(direction) =
-                                            action_id.strip_prefix("move_window_")
-                                        {
-                                            shortcuts::start_move_window(app, direction);
-                                        } else {
-                                            eprintln!("Shortcut triggered: {}", action_id);
-                                            shortcuts::handle_shortcut_action(app, &action_id);
-                                        }
-                                    }
-                                    ShortcutState::Released => {
-                                        if let Some(direction) =
-                                            action_id.strip_prefix("move_window_")
-                                        {
-                                            shortcuts::stop_move_window(app, direction);
-                                        }
-                                    }
-                                }
-                            }
-                        })
-                        .build(),
-                )
+                .plugin(tauri_plugin_global_shortcut::Builder::new().build())
                 .expect("Failed to initialize global shortcut plugin");
-            if let Err(e) = shortcuts::setup_global_shortcuts(app.handle()) {
-                eprintln!("Failed to setup global shortcuts: {}", e);
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                tracing::warn!("global shortcuts use X11 key grabs and fire under Wayland only while an XWayland window has focus; bind `pluely --action <action_id>` in your compositor config instead");
             }
             Ok(())
         });
 
-    // Add macOS-specific permissions plugin
     #[cfg(target_os = "macos")]
-    {
-        builder = builder.plugin(tauri_plugin_macos_permissions::init());
-    }
+    let builder = builder.plugin(tauri_plugin_macos_permissions::init());
 
     builder
         .run(tauri::generate_context!())

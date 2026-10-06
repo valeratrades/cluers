@@ -26,7 +26,7 @@ export const getPlatformDefaultKey = (action: ShortcutAction): string => {
 /**
  * Get default shortcuts configuration
  */
-export const getDefaultShortcutsConfig = (): ShortcutsConfig => {
+const getDefaultShortcutsConfig = (): ShortcutsConfig => {
   const bindings: Record<string, ShortcutBinding> = {};
 
   DEFAULT_SHORTCUT_ACTIONS.forEach((action) => {
@@ -37,44 +37,22 @@ export const getDefaultShortcutsConfig = (): ShortcutsConfig => {
     };
   });
 
-  return {
-    bindings,
-    customActions: [],
-  };
+  return { bindings };
 };
 
 /**
- * Get shortcuts configuration from localStorage
+ * Get shortcuts configuration from localStorage; throws on corrupt JSON
  */
 export const getShortcutsConfig = (): ShortcutsConfig => {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEYS.SHORTCUTS);
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      // Merge with defaults to ensure all default actions are present
-      const defaults = getDefaultShortcutsConfig();
-      return {
-        bindings: { ...defaults.bindings, ...parsed.bindings },
-        customActions: parsed.customActions || [],
-      };
-    }
-    return getDefaultShortcutsConfig();
-  } catch (error) {
-    console.error("Failed to get shortcuts config:", error);
-    return getDefaultShortcutsConfig();
-  }
+  const defaults = getDefaultShortcutsConfig();
+  const stored = localStorage.getItem(STORAGE_KEYS.SHORTCUTS);
+  if (!stored) return defaults;
+  const parsed: ShortcutsConfig = JSON.parse(stored);
+  return { bindings: { ...defaults.bindings, ...parsed.bindings } };
 };
 
-/**
- * Save shortcuts configuration to localStorage
- */
-export const setShortcutsConfig = (config: ShortcutsConfig): void => {
-  try {
-    localStorage.setItem(STORAGE_KEYS.SHORTCUTS, JSON.stringify(config));
-  } catch (error) {
-    console.error("Failed to save shortcuts config:", error);
-  }
-};
+const setShortcutsConfig = (config: ShortcutsConfig): void =>
+  localStorage.setItem(STORAGE_KEYS.SHORTCUTS, JSON.stringify(config));
 
 /**
  * Update a single shortcut binding
@@ -241,75 +219,4 @@ export const formatShortcutKeyForDisplay = (key: string): string => {
       return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
     })
     .join(" + ");
-};
-
-/**
- * Get all available actions (default + custom)
- */
-export const getAllShortcutActions = (
-  hasLicense: boolean
-): ShortcutAction[] => {
-  const config = getShortcutsConfig();
-  const actions = [...DEFAULT_SHORTCUT_ACTIONS];
-
-  // Add custom actions if user has license
-  if (hasLicense && config.customActions) {
-    actions.push(...config.customActions);
-  }
-
-  return actions;
-};
-
-/**
- * Add a custom shortcut action (license required)
- */
-export const addCustomShortcutAction = (
-  action: ShortcutAction
-): ShortcutsConfig => {
-  const config = getShortcutsConfig();
-
-  if (!config.customActions) {
-    config.customActions = [];
-  }
-
-  // Check if action already exists
-  const existingIndex = config.customActions.findIndex(
-    (a) => a.id === action.id
-  );
-  if (existingIndex >= 0) {
-    config.customActions[existingIndex] = action;
-  } else {
-    config.customActions.push(action);
-  }
-
-  // Add binding for the new action
-  config.bindings[action.id] = {
-    action: action.id,
-    key: getPlatformDefaultKey(action),
-    enabled: true,
-  };
-
-  setShortcutsConfig(config);
-  return config;
-};
-
-/**
- * Remove a custom shortcut action
- */
-export const removeCustomShortcutAction = (
-  actionId: string
-): ShortcutsConfig => {
-  const config = getShortcutsConfig();
-
-  if (config.customActions) {
-    config.customActions = config.customActions.filter(
-      (a) => a.id !== actionId
-    );
-  }
-
-  // Remove binding
-  delete config.bindings[actionId];
-
-  setShortcutsConfig(config);
-  return config;
 };

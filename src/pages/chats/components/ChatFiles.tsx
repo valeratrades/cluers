@@ -15,9 +15,10 @@ import {
 } from "lucide-react";
 import { MAX_FILES } from "@/config";
 import { useApp } from "@/contexts";
+import { AttachedFile } from "@/types";
 
 interface ChatFilesProps {
-  attachedFiles: any[];
+  attachedFiles: AttachedFile[];
   handleFileSelect: (e: React.ChangeEvent<HTMLInputElement>) => void;
   removeFile: (fileId: string) => void;
   onRemoveAllFiles: () => void;
@@ -66,7 +67,7 @@ export const ChatFiles = ({
             className="size-7 lg:size-9 rounded-lg lg:rounded-xl"
             title={
               supportsImages
-                ? "Attach images or PDFs"
+                ? "Attach images, PDFs or text files"
                 : "File upload not supported by current AI provider"
             }
           >
@@ -180,7 +181,7 @@ export const ChatFiles = ({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf"
+        accept="image/*,application/pdf,text/*,.md,.markdown,.txt"
         onChange={handleFileSelect}
         className="hidden"
       />

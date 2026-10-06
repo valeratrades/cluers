@@ -1,0 +1,82 @@
+//! LLM streaming + secret storage subsystem.
+//!
+//! - `stream_chat` (in `commands`) is the single command surface the
+//!   frontend uses to drive both the Pluely-hosted path and arbitrary
+//!   custom provider templates. Streaming is over a Tauri `Channel<T>`.
+//! - `transcribe` is the STT counterpart (`stt::transcribe`), same routing.
+//! - `stream_chat` cancellation is an outer `tokio::select!` against an
+//!   `oneshot::Receiver` whose `Sender` lives in `LlmState` keyed by
+//!   `request_id`; dropping the stream future cancels it. Duplicate
+//!   in-flight ids are rejected; cancel is idempotent.
+//! - Custom-provider secrets (API keys etc.) live in the OS keychain via
+//!   `secrets.rs`. Non-secret preferences such as the Pluely-hosted
+//!   `selected_model` live in the SQLite `settings` table — the keychain is
+//!   never on the hot path of the Pluely chat/STT flow.
+
+pub mod commands;
+pub mod pluely;
+pub mod provider;
+pub mod secrets;
+pub mod state;
+pub mod stream;
+pub mod stt;
+
+pub use state::LlmState;
+
+use serde::Serialize;
+
+/// Event payload sent over the per-request `Channel<StreamEvent>`.
+/// Zero or more `Chunk`s, terminated by `Done`; failures are the command's `Err`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum StreamEvent {
+    Chunk {
+        delta: String,
+    },
+    Done {
+        full_response: String,
+        request_id: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LlmError {
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+    #[error("keychain: {0}")]
+    Keychain(#[from] keyring::Error),
+    #[error(transparent)]
+    Db(#[from] crate::db::DbError),
+    #[error("missing variable: {0}")]
+    MissingVariable(String),
+    #[error("invalid curl: {0}")]
+    InvalidCurl(&'static str),
+    #[error("pluely config: {0}")]
+    PluelyConfig(String),
+    #[error("provider api {status}: {body}")]
+    ProviderApi { status: u16, body: String },
+    #[error("curl parse: {0}")]
+    CurlParse(String),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("channel: {0}")]
+    Channel(String),
+    #[error("text attachment {0}: {1}")]
+    TextAttachment(String, String),
+    #[error("provider template has no {{{{{0}}}}} slot — add one to the curl template to enable this attachment type")]
+    UnsupportedAttachment(&'static str),
+    #[error("pluely stt: {0}")]
+    PluelyStt(String),
+    #[error("stt response: {0}")]
+    SttResponse(String),
+    #[error("request id already in flight: {0}")]
+    DuplicateRequestId(String),
+    #[error("cancelled")]
+    Cancelled,
+}
+
+impl serde::Serialize for LlmError {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}

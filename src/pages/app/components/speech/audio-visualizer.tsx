@@ -16,10 +16,9 @@ const AUDIO_CONFIG = {
 
 interface AudioVisualizerProps {
   isRecording: boolean;
-  stream?: MediaStream | null;
 }
 
-export function AudioVisualizer({ stream, isRecording }: AudioVisualizerProps) {
+export function AudioVisualizer({ isRecording }: AudioVisualizerProps) {
   // Refs for managing audio context and animation
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -63,7 +62,7 @@ export function AudioVisualizer({ stream, isRecording }: AudioVisualizerProps) {
       cleanup();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stream, isRecording]);
+  }, [isRecording]);
 
   // Handle window resize
   useEffect(() => {
@@ -159,18 +158,11 @@ export function AudioVisualizer({ stream, isRecording }: AudioVisualizerProps) {
       analyser.smoothingTimeConstant = AUDIO_CONFIG.SMOOTHING;
       analyserRef.current = analyser;
 
-      if (stream) {
-        // Use real stream if available
-        const source = audioContext.createMediaStreamSource(stream);
-        source.connect(analyser);
-      } else {
-        // Create fake stream for visualization
-        createFakeStream(audioContext, analyser);
-      }
+      createFakeStream(audioContext, analyser);
 
       draw();
     } catch (error) {
-      console.error("Error starting visualization:", error);
+      console.error("Error starting visualization:", error); // cosmetic: capture works without it
     }
   };
 

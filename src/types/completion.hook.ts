@@ -6,13 +6,7 @@ import {
   ChangeEvent,
   ClipboardEvent,
 } from "react";
-// import {
-//   AttachedFile,
-//   ChatMessage,
-//   ChatConversation,
-//   CompletionState,
-//   ScreenshotConfig,
-// } from "@/types";
+import { AttachedFile, ChatMessage, ScreenshotConfig } from "@/types";
 
 /**
  * Type definition for the useCompletion hook return value
@@ -39,7 +33,7 @@ export interface UseCompletionReturn {
 
   // File attachment management
   /** Array of currently attached files */
-  attachedFiles: any[];
+  attachedFiles: AttachedFile[];
   /** Function to add a file to attachments */
   addFile: (file: File) => Promise<void>;
   /** Function to remove a file by its ID */
@@ -59,12 +53,7 @@ export interface UseCompletionReturn {
   /** Direct state setter for advanced use cases */
   setState: Dispatch<SetStateAction<any>>;
 
-  // Voice Activity Detection (VAD) and microphone
-  /** Whether Voice Activity Detection is enabled */
-  enableVAD: boolean;
-  /** Function to toggle VAD state */
-  setEnableVAD: Dispatch<SetStateAction<boolean>>;
-  /** Whether microphone is currently open/active */
+  /** Push-to-talk popover; open means recording once STT is configured */
   micOpen: boolean;
   /** Function to control microphone state */
   setMicOpen: Dispatch<SetStateAction<boolean>>;
@@ -73,9 +62,7 @@ export interface UseCompletionReturn {
   /** ID of the currently active conversation, null for new conversation */
   currentConversationId: string | null;
   /** Array of messages in the current conversation */
-  conversationHistory: any[];
-  /** Function to load an existing conversation */
-  loadConversation: (conversation: any) => void;
+  conversationHistory: ChatMessage[];
   /** Function to start a new conversation (clears current state) */
   startNewConversation: () => void;
 
@@ -91,11 +78,9 @@ export interface UseCompletionReturn {
 
   // Screenshot functionality
   /** Current screenshot configuration settings */
-  screenshotConfiguration: any;
+  screenshotConfiguration: ScreenshotConfig;
   /** Function to update screenshot configuration */
-  setScreenshotConfiguration: Dispatch<SetStateAction<any>>;
-  /** Function to handle screenshot submission with optional prompt */
-  handleScreenshotSubmit: (base64: string, prompt?: string) => Promise<void>;
+  setScreenshotConfiguration: Dispatch<SetStateAction<ScreenshotConfig>>;
 
   // File selection and keyboard handling
   /** Event handler for file input changes */
@@ -128,8 +113,3 @@ export interface UseCompletionReturn {
   /** Whether a screenshot is currently loading */
   isScreenshotLoading: boolean;
 }
-
-/**
- * Type for the useCompletion hook function signature
- */
-export type UseCompletionHook = () => UseCompletionReturn;

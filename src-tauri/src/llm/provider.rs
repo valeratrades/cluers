@@ -1,0 +1,645 @@
+//! Curl-template parser, variable substitution, message building, and
+//! the custom-provider stream entrypoint.
+//!
+//! The supported curl subset (intentionally narrow — matches what
+//! `@bany/curl-to-json` accepted on the JS side):
+//! - `-X METHOD` / `--request METHOD`
+//! - `-H 'K: V'` / `--header 'K: V'` (quoted, double-quoted, or bare)
+//! - `-d <data>` / `--data <data>` / `--data-raw <data>` / `--data-binary <data>`
+//! - `-F k=v` / `--form k=v`
+//! - `--url <url>` and the bare positional URL
+//!
+//! Variable templates use `{{UPPER_SNAKE}}` placeholders. Reserved names
+//! (`TEXT`, `IMAGE`, `IMAGE_MIME`, `AUDIO`, `DOCUMENT`, `DOCUMENT_NAME`,
+//! `SYSTEM_PROMPT`) are handled by `build_messages` / `substitute_value`;
+//! everything else comes from `Secrets`-cached keychain entries ∪
+//! user_variables.
+
+use crate::db::schema::AttachedFile;
+use crate::llm::{
+    commands::{Chat, ProviderInput},
+    secrets::{ProviderKind, Secrets},
+    stream, LlmError,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryMessage {
+    pub role: crate::db::schema::Role,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedCurl {
+    pub url: String,
+    pub method: String,
+    pub headers: HashMap<String, String>,
+    pub data: Option<String>,
+    pub form: Vec<(String, String)>,
+}
+
+pub fn parse_curl(input: &str) -> Result<ParsedCurl, LlmError> {
+    let tokens = tokenize(input)?;
+    let mut iter = tokens.into_iter().peekable();
+    if iter.peek().map(|s| s.as_str()) == Some("curl") {
+        iter.next();
+    }
+    let mut url: Option<String> = None;
+    let mut method: Option<String> = None;
+    let mut headers: HashMap<String, String> = HashMap::new();
+    let mut data: Option<String> = None;
+    let mut form: Vec<(String, String)> = Vec::new();
+
+    while let Some(tok) = iter.next() {
+        match tok.as_str() {
+            "-X" | "--request" => {
+                method = Some(iter.next().ok_or(LlmError::InvalidCurl("missing -X value"))?);
+            }
+            "-H" | "--header" => {
+                let v = iter.next().ok_or(LlmError::InvalidCurl("missing -H value"))?;
+                let (k, val) = v.split_once(':').ok_or(LlmError::InvalidCurl("bad header"))?;
+                headers.insert(k.trim().to_string(), val.trim().to_string());
+            }
+            "-d" | "--data" | "--data-raw" | "--data-binary" => {
+                data = Some(iter.next().ok_or(LlmError::InvalidCurl("missing -d value"))?);
+            }
+            "-F" | "--form" => {
+                let v = iter.next().ok_or(LlmError::InvalidCurl("missing -F value"))?;
+                let (k, val) = v.split_once('=').ok_or(LlmError::InvalidCurl("bad -F"))?;
+                form.push((k.to_string(), val.to_string()));
+            }
+            "--url" => {
+                url = Some(iter.next().ok_or(LlmError::InvalidCurl("missing --url value"))?);
+            }
+            other if !other.starts_with('-')
+                && url.is_none() => {
+                    url = Some(other.to_string());
+                }
+            // Flags we don't model (e.g. `-i`, `--compressed`) are skipped.
+            _ => {}
+        }
+    }
+
+    let url = url.ok_or(LlmError::InvalidCurl("missing URL"))?;
+    let method = method.unwrap_or_else(|| {
+        if data.is_some() || !form.is_empty() {
+            "POST".to_string()
+        } else {
+            "GET".to_string()
+        }
+    });
+    Ok(ParsedCurl {
+        url,
+        method,
+        headers,
+        data,
+        form,
+    })
+}
+
+fn tokenize(input: &str) -> Result<Vec<String>, LlmError> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if in_double => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            '\\' if !in_single => {
+                // Outside quotes, `\\\n` is line continuation; otherwise
+                // take the next char literally.
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                } else if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if in_single || in_double {
+        return Err(LlmError::InvalidCurl("unterminated quote"));
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+fn extract_variables(template: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find("}}") else { break };
+        let name = &rest[..end];
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == '_')
+            && !out.iter().any(|v| v == name)
+        {
+            out.push(name.to_string());
+        }
+        rest = &rest[end + 2..];
+    }
+    out
+}
+
+pub fn substitute_string(template: &str, vars: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str("{{");
+            out.push_str(after);
+            return out;
+        };
+        let name = &after[..end];
+        if let Some(v) = vars.get(name) {
+            out.push_str(v);
+        } else {
+            out.push_str("{{");
+            out.push_str(name);
+            out.push_str("}}");
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+pub fn substitute_value(value: &mut serde_json::Value, vars: &HashMap<String, String>) {
+    match value {
+        serde_json::Value::String(s) => *s = substitute_string(s, vars),
+        serde_json::Value::Array(a) => {
+            for v in a {
+                substitute_value(v, vars);
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for v in o.values_mut() {
+                substitute_value(v, vars);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Mutates `body[messages_key]` in place, replacing the `{{TEXT}}`
+/// template message with the actual user turn (text + attachments) and
+/// inserting `history` before it. `messages_key` is auto-detected from
+/// `{messages, contents, conversation, history}`.
+fn build_messages(
+    body: &mut serde_json::Value,
+    history: &[HistoryMessage],
+    user_message: &str,
+    attached_files: &[AttachedFile],
+) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let key: Option<String> = ["messages", "contents", "conversation", "history"]
+        .iter()
+        .find(|k| obj.get(**k).map(|v| v.is_array()).unwrap_or(false))
+        .map(|s| s.to_string());
+    let Some(key) = key else { return };
+    let Some(template_arr) = obj.get(&key).and_then(|v| v.as_array()).cloned() else {
+        return;
+    };
+
+    let user_idx = template_arr
+        .iter()
+        .position(|m| value_contains(m, "{{TEXT}}"));
+
+    let (prefix, user_tpl, suffix) = match user_idx {
+        Some(i) => {
+            let mut head = template_arr;
+            let suffix = head.split_off(i + 1);
+            let user_tpl = head.pop().unwrap();
+            (head, Some(user_tpl), suffix)
+        }
+        None => (template_arr, None, Vec::new()),
+    };
+
+    let history_msgs: Vec<serde_json::Value> = history
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "role": m.role.as_str(),
+                "content": m.content,
+            })
+        })
+        .collect();
+
+    let mut result: Vec<serde_json::Value> = Vec::with_capacity(prefix.len() + history_msgs.len() + 1 + suffix.len());
+    result.extend(prefix);
+    result.extend(history_msgs);
+    match user_tpl {
+        Some(tpl) => result.push(expand_user_template(tpl, user_message, attached_files)),
+        None => result.push(serde_json::json!({ "role": "user", "content": user_message })),
+    }
+    result.extend(suffix);
+
+    obj.insert(key, serde_json::Value::Array(result));
+}
+
+fn value_contains(v: &serde_json::Value, needle: &str) -> bool {
+    match v {
+        serde_json::Value::String(s) => s.contains(needle),
+        serde_json::Value::Array(a) => a.iter().any(|x| value_contains(x, needle)),
+        serde_json::Value::Object(o) => o.values().any(|x| value_contains(x, needle)),
+        _ => false,
+    }
+}
+
+fn json_escape_contents(s: &str) -> String {
+    // Strip the outer quotes from the JSON-stringified form so the
+    // result is safe to substitute *into* a JSON-string literal.
+    let escaped = serde_json::to_string(s).unwrap_or_default();
+    if escaped.len() < 2 {
+        String::new()
+    } else {
+        escaped[1..escaped.len() - 1].to_string()
+    }
+}
+
+fn expand_user_template(
+    template: serde_json::Value,
+    user_message: &str,
+    attached: &[AttachedFile],
+) -> serde_json::Value {
+    // {{TEXT}} substitution via JSON string-level replace so the result
+    // remains valid JSON (escapes user newlines, quotes, etc).
+    let tpl_str = serde_json::to_string(&template).unwrap_or_default();
+    let with_text = tpl_str.replace("{{TEXT}}", &json_escape_contents(user_message));
+    let value: serde_json::Value = serde_json::from_str(&with_text).unwrap_or(template);
+
+    let images: Vec<HashMap<String, String>> = attached
+        .iter()
+        .filter(|f| f.mime.starts_with("image/"))
+        .map(|f| {
+            let mut m = HashMap::new();
+            m.insert("IMAGE".to_string(), f.base64.clone());
+            m.insert("IMAGE_MIME".to_string(), f.mime.clone());
+            m
+        })
+        .collect();
+    // Text attachments were already inlined into the message by
+    // `stream_chat`; the `{{DOCUMENT}}` slot is base64 PDF data only
+    // (provider templates hardcode the application/pdf media type).
+    let docs: Vec<HashMap<String, String>> = attached
+        .iter()
+        .filter(|f| f.mime == "application/pdf")
+        .map(|f| {
+            let mut m = HashMap::new();
+            m.insert("DOCUMENT".to_string(), f.base64.clone());
+            m.insert("DOCUMENT_NAME".to_string(), f.name.clone());
+            m
+        })
+        .collect();
+
+    replacer(value, &images, &docs)
+}
+
+fn replacer(
+    node: serde_json::Value,
+    images: &[HashMap<String, String>],
+    docs: &[HashMap<String, String>],
+) -> serde_json::Value {
+    match node {
+        serde_json::Value::Array(arr) => {
+            let arr = expand_one_array(arr, &["IMAGE", "IMAGE_MIME"], images);
+            let arr = expand_one_array(arr, &["DOCUMENT", "DOCUMENT_NAME"], docs);
+            serde_json::Value::Array(
+                arr.into_iter()
+                    .map(|v| replacer(v, images, docs))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Object(obj) => serde_json::Value::Object(
+            obj.into_iter()
+                .map(|(k, v)| (k, replacer(v, images, docs)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn expand_one_array(
+    arr: Vec<serde_json::Value>,
+    tokens: &[&str],
+    payloads: &[HashMap<String, String>],
+) -> Vec<serde_json::Value> {
+    let idx = arr.iter().position(|item| {
+        let s = serde_json::to_string(item).unwrap_or_default();
+        tokens
+            .iter()
+            .any(|t| s.contains(&format!("{{{{{}}}}}", t)))
+    });
+    let Some(idx) = idx else { return arr };
+
+    let tpl_str = serde_json::to_string(&arr[idx]).unwrap_or_default();
+    let parts: Vec<serde_json::Value> = payloads
+        .iter()
+        .map(|p| {
+            let mut s = tpl_str.clone();
+            for token in tokens {
+                let val = p.get(*token).map(String::as_str).unwrap_or("");
+                s = s.replace(
+                    &format!("{{{{{}}}}}", token),
+                    &json_escape_contents(val),
+                );
+            }
+            serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
+        })
+        .collect();
+    let mut out = Vec::with_capacity(arr.len() - 1 + parts.len());
+    for (i, item) in arr.into_iter().enumerate() {
+        if i == idx {
+            out.extend(parts.clone());
+        } else {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// user_variables (uppercased) ∪ keychain secrets of `kind`; keychain wins. A template without variables never touches the keychain.
+/// Every non-reserved `{{VAR}}` in the template must resolve to a non-blank value.
+pub(crate) async fn resolve_vars(
+    secrets: &Secrets,
+    kind: ProviderKind,
+    p: &ProviderInput,
+) -> Result<HashMap<String, String>, LlmError> {
+    let mut vars: HashMap<String, String> = p
+        .user_variables
+        .iter()
+        .map(|(k, v)| (k.to_ascii_uppercase(), v.clone()))
+        .collect();
+    let needed: Vec<String> = extract_variables(&p.curl)
+        .into_iter()
+        .filter(|v| {
+            !matches!(
+                v.as_str(),
+                "SYSTEM_PROMPT" | "TEXT" | "IMAGE" | "IMAGE_MIME" | "AUDIO" | "DOCUMENT"
+                    | "DOCUMENT_NAME"
+            )
+        })
+        .collect();
+    if needed.is_empty() {
+        return Ok(vars); // keyless templates must work without a Secret Service
+    }
+    vars.extend(secrets.provider(kind, &p.id).await?);
+    for v in needed {
+        if vars.get(&v).is_none_or(|s| s.trim().is_empty()) {
+            return Err(LlmError::MissingVariable(v));
+        }
+    }
+    Ok(vars)
+}
+
+pub(crate) fn method(s: &str) -> Result<reqwest::Method, LlmError> {
+    Ok(match s.to_ascii_uppercase().as_str() {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "PATCH" => reqwest::Method::PATCH,
+        "DELETE" => reqwest::Method::DELETE,
+        other => return Err(LlmError::CurlParse(format!("unsupported method: {other}"))),
+    })
+}
+
+/// Custom-provider stream entrypoint (the non-Pluely path).
+pub async fn stream_custom(
+    http: &reqwest::Client,
+    secrets: &Secrets,
+    request: Chat,
+    on_delta: &mut impl FnMut(String) -> Result<(), LlmError>,
+) -> Result<String, LlmError> {
+    // An attachment the template has no slot for would be silently
+    // dropped by `expand_one_array` — reject it up front instead, like
+    // the pre-rewrite JS did ("does not support document input").
+    for f in &request.attached_files {
+        let token = if f.mime.starts_with("image/") {
+            "IMAGE"
+        } else {
+            "DOCUMENT"
+        };
+        if !request.provider.curl.contains(&format!("{{{{{token}}}}}")) {
+            return Err(LlmError::UnsupportedAttachment(token));
+        }
+    }
+
+    let p = &request.provider;
+    let parsed = parse_curl(&p.curl)?;
+
+    let mut vars = resolve_vars(secrets, ProviderKind::Ai, p).await?;
+    vars.insert(
+        "SYSTEM_PROMPT".to_string(),
+        request.system_prompt.clone().unwrap_or_default(),
+    );
+
+    let mut body = match parsed.data {
+        None => serde_json::json!({}),
+        Some(s) => serde_json::from_str(&s)
+            .map_err(|e| LlmError::CurlParse(format!("body json: {e}")))?,
+    };
+    build_messages(
+        &mut body,
+        &request.history,
+        &request.message,
+        &request.attached_files,
+    );
+    substitute_value(&mut body, &vars);
+
+    if p.streaming {
+        if let Some(obj) = body.as_object_mut() {
+            let existing = obj.keys().find(|k| k.eq_ignore_ascii_case("stream")).cloned();
+            match existing {
+                Some(k) => {
+                    obj.insert(k, serde_json::json!(true));
+                }
+                None => {
+                    obj.insert("stream".to_string(), serde_json::json!(true));
+                }
+            }
+        }
+    }
+
+    let url = substitute_string(&parsed.url, &vars);
+    let method = method(&parsed.method)?;
+
+    let mut req_builder = http.request(method.clone(), url);
+    for (k, v) in &parsed.headers {
+        req_builder = req_builder.header(k, substitute_string(v, &vars));
+    }
+    req_builder = req_builder.header("Content-Type", "application/json");
+
+    let response = if method == reqwest::Method::GET {
+        req_builder.send()
+    } else {
+        req_builder.json(&body).send()
+    }
+    .await?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(LlmError::ProviderApi { status, body });
+    }
+
+    if !p.streaming {
+        let json: serde_json::Value = response.json().await?;
+        let content =
+            stream::extract_by_path(&json, &p.response_content_path).unwrap_or_default();
+        if !content.is_empty() {
+            on_delta(content.clone())?;
+        }
+        return Ok(content);
+    }
+
+    let path = p.response_content_path.clone();
+    let outcome = stream::stream_sse(response, on_delta, move |parsed| {
+        stream::extract_streaming_delta(parsed, &path)
+    })
+    .await?;
+    Ok(outcome.full_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(
+        template: &str,
+        files: &[(&str, &str, &str)],
+        expected: serde_json::Value,
+    ) {
+        let mut body: serde_json::Value = serde_json::from_str(template).unwrap();
+        let attached: Vec<AttachedFile> = files
+            .iter()
+            .map(|(name, mime, base64)| AttachedFile {
+                id: "t".into(),
+                name: (*name).into(),
+                mime: (*mime).into(),
+                base64: (*base64).into(),
+                size: 0,
+            })
+            .collect();
+        build_messages(&mut body, &[], "hello", &attached);
+        assert_eq!(body, expected);
+    }
+
+    // The user-content shapes below mirror src/config/ai-providers.constants.ts.
+    const OPENAI: &str = r#"{
+        "messages": [
+            {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "{{TEXT}}"},
+                {"type": "image_url", "image_url": {"url": "data:{{IMAGE_MIME}};base64,{{IMAGE}}"}},
+                {"type": "file", "file": {"filename": "{{DOCUMENT_NAME}}", "file_data": "data:application/pdf;base64,{{DOCUMENT}}"}}
+            ]}
+        ]
+    }"#;
+
+    const CLAUDE: &str = r#"{
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "{{TEXT}}"},
+                {"type": "image", "source": {"type": "base64", "media_type": "{{IMAGE_MIME}}", "data": "{{IMAGE}}"}},
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "{{DOCUMENT}}"}}
+            ]}
+        ]
+    }"#;
+
+    #[test]
+    fn parse_curl_shapes() {
+        let ai = parse_curl(r#"curl https://x/v1 -H 'Authorization: Bearer {{API_KEY}}' -d '{"model":"m","messages":[]}'"#).unwrap();
+        assert_eq!(ai.method, "POST");
+        let body: serde_json::Value = serde_json::from_str(ai.data.as_deref().unwrap()).unwrap();
+        assert_eq!(body["model"], "m");
+        assert!(ai.form.is_empty());
+
+        let stt = parse_curl(r#"curl https://x/t -F "file={{AUDIO}}" -F model=whisper-1"#).unwrap();
+        assert_eq!(stt.method, "POST");
+        assert_eq!(stt.data, None);
+        assert_eq!(
+            stt.form,
+            vec![("file".into(), "{{AUDIO}}".into()), ("model".into(), "whisper-1".into())]
+        );
+
+        let bin = parse_curl("curl https://x/l --data-binary {{AUDIO}}").unwrap();
+        assert_eq!(bin.data.as_deref(), Some("{{AUDIO}}"));
+    }
+
+    #[test]
+    fn no_attachments_drops_attachment_slots() {
+        check(
+            OPENAI,
+            &[],
+            serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
+                    {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+                ]
+            }),
+        );
+    }
+
+    #[test]
+    fn openai_pdf_expands_file_part() {
+        check(
+            OPENAI,
+            &[("report.pdf", "application/pdf", "UERG")],
+            serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": "{{SYSTEM_PROMPT}}"},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "hello"},
+                        {"type": "file", "file": {"filename": "report.pdf", "file_data": "data:application/pdf;base64,UERG"}}
+                    ]}
+                ]
+            }),
+        );
+    }
+
+    #[test]
+    fn claude_pdf_and_image_expand() {
+        check(
+            CLAUDE,
+            &[
+                ("shot.png", "image/png", "SU1H"),
+                ("a.pdf", "application/pdf", "UERG"),
+                ("b.pdf", "application/pdf", "UERHMg=="),
+            ],
+            serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "hello"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "SU1H"}},
+                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "UERG"}},
+                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "UERHMg=="}}
+                    ]}
+                ]
+            }),
+        );
+    }
+}

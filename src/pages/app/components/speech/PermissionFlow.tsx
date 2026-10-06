@@ -42,7 +42,7 @@ export const PermissionFlow = ({
         onPermissionDenied();
       }
     } catch (error) {
-      console.error("Permission check failed:", error);
+      console.error("Permission check failed:", error); // surfaced as the denied state
       setPermissionState("denied");
       onPermissionDenied();
     }
@@ -73,11 +73,11 @@ export const PermissionFlow = ({
             onPermissionDenied();
           }
         } catch (error) {
-          console.error("Permission poll failed:", error);
+          console.error("Permission poll failed:", error); // the next poll retries
         }
       }, 1000);
     } catch (error) {
-      console.error("Permission request failed:", error);
+      console.error("Permission request failed:", error); // surfaced as the denied state
       setPermissionState("denied");
       onPermissionDenied();
     }

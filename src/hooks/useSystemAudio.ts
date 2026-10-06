@@ -1,9 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useWindowResize, useGlobalShortcuts } from ".";
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useApp } from "@/contexts";
-import { fetchSTT, fetchAIResponse } from "@/lib/functions";
 import {
   DEFAULT_QUICK_ACTIONS,
   DEFAULT_SYSTEM_PROMPT,
@@ -11,24 +10,21 @@ import {
 } from "@/config";
 import {
   safeLocalStorage,
-  shouldUsePluelyAPI,
   generateConversationTitle,
-  saveConversation,
-  CONVERSATION_SAVE_DEBOUNCE_MS,
-  generateConversationId,
-  generateMessageId,
+  appendTurn,
+  resolveProviderInput,
+  buildEnhancedSystemPrompt,
 } from "@/lib";
-import { Message } from "@/types/completion";
 
 // VAD Configuration interface matching Rust
 export interface VadConfig {
   enabled: boolean;
-  hop_size: number;
   sensitivity_rms: number;
   peak_threshold: number;
-  silence_chunks: number;
-  min_speech_chunks: number;
-  pre_speech_chunks: number;
+  silence_ms: number;
+  min_speech_ms: number;
+  pre_speech_ms: number;
+  max_segment_ms: number;
   noise_gate_threshold: number;
   max_recording_duration_secs: number;
 }
@@ -51,18 +47,15 @@ export interface VadCalibration {
   noise_gate_threshold: number;
 }
 
-// OPTIMIZED VAD defaults - matches backend exactly for perfect performance
-const DEFAULT_VAD_CONFIG: VadConfig = {
-  enabled: true,
-  hop_size: 1024,
-  sensitivity_rms: 0.012, // Much less sensitive - only real speech
-  peak_threshold: 0.035, // Higher threshold - filters clicks/noise
-  silence_chunks: 45, // ~1.0s of required silence
-  min_speech_chunks: 7, // ~0.16s - captures short answers
-  pre_speech_chunks: 12, // ~0.27s - enough to catch word start
-  noise_gate_threshold: 0.003, // Stronger noise filtering
-  max_recording_duration_secs: 180, // 3 minutes default
-};
+// Mirrors `TurnEvent` in src-tauri/src/speaker/turn.rs
+type TurnEvent =
+  | { kind: "heard"; text: string }
+  | { kind: "asked"; message: string }
+  | { kind: "delta"; delta: string }
+  | { kind: "answered"; message: string; answer: string }
+  | { kind: "skipped"; message: string; carried: boolean }
+  | { kind: "noSpeech" }
+  | { kind: "failed"; error: string };
 
 // Chat message interface (reusing from useCompletion)
 interface ChatMessage {
@@ -81,7 +74,21 @@ export interface ChatConversation {
   updatedAt: number;
 }
 
+const EMPTY_CONVERSATION: ChatConversation = {
+  id: "",
+  title: "",
+  messages: [],
+  createdAt: 0,
+  updatedAt: 0,
+};
+
 export type useSystemAudioType = ReturnType<typeof useSystemAudio>;
+
+// Forward diagnostics to the Rust log (the webview console is invisible in
+// normal terminal launches).
+const dbg = (msg: string) => {
+  invoke("js_log", { msg }).catch(() => {}); // logging a logging failure would recurse
+};
 
 export function useSystemAudio() {
   const { resizeWindow } = useWindowResize();
@@ -98,7 +105,7 @@ export function useSystemAudio() {
   const [isManagingQuickActions, setIsManagingQuickActions] =
     useState<boolean>(false);
   const [showQuickActions, setShowQuickActions] = useState<boolean>(true);
-  const [vadConfig, setVadConfig] = useState<VadConfig>(DEFAULT_VAD_CONFIG);
+  const [vadConfig, setVadConfig] = useState<VadConfig | null>(null);
   const [vadMetrics, setVadMetrics] = useState<VadMetrics | null>(null);
   const [lastCalibration, setLastCalibration] = useState<VadCalibration | null>(
     null
@@ -107,18 +114,40 @@ export function useSystemAudio() {
   const [calibrationError, setCalibrationError] = useState<string>("");
   const [discardedNotice, setDiscardedNotice] = useState<string>("");
   const discardedTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  // The input was received and understood, but the model explicitly decided
+  // not to answer (SKIP/COPY). Distinct from `discardedNotice`, which means
+  // the input never made it to the model at all.
+  const [skippedNotice, setSkippedNotice] = useState<string>("");
+  const skippedTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [recordingProgress, setRecordingProgress] = useState<number>(0); // For continuous mode
   const [isContinuousMode, setIsContinuousMode] = useState<boolean>(false);
   const [isRecordingInContinuousMode, setIsRecordingInContinuousMode] =
     useState<boolean>(false);
 
-  const [conversation, setConversation] = useState<ChatConversation>({
-    id: "",
-    title: "",
-    messages: [],
-    createdAt: 0,
-    updatedAt: 0,
+  const [conversation, setConversation] =
+    useState<ChatConversation>(EMPTY_CONVERSATION);
+  // Source of truth for session memory; Rust is seeded from it on every capture start.
+  const conversationRef = useRef<ChatConversation>(EMPTY_CONVERSATION);
+  const carryRef = useRef<string>("");
+  // One per conversation, so turns persist in order and a reset never appends to the old one.
+  const persistRef = useRef<{ id: string | null; chain: Promise<void> }>({
+    id: null,
+    chain: Promise.resolve(),
   });
+  const answerStartedRef = useRef<boolean>(false);
+  const updateConversation = useCallback(
+    (f: (c: ChatConversation) => ChatConversation) => {
+      conversationRef.current = f(conversationRef.current);
+      setConversation(conversationRef.current);
+    },
+    []
+  );
+  const resetConversation = useCallback(() => {
+    conversationRef.current = EMPTY_CONVERSATION;
+    setConversation(EMPTY_CONVERSATION);
+    carryRef.current = "";
+    persistRef.current = { id: null, chain: Promise.resolve() };
+  }, []);
 
   // Context management states
   const [useSystemPrompt, setUseSystemPrompt] = useState<boolean>(true);
@@ -133,10 +162,30 @@ export function useSystemAudio() {
     selectedAudioDevices,
     attachedFiles,
   } = useApp();
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const isSavingRef = useRef<boolean>(false);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
+
+  // State-transition log. Cheap (fires only on changes) and has repeatedly
+  // been the difference between guessing and knowing during UI-state bugs.
+  useEffect(() => { dbg(`capturing=${capturing}`); }, [capturing]);
+  useEffect(() => { dbg(`isPopoverOpen=${isPopoverOpen}`); }, [isPopoverOpen]);
+  useEffect(() => { dbg(`isProcessing=${isProcessing}`); }, [isProcessing]);
+  useEffect(() => { dbg(`isAIProcessing=${isAIProcessing}`); }, [isAIProcessing]);
+  useEffect(() => {
+    dbg(`lastAIResponse(len=${lastAIResponse.length})="${lastAIResponse.slice(0, 40).replace(/\n/g, "\\n")}"`);
+  }, [lastAIResponse]);
+  useEffect(() => {
+    dbg(`lastTranscription="${lastTranscription.slice(0, 60)}"`);
+  }, [lastTranscription]);
+  useEffect(() => { dbg(`error="${error}"`); }, [error]);
+  useEffect(() => { dbg(`discardedNotice="${discardedNotice}"`); }, [discardedNotice]);
+  useEffect(() => { dbg(`skippedNotice="${skippedNotice}"`); }, [skippedNotice]);
+  useEffect(() => { dbg(`setupRequired=${setupRequired}`); }, [setupRequired]);
+  useEffect(() => {
+    dbg(`isRecordingInContinuousMode=${isRecordingInContinuousMode}`);
+  }, [isRecordingInContinuousMode]);
+  useEffect(() => {
+    dbg(`conversation: id=${conversation.id} msgs=${conversation.messages.length}`);
+  }, [conversation]);
 
   // Load context settings and VAD config from localStorage on mount
   useEffect(() => {
@@ -149,19 +198,21 @@ export function useSystemAudio() {
         setUseSystemPrompt(parsed.useSystemPrompt ?? true);
         setContextContent(parsed.contextContent ?? "");
       } catch (error) {
-        console.error("Failed to load system audio context:", error);
+        setError(`Failed to load system audio context: ${error}`);
       }
     }
 
-    // Load VAD config
-    const savedVadConfig = safeLocalStorage.getItem("vad_config");
+    const savedVadConfig = safeLocalStorage.getItem("vad_config_v2");
     if (savedVadConfig) {
       try {
-        const parsed = JSON.parse(savedVadConfig);
-        setVadConfig(parsed);
+        setVadConfig(JSON.parse(savedVadConfig));
       } catch (error) {
-        console.error("Failed to load VAD config:", error);
+        setError(`Failed to load VAD config: ${error}`);
       }
+    } else {
+      invoke<VadConfig>("default_vad_config")
+        .then(setVadConfig)
+        .catch((err) => setError(`Failed to load VAD defaults: ${err}`));
     }
   }, []);
 
@@ -175,200 +226,234 @@ export function useSystemAudio() {
         const parsed = JSON.parse(savedActions);
         setQuickActions(parsed);
       } catch (error) {
-        console.error("Failed to load quick actions:", error);
-        setQuickActions(DEFAULT_QUICK_ACTIONS);
+        setError(`Failed to load quick actions: ${error}`);
       }
     } else {
       setQuickActions(DEFAULT_QUICK_ACTIONS);
     }
   }, []);
 
-  // Handle continuous recording progress events AND error events
+  const showDiscarded = (notice: string) => {
+    setDiscardedNotice(notice);
+    if (discardedTimeoutRef.current) {
+      clearTimeout(discardedTimeoutRef.current);
+    }
+    discardedTimeoutRef.current = setTimeout(() => {
+      setDiscardedNotice("");
+    }, 3500);
+  };
+
   useEffect(() => {
-    let progressUnlisten: (() => void) | undefined;
-    let startUnlisten: (() => void) | undefined;
-    let stopUnlisten: (() => void) | undefined;
-    let errorUnlisten: (() => void) | undefined;
-    let discardedUnlisten: (() => void) | undefined;
-    let metricsUnlisten: (() => void) | undefined;
-
-    const setupContinuousListeners = async () => {
-      try {
-        // Progress updates (every second)
-        progressUnlisten = await listen("recording-progress", (event) => {
-          const seconds = event.payload as number;
-          setRecordingProgress(seconds);
-        });
-
-        // Recording started
-        startUnlisten = await listen("continuous-recording-start", () => {
-          setRecordingProgress(0);
-          setIsRecordingInContinuousMode(true);
-        });
-
-        // Recording stopped
-        stopUnlisten = await listen("continuous-recording-stopped", () => {
+    const unlisteners: Promise<() => void>[] = [
+      listen<number>("recording-progress", (event) => {
+        setRecordingProgress(event.payload);
+      }),
+      listen("continuous-recording-start", () => {
+        setRecordingProgress(0);
+        setIsRecordingInContinuousMode(true);
+      }),
+      listen<"sent" | "limit" | "discarded">(
+        "continuous-recording-stopped",
+        (event) => {
           setRecordingProgress(0);
           setIsRecordingInContinuousMode(false);
-        });
-
-        // Audio encoding errors
-        errorUnlisten = await listen("audio-encoding-error", (event) => {
-          const errorMsg = event.payload as string;
-          console.error("Audio encoding error:", errorMsg);
-          setError(`Failed to process audio: ${errorMsg}`);
-          setIsProcessing(false);
-          setIsAIProcessing(false);
-          setIsRecordingInContinuousMode(false);
-        });
-
-        // Speech discarded (too short) - surface so the user can see "almost worked"
-        discardedUnlisten = await listen("speech-discarded", (event) => {
-          const reason = event.payload as string;
-          setDiscardedNotice(reason);
-          if (discardedTimeoutRef.current) {
-            clearTimeout(discardedTimeoutRef.current);
-          }
-          discardedTimeoutRef.current = setTimeout(() => {
-            setDiscardedNotice("");
-          }, 3500);
-        });
-
-        // Live VAD metrics (~10 Hz)
-        metricsUnlisten = await listen("vad-metrics", (event) => {
-          setVadMetrics(event.payload as VadMetrics);
-        });
-      } catch (err) {
-        console.error("Failed to setup continuous recording listeners:", err);
-      }
-    };
-
-    setupContinuousListeners();
+          if (event.payload !== "discarded") setIsProcessing(true);
+          if (event.payload === "limit") showDiscarded("max duration reached, sent");
+        }
+      ),
+      // Surfaced so the user can see "almost worked"; a discarded recording produces no turn event.
+      listen<string>("speech-discarded", (event) => {
+        setIsProcessing(false);
+        showDiscarded(event.payload);
+      }),
+      listen<VadMetrics>("vad-metrics", (event) => {
+        setVadMetrics(event.payload);
+      }),
+      // Backend already reset its capture state; mirror it here.
+      listen<string>("capture-error", (event) => {
+        setError(`System audio capture stopped: ${event.payload}`);
+        setCapturing(false);
+        setIsProcessing(false);
+        setIsAIProcessing(false);
+        setIsContinuousMode(false);
+        setIsRecordingInContinuousMode(false);
+        setRecordingProgress(0);
+        setVadMetrics(null);
+        setIsPopoverOpen(true);
+      }),
+    ];
+    Promise.all(unlisteners).catch((err) =>
+      setError(`Failed to listen for system audio events: ${err}`)
+    );
 
     return () => {
-      if (progressUnlisten) progressUnlisten();
-      if (startUnlisten) startUnlisten();
-      if (stopUnlisten) stopUnlisten();
-      if (errorUnlisten) errorUnlisten();
-      if (discardedUnlisten) discardedUnlisten();
-      if (metricsUnlisten) metricsUnlisten();
+      for (const u of unlisteners) u.then((unlisten) => unlisten(), () => {}); // rejection already reported above
       if (discardedTimeoutRef.current) {
         clearTimeout(discardedTimeoutRef.current);
+      }
+      if (skippedTimeoutRef.current) {
+        clearTimeout(skippedTimeoutRef.current);
       }
     };
   }, []);
 
-  // Handle single speech detection event (both VAD and continuous modes)
-  useEffect(() => {
-    let speechUnlisten: (() => void) | undefined;
-
-    const setupEventListener = async () => {
-      try {
-        speechUnlisten = await listen("speech-detected", async (event) => {
-          try {
-            if (!capturing) return;
-
-            const base64Audio = event.payload as string;
-            // Convert to blob
-            const binaryString = atob(base64Audio);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-              bytes[i] = binaryString.charCodeAt(i);
-            }
-            const audioBlob = new Blob([bytes], { type: "audio/wav" });
-
-            const usePluelyAPI = await shouldUsePluelyAPI();
-            if (!selectedSttProvider.provider && !usePluelyAPI) {
-              setError("No speech provider selected.");
-              return;
-            }
-
-            const providerConfig = allSttProviders.find(
-              (p) => p.id === selectedSttProvider.provider
-            );
-
-            if (!providerConfig && !usePluelyAPI) {
-              setError("Speech provider config not found.");
-              return;
-            }
-
-            setIsProcessing(true);
-
-            // Add timeout wrapper for STT request (30 seconds)
-            const sttPromise = fetchSTT({
-              provider: providerConfig,
-              selectedProvider: selectedSttProvider,
-              audio: audioBlob,
+  // Called through a ref so the per-start Channel never holds a stale closure.
+  const onTurnRef = useRef<(e: TurnEvent) => void>(() => {});
+  onTurnRef.current = (e: TurnEvent) => {
+    dbg(`turn ${e.kind}`);
+    switch (e.kind) {
+      case "heard":
+        setLastTranscription(e.text);
+        return;
+      case "asked":
+        setLastTranscription(e.message);
+        setError("");
+        setIsAIProcessing(true);
+        setIsProcessing(false);
+        carryRef.current = "";
+        answerStartedRef.current = false;
+        return;
+      case "delta":
+        if (answerStartedRef.current) {
+          setLastAIResponse((prev) => prev + e.delta);
+        } else {
+          answerStartedRef.current = true;
+          setLastAIResponse(e.delta);
+        }
+        return;
+      case "answered": {
+        setIsAIProcessing(false);
+        setLastAIResponse(e.answer);
+        const timestamp = Date.now();
+        updateConversation((c) => ({
+          ...c,
+          messages: [
+            ...c.messages,
+            {
+              id: `local_${timestamp}_user`,
+              role: "user",
+              content: e.message,
+              timestamp,
+            },
+            {
+              id: `local_${timestamp + 1}_assistant`,
+              role: "assistant",
+              content: e.answer,
+              timestamp: timestamp + 1,
+            },
+          ],
+          updatedAt: timestamp,
+          title: c.title || generateConversationTitle(e.message),
+        }));
+        const p = persistRef.current;
+        p.chain = p.chain
+          .then(async () => {
+            const turn = await appendTurn(p.id, {
+              user: e.message,
+              attachedFiles: [],
+              assistant: e.answer,
             });
-
-            const timeoutPromise = new Promise<string>((_, reject) => {
-              setTimeout(
-                () => reject(new Error("Speech transcription timed out (30s)")),
-                30000
-              );
-            });
-
-            try {
-              const transcription = await Promise.race([
-                sttPromise,
-                timeoutPromise,
-              ]);
-
-              if (transcription.trim()) {
-                setLastTranscription(transcription);
-                setError("");
-
-                const effectiveSystemPrompt = useSystemPrompt
-                  ? systemPrompt || DEFAULT_SYSTEM_PROMPT
-                  : contextContent || DEFAULT_SYSTEM_PROMPT;
-
-                const previousMessages = conversation.messages.map((msg) => {
-                  return { role: msg.role, content: msg.content };
-                });
-
-                await processWithAI(
-                  transcription,
-                  effectiveSystemPrompt,
-                  previousMessages
-                );
-              } else {
-                // No speech recognized (e.g. keyboard typing, background noise).
-                // Surface the same way as a too-short segment and skip AI.
-                setDiscardedNotice("no speech recognized");
-                if (discardedTimeoutRef.current) {
-                  clearTimeout(discardedTimeoutRef.current);
-                }
-                discardedTimeoutRef.current = setTimeout(() => {
-                  setDiscardedNotice("");
-                }, 3500);
-              }
-            } catch (sttError: any) {
-              console.error("STT Error:", sttError);
-              setError(sttError.message || "Failed to transcribe audio");
-              setIsPopoverOpen(true);
+            p.id = turn.conversationId;
+            if (persistRef.current === p) {
+              updateConversation((c) => ({ ...c, id: turn.conversationId }));
             }
-          } catch (err) {
-            setError("Failed to process speech");
-          } finally {
-            setIsProcessing(false);
-          }
-        });
-      } catch (err) {
-        setError("Failed to setup speech listener");
+          })
+          .catch((err) => {
+            setError(`Failed to save conversation: ${err}`);
+          });
+        return;
       }
-    };
+      case "skipped":
+        setIsAIProcessing(false);
+        carryRef.current = e.carried ? e.message : "";
+        setSkippedNotice(
+          `heard "${e.message.slice(0, 120)}" - ${
+            e.carried
+              ? "judged an incomplete fragment, waiting for the rest"
+              : "judged to need no reply"
+          }`
+        );
+        if (skippedTimeoutRef.current) {
+          clearTimeout(skippedTimeoutRef.current);
+        }
+        skippedTimeoutRef.current = setTimeout(() => {
+          setSkippedNotice("");
+        }, 6000);
+        return;
+      case "noSpeech":
+        setIsProcessing(false);
+        showDiscarded("no speech recognized");
+        return;
+      case "failed":
+        setError(e.error);
+        setIsProcessing(false);
+        setIsAIProcessing(false);
+        setIsPopoverOpen(true);
+        return;
+    }
+  };
 
-    setupEventListener();
-
-    return () => {
-      if (speechUnlisten) speechUnlisten();
+  const buildSessionConfig = useCallback(async () => {
+    const base = useSystemPrompt
+      ? systemPrompt || DEFAULT_SYSTEM_PROMPT
+      : contextContent || DEFAULT_SYSTEM_PROMPT;
+    return {
+      stt: await resolveProviderInput(selectedSttProvider, allSttProviders),
+      ai: await resolveProviderInput(selectedAIProvider, allAiProviders),
+      systemPrompt: buildEnhancedSystemPrompt(base),
+      attachedFiles,
     };
   }, [
-    capturing,
     selectedSttProvider,
     allSttProviders,
-    conversation.messages.length,
+    selectedAIProvider,
+    allAiProviders,
+    useSystemPrompt,
+    systemPrompt,
+    contextContent,
+    attachedFiles,
   ]);
+
+  const startBackend = useCallback(
+    async (cfg: VadConfig) => {
+      const events = new Channel<TurnEvent>();
+      events.onmessage = (e) => onTurnRef.current(e);
+      await invoke("start_system_audio_capture", {
+        vadConfig: cfg,
+        deviceId:
+          selectedAudioDevices.output.id !== "default"
+            ? selectedAudioDevices.output.id
+            : null,
+        micDeviceId:
+          selectedAudioDevices.input.id !== "default"
+            ? selectedAudioDevices.input.id
+            : null,
+        session: {
+          config: await buildSessionConfig(),
+          history: conversationRef.current.messages.map(({ role, content }) => ({
+            role,
+            content,
+          })),
+          carry: carryRef.current,
+        },
+        events,
+      });
+    },
+    [
+      buildSessionConfig,
+      selectedAudioDevices.output.id,
+      selectedAudioDevices.input.id,
+    ]
+  );
+
+  useEffect(() => {
+    if (!capturing) return; // deliberately not a dep: the session starts with the current config
+    buildSessionConfig()
+      .then((config) =>
+        invoke("system_audio_control", { control: { kind: "config", config } })
+      )
+      .catch((err) => setError(`Failed to update session: ${err}`));
+  }, [buildSessionConfig]);
 
   // Context management functions
   const saveContextSettings = useCallback(
@@ -383,7 +468,7 @@ export function useSystemAudio() {
           JSON.stringify(contextSettings)
         );
       } catch (error) {
-        console.error("Failed to save context settings:", error);
+        setError(`Failed to save context settings: ${error}`);
       }
     },
     []
@@ -413,7 +498,7 @@ export function useSystemAudio() {
         JSON.stringify(actions)
       );
     } catch (error) {
-      console.error("Failed to save quick actions:", error);
+      setError(`Failed to save quick actions: ${error}`);
     }
   }, []);
 
@@ -439,184 +524,27 @@ export function useSystemAudio() {
 
   const handleQuickActionClick = async (action: string) => {
     setError("");
-
-    const effectiveSystemPrompt = useSystemPrompt
-      ? systemPrompt || DEFAULT_SYSTEM_PROMPT
-      : contextContent || DEFAULT_SYSTEM_PROMPT;
-
-    // Include the most recent transcription in conversation history if it exists
-    let updatedMessages = [...conversation.messages];
-
-    if (lastTranscription && lastTranscription.trim()) {
-      const lastMessage = updatedMessages[updatedMessages.length - 1];
-      // Only add if it's not already the last message
-      if (!lastMessage || lastMessage.content !== lastTranscription) {
-        const timestamp = Date.now();
-        const userMessage = {
-          id: generateMessageId("user", timestamp),
-          role: "user" as const,
-          content: lastTranscription,
-          timestamp,
-        };
-        updatedMessages.push(userMessage);
-
-        // Update conversation state with the latest transcription
-        setConversation((prev) => ({
-          ...prev,
-          messages: [userMessage, ...prev.messages],
-          updatedAt: timestamp,
-          title: prev.title || generateConversationTitle(lastTranscription),
-        }));
-      }
-    }
-
-    const previousMessages = updatedMessages.map((msg) => {
-      return { role: msg.role, content: msg.content };
-    });
-
-    await processWithAI(action, effectiveSystemPrompt, previousMessages);
-  };
-
-  // Start continuous recording manually
-  const startContinuousRecording = useCallback(async () => {
     try {
-      setRecordingProgress(0);
-      setError("");
-
-      // Stop any existing capture (auto-listen / leftover task) before starting a new one
-      await invoke<string>("stop_system_audio_capture").catch(() => {});
-
-      const deviceId =
-        selectedAudioDevices.output.id !== "default"
-          ? selectedAudioDevices.output.id
-          : null;
-
-      // Start a new continuous recording session
-      await invoke<string>("start_system_audio_capture", {
-        vadConfig: vadConfig,
-        deviceId: deviceId,
+      await invoke("system_audio_control", {
+        control: { kind: "prompt", text: action },
       });
     } catch (err) {
-      console.error("Failed to start continuous recording:", err);
-      setError(`Failed to start recording: ${err}`);
+      setError(`Quick action failed: ${err}`);
     }
-  }, [vadConfig, selectedAudioDevices.output.id]);
+  };
 
-  // Ignore current recording (stop without transcription)
-  const ignoreContinuousRecording = useCallback(async () => {
+  const record = useCallback(async (action: "start" | "send" | "discard") => {
     try {
-      if (!isContinuousMode || !isRecordingInContinuousMode) return;
-
-      // Stop the capture without processing
-      await invoke<string>("stop_system_audio_capture");
-
-      // Reset states
-      setRecordingProgress(0);
-      setIsProcessing(false);
-      setIsRecordingInContinuousMode(false);
+      await invoke("system_audio_control", {
+        control: { kind: "record", action },
+      });
     } catch (err) {
-      console.error("Failed to ignore recording:", err);
-      setError(`Failed to ignore recording: ${err}`);
+      setError(`Recording ${action} failed: ${err}`);
     }
-  }, [isContinuousMode, isRecordingInContinuousMode]);
-
-  // AI Processing function
-  const processWithAI = useCallback(
-    async (
-      transcription: string,
-      prompt: string,
-      previousMessages: Message[]
-    ) => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-
-      abortControllerRef.current = new AbortController();
-
-      try {
-        setIsAIProcessing(true);
-        setLastAIResponse("");
-        setError("");
-
-        let fullResponse = "";
-
-        const usePluelyAPI = await shouldUsePluelyAPI();
-        if (!selectedAIProvider.provider && !usePluelyAPI) {
-          setError("No AI provider selected.");
-          return;
-        }
-
-        const provider = allAiProviders.find(
-          (p) => p.id === selectedAIProvider.provider
-        );
-        if (!provider && !usePluelyAPI) {
-          setError("AI provider config not found.");
-          return;
-        }
-
-        // Split shared attachments into images and documents (PDFs)
-        const imagesBase64: string[] = [];
-        const imagesMime: string[] = [];
-        const documentsBase64: string[] = [];
-        attachedFiles.forEach((file) => {
-          if (file.type.startsWith("image/")) {
-            imagesBase64.push(file.base64);
-            imagesMime.push(file.type);
-          } else if (file.type === "application/pdf") {
-            documentsBase64.push(file.base64);
-          }
-        });
-
-        try {
-          for await (const chunk of fetchAIResponse({
-            provider: usePluelyAPI ? undefined : provider,
-            selectedProvider: selectedAIProvider,
-            systemPrompt: prompt,
-            history: previousMessages,
-            userMessage: transcription,
-            imagesBase64,
-            imagesMime,
-            documentsBase64,
-          })) {
-            fullResponse += chunk;
-            setLastAIResponse((prev) => prev + chunk);
-          }
-        } catch (aiError: any) {
-          setError(aiError.message || "Failed to get AI response");
-        }
-
-        if (fullResponse) {
-          const timestamp = Date.now();
-          setConversation((prev) => ({
-            ...prev,
-            messages: [
-              {
-                id: generateMessageId("user", timestamp),
-                role: "user" as const,
-                content: transcription,
-                timestamp,
-              },
-              {
-                id: generateMessageId("assistant", timestamp + 1),
-                role: "assistant" as const,
-                content: fullResponse,
-                timestamp: timestamp + 1,
-              },
-              ...prev.messages,
-            ],
-            updatedAt: timestamp,
-            title: prev.title || generateConversationTitle(transcription),
-          }));
-        }
-      } catch (err) {
-        setError("Failed to get AI response");
-      } finally {
-        setIsAIProcessing(false);
-        // No auto-restart - user manually controls when to start next recording
-      }
-    },
-    [selectedAIProvider, allAiProviders, conversation.messages, attachedFiles]
-  );
+  }, []);
+  const startContinuousRecording = useCallback(() => record("start"), [record]);
+  const manualStopAndSend = useCallback(() => record("send"), [record]);
+  const ignoreContinuousRecording = useCallback(() => record("discard"), [record]);
 
   const startCapture = useCallback(async () => {
     try {
@@ -629,17 +557,10 @@ export function useSystemAudio() {
         return;
       }
 
+      if (!vadConfig) throw new Error("VAD config is still loading");
       const isContinuous = !vadConfig.enabled;
 
-      // Set up conversation
-      const conversationId = generateConversationId("sysaudio");
-      setConversation({
-        id: conversationId,
-        title: "",
-        messages: [],
-        createdAt: 0,
-        updatedAt: 0,
-      });
+      resetConversation();
 
       setCapturing(true);
       setIsPopoverOpen(true);
@@ -647,43 +568,22 @@ export function useSystemAudio() {
       setRecordingProgress(0);
       setVadMetrics(null);
       setDiscardedNotice("");
+      setIsRecordingInContinuousMode(false);
 
-      // If continuous mode
-      if (isContinuous) {
-        setIsRecordingInContinuousMode(false);
-        return;
-      }
-
-      // VAD mode: Start recording immediately
-      // Stop any existing capture
       await invoke<string>("stop_system_audio_capture");
-
-      const deviceId =
-        selectedAudioDevices.output.id !== "default"
-          ? selectedAudioDevices.output.id
-          : null;
-
-      // Start capture with VAD config
-      await invoke<string>("start_system_audio_capture", {
-        vadConfig: vadConfig,
-        deviceId: deviceId,
-      });
+      await startBackend(vadConfig);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       setError(errorMessage);
       setIsPopoverOpen(true);
     }
-  }, [vadConfig, selectedAudioDevices.output.id]);
+  }, [vadConfig, startBackend, resetConversation]);
 
   const stopCapture = useCallback(async () => {
+    // Resets all listen-mode state; the stack identifies which of the many
+    // possible triggers (button, shortcut, effect) wiped the screen.
+    dbg(`stopCapture called\n${new Error().stack}`);
     try {
-      // Abort any ongoing AI requests
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
-      }
-
-      // Stop the audio capture
       await invoke<string>("stop_system_audio_capture");
 
       // Reset ALL states
@@ -706,27 +606,6 @@ export function useSystemAudio() {
     }
   }, []);
 
-  // Manual stop for continuous recording
-  const manualStopAndSend = useCallback(async () => {
-    try {
-      if (!isContinuousMode) {
-        console.warn("Not in continuous mode");
-        return;
-      }
-
-      // Show processing state immediately
-      setIsProcessing(true);
-
-      // Trigger manual stop event
-      await invoke("manual_stop_continuous");
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      setError(`Failed to manually stop: ${errorMessage}`);
-      setIsProcessing(false); // Clear processing state on error
-      console.error("Manual stop error:", err);
-    }
-  }, [isContinuousMode]);
-
   const handleSetup = useCallback(async () => {
     try {
       const platform = navigator.platform.toLowerCase();
@@ -747,7 +626,7 @@ export function useSystemAudio() {
         setError("Permission not granted. Please try the manual steps.");
       }
     } catch (err) {
-      setError("Failed to request access. Please try the manual steps below.");
+      setError(`Failed to request access (${err}). Please try the manual steps below.`);
       setSetupRequired(true);
     }
   }, [startCapture]);
@@ -759,6 +638,7 @@ export function useSystemAudio() {
       isAIProcessing ||
       !!lastAIResponse ||
       !!error;
+    dbg(`shouldOpenPopover=${shouldOpenPopover}`);
     setIsPopoverOpen(shouldOpenPopover);
     resizeWindow(shouldOpenPopover);
   }, [
@@ -778,71 +658,19 @@ export function useSystemAudio() {
         await startCapture();
       }
     });
-  }, [startCapture, stopCapture]);
+  }, [capturing, startCapture, stopCapture]);
 
   useEffect(() => {
     return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-      invoke("stop_system_audio_capture").catch(() => {});
+      invoke("stop_system_audio_capture").catch((err) =>
+        dbg(`unmount stop failed: ${err}`)
+      );
     };
   }, []);
 
-  // Debounced save to prevent race conditions and improve performance
-  useEffect(() => {
-    // Clear any pending save
-    if (saveTimeoutRef.current) {
-      clearTimeout(saveTimeoutRef.current);
-    }
-
-    // Only debounce if there are messages to save
-    if (
-      !conversation.id ||
-      conversation.updatedAt === 0 ||
-      conversation.messages.length === 0
-    ) {
-      return;
-    }
-
-    // Debounce saves (only save 500ms after last change)
-    saveTimeoutRef.current = setTimeout(async () => {
-      // Don't save if already saving (prevent concurrent saves)
-      if (isSavingRef.current) {
-        return;
-      }
-
-      try {
-        isSavingRef.current = true;
-        await saveConversation(conversation);
-      } catch (error) {
-        console.error("Failed to save system audio conversation:", error);
-      } finally {
-        isSavingRef.current = false;
-      }
-    }, CONVERSATION_SAVE_DEBOUNCE_MS);
-
-    // Cleanup on unmount or dependency change
-    return () => {
-      if (saveTimeoutRef.current) {
-        clearTimeout(saveTimeoutRef.current);
-      }
-    };
-  }, [
-    conversation.messages.length,
-    conversation.title,
-    conversation.id,
-    conversation.updatedAt,
-  ]);
-
-  const startNewConversation = useCallback(() => {
-    setConversation({
-      id: generateConversationId("sysaudio"),
-      title: "",
-      messages: [],
-      createdAt: 0,
-      updatedAt: 0,
-    });
+  const startNewConversation = useCallback(async () => {
+    dbg(`startNewConversation called\n${new Error().stack}`);
+    resetConversation();
     setLastTranscription("");
     setLastAIResponse("");
     setError("");
@@ -851,18 +679,52 @@ export function useSystemAudio() {
     setIsAIProcessing(false);
     setIsPopoverOpen(false);
     setUseSystemPrompt(true);
-  }, []);
+    // Rust holds the session memory it was started with.
+    if (capturing && vadConfig) {
+      try {
+        await invoke("stop_system_audio_capture");
+        setIsRecordingInContinuousMode(false);
+        setRecordingProgress(0);
+        await startBackend(vadConfig);
+      } catch (err) {
+        setError(`Failed to restart capture: ${err}`);
+      }
+    }
+  }, [resetConversation, capturing, vadConfig, startBackend]);
 
   // Update VAD configuration
-  const updateVadConfiguration = useCallback(async (config: VadConfig) => {
+  const updateVadConfiguration = useCallback(
+    async (config: VadConfig) => {
+      try {
+        await invoke("update_vad_config", { config });
+        const modeChanged = config.enabled !== vadConfig?.enabled;
+        setVadConfig(config);
+        safeLocalStorage.setItem("vad_config_v2", JSON.stringify(config));
+
+        // The mode picks the capture shape (mic + segmenters vs recorder), so it needs a restart.
+        if (modeChanged && capturing) {
+          await invoke("stop_system_audio_capture");
+          setIsRecordingInContinuousMode(false);
+          setRecordingProgress(0);
+          setVadMetrics(null);
+          await startBackend(config);
+        }
+      } catch (error) {
+        setError(`Failed to update VAD config: ${error}`);
+      }
+    },
+    [vadConfig?.enabled, capturing, startBackend]
+  );
+
+  const resetVadConfig = useCallback(async () => {
     try {
-      setVadConfig(config);
-      safeLocalStorage.setItem("vad_config", JSON.stringify(config));
-      await invoke("update_vad_config", { config });
+      const defaults = await invoke<VadConfig>("default_vad_config");
+      if (!vadConfig) throw new Error("VAD config is still loading");
+      await updateVadConfiguration({ ...defaults, enabled: vadConfig.enabled });
     } catch (error) {
-      console.error("Failed to update VAD config:", error);
+      setError(`Failed to reset VAD config: ${error}`);
     }
-  }, []);
+  }, [vadConfig, updateVadConfiguration]);
 
   // Explicit calibration: stop capturing if needed, sample ambient audio,
   // bake the resulting thresholds into vadConfig (which persists via the
@@ -870,9 +732,29 @@ export function useSystemAudio() {
   const calibrateVad = useCallback(
     async (durationSecs: number = 3) => {
       if (isCalibrating) return;
+      if (!vadConfig) {
+        setCalibrationError("VAD config is still loading");
+        return;
+      }
       setCalibrationError("");
       setIsCalibrating(true);
+      const wasCapturing = capturing;
       try {
+        // Release the audio device before calibrating.
+        if (wasCapturing) {
+          try {
+            await invoke("stop_system_audio_capture");
+            setCapturing(false);
+            setIsRecordingInContinuousMode(false);
+            setRecordingProgress(0);
+          } catch (e) {
+            setCalibrationError(
+              `Failed to pause capture: ${e instanceof Error ? e.message : String(e)}`
+            );
+            return;
+          }
+        }
+
         const deviceId =
           selectedAudioDevices.output.id !== "default"
             ? selectedAudioDevices.output.id
@@ -884,12 +766,24 @@ export function useSystemAudio() {
         );
 
         setLastCalibration(result);
-        await updateVadConfiguration({
+        const calibrated = {
           ...vadConfig,
           sensitivity_rms: result.sensitivity_rms,
           peak_threshold: result.peak_threshold,
           noise_gate_threshold: result.noise_gate_threshold,
-        });
+        };
+        await updateVadConfiguration(calibrated);
+
+        if (wasCapturing) {
+          try {
+            setCapturing(true);
+            await startBackend(calibrated);
+          } catch (e) {
+            setError(
+              `Calibration applied but restarting capture failed: ${e instanceof Error ? e.message : String(e)}`
+            );
+          }
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setCalibrationError(msg);
@@ -897,18 +791,12 @@ export function useSystemAudio() {
         setIsCalibrating(false);
       }
     },
-    [isCalibrating, selectedAudioDevices.output.id, updateVadConfiguration, vadConfig]
+    [isCalibrating, capturing, selectedAudioDevices.output.id, updateVadConfiguration, vadConfig, startBackend]
   );
 
   useEffect(() => {
-    if (capturing) {
-      setIsContinuousMode(!vadConfig.enabled);
-
-      if (!vadConfig.enabled) {
-        setIsRecordingInContinuousMode(false);
-      }
-    }
-  }, [vadConfig.enabled, capturing]);
+    if (capturing && vadConfig) setIsContinuousMode(!vadConfig.enabled);
+  }, [vadConfig?.enabled, capturing]);
 
   // Keyboard arrow key support for scrolling (local shortcut)
   useEffect(() => {
@@ -940,7 +828,14 @@ export function useSystemAudio() {
   useEffect(() => {
     const handleRecordingShortcuts = (e: KeyboardEvent) => {
       if (!isPopoverOpen || !isContinuousMode) return;
-      if (isProcessing || isAIProcessing) return;
+      const t = e.target;
+      if (
+        t instanceof HTMLInputElement ||
+        t instanceof HTMLTextAreaElement ||
+        (t instanceof HTMLElement && t.isContentEditable)
+      ) {
+        return;
+      }
 
       // Enter: Start recording (when not recording) or Stop & Send (when recording)
       if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
@@ -963,9 +858,7 @@ export function useSystemAudio() {
         e.key === " " &&
         !isRecordingInContinuousMode &&
         !e.metaKey &&
-        !e.ctrlKey &&
-        !(e.target instanceof HTMLInputElement) &&
-        !(e.target instanceof HTMLTextAreaElement)
+        !e.ctrlKey
       ) {
         e.preventDefault();
         startContinuousRecording();
@@ -979,12 +872,11 @@ export function useSystemAudio() {
     isPopoverOpen,
     isContinuousMode,
     isRecordingInContinuousMode,
-    isProcessing,
-    isAIProcessing,
     startContinuousRecording,
     manualStopAndSend,
     ignoreContinuousRecording,
   ]);
+
 
   return {
     capturing,
@@ -1001,9 +893,6 @@ export function useSystemAudio() {
     setIsPopoverOpen,
     // Conversation management
     conversation,
-    setConversation,
-    // AI processing
-    processWithAI,
     // Context management
     useSystemPrompt,
     setUseSystemPrompt: updateUseSystemPrompt,
@@ -1023,9 +912,11 @@ export function useSystemAudio() {
     // VAD configuration
     vadConfig,
     updateVadConfiguration,
+    resetVadConfig,
     // Live VAD telemetry
     vadMetrics,
     discardedNotice,
+    skippedNotice,
     // Calibration
     calibrateVad,
     isCalibrating,

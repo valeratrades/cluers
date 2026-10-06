@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { MousePointer2 } from "lucide-react";
 
@@ -25,16 +25,15 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
   });
   const [cursorPosition, setCursorPosition] = useState({ x: 0, y: 0 });
   const [cursorVisible, setCursorVisible] = useState(false);
-
-  const selectionRef = useRef<HTMLDivElement>(null);
+  const [error, setError] = useState<string | null>(null);
 
   // Handle cancellation (ESC key, cancel button)
   const handleCancel = async () => {
     setIsSelecting(false);
     try {
-      await invoke("close_overlay_window", { reason: "User cancelled" });
-    } catch {
-      // Error ignored
+      await invoke("close_overlay_window");
+    } catch (e) {
+      setError(`Failed to close overlay: ${e}`);
     }
   };
 
@@ -46,7 +45,7 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
     height: number
   ) => {
     try {
-      const scaleFactor = window.devicePixelRatio || 1;
+      const scaleFactor = window.devicePixelRatio;
       const coords: SelectionCoords = {
         x: Math.round(x * scaleFactor),
         y: Math.round(y * scaleFactor),
@@ -58,9 +57,8 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
         coords,
         monitorIndex,
       });
-    } catch {
-      // Error ignored
-      console.error("Error capturing selected area");
+    } catch (e) {
+      setError(`Capture failed: ${e}`);
     }
   };
 
@@ -134,7 +132,7 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
 
   // Handle ESC key
   const handleEscapeKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape" || e.keyCode === 27) {
+    if (e.key === "Escape") {
       e.preventDefault();
       e.stopImmediatePropagation();
       handleCancel();
@@ -143,16 +141,8 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
 
   // Event listeners setup
   useEffect(() => {
-    // ESC key listeners (multiple levels for reliability)
-    document.addEventListener("keydown", handleEscapeKey, true);
-    document.body.addEventListener("keydown", handleEscapeKey, true);
     window.addEventListener("keydown", handleEscapeKey, true);
-
-    return () => {
-      document.removeEventListener("keydown", handleEscapeKey, true);
-      document.body.removeEventListener("keydown", handleEscapeKey, true);
-      window.removeEventListener("keydown", handleEscapeKey, true);
-    };
+    return () => window.removeEventListener("keydown", handleEscapeKey, true);
   }, []);
 
   return (
@@ -171,14 +161,22 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
         {/* Instructions - Show on all monitors so users always see them */}
         <div className="fixed top-5 left-1/2 transform -translate-x-1/2 bg-black/70 text-white px-6 py-3 rounded-lg font-sans text-sm pointer-events-none z-[5000] shadow-2xl backdrop-blur-sm">
           <div className="flex items-center gap-2">
-            <span className="font-semibold">Screen Capture:</span>
-            <span>Click and drag to select area · Press ESC to cancel</span>
+            {error ? (
+              <>
+                <span className="text-red-400 font-semibold">{error}</span>
+                <span>Press ESC to close</span>
+              </>
+            ) : (
+              <>
+                <span className="font-semibold">Screen Capture:</span>
+                <span>Click and drag to select area · Press ESC to cancel</span>
+              </>
+            )}
           </div>
         </div>
 
         {/* Cancel Button - Show on all monitors for easy access */}
         <button
-          onClick={handleCancel}
           onMouseDown={(e) => {
             e.preventDefault();
             e.stopPropagation();
@@ -192,7 +190,6 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
 
         {/* Selection Rectangle */}
         <div
-          ref={selectionRef}
           className="absolute border-2 border-primary-foreground bg-primary/10 rounded-3xl rounded-br-none pointer-events-none"
           style={{
             left: selectionStyle.left,
@@ -204,7 +201,6 @@ const Overlay: React.FC<OverlayProps> = ({ monitorIndex }) => {
           }}
         />
         <div
-          ref={selectionRef}
           className="absolute border-[0.5px] border-black bg-primary/5 rounded-3xl rounded-br-none pointer-events-none"
           style={{
             left: selectionStyle.left,
