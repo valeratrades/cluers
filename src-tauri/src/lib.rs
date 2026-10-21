@@ -46,12 +46,27 @@ pub fn run() {
 
     // Without a subscriber every tracing::error!/warn! in the codebase is
     // silently dropped. RUST_LOG overrides the default level.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let fmt = tracing_subscriber::fmt().with_env_filter(filter);
+    // Launched from a launcher/autostart, stderr is gone: persist it so a failed run can be studied afterwards.
+    #[cfg(target_os = "linux")]
+    {
+        use tracing_subscriber::fmt::writer::MakeWriterExt as _;
+        let dir = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set on linux sessions"))
+            .join(".local/state/pluely");
+        std::fs::create_dir_all(&dir).expect("state dir must be writable");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("pluely.log"))
+            .expect("log file must be writable");
+        fmt.with_ansi(false)
+            .with_writer(std::io::stderr.and(std::sync::Arc::new(file)))
+            .init();
+    }
+    #[cfg(not(target_os = "linux"))]
+    fmt.init();
 
     // Get PostHog API key
     let posthog_api_key = option_env!("POSTHOG_API_KEY").unwrap_or("").to_string();

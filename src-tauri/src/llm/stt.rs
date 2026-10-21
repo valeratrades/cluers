@@ -21,13 +21,20 @@ pub async fn transcribe(
     audio: &[u8],
     mime: &str,
 ) -> Result<String, LlmError> {
-    if provider.is_pluely_hosted {
+    let started = std::time::Instant::now();
+    let res = if provider.is_pluely_hosted {
         crate::api::transcribe_pluely(app, &llm.http, audio)
             .await
             .map_err(LlmError::PluelyStt)
     } else {
         transcribe_custom(&llm.http, &llm.secrets, provider, audio, mime).await
+    };
+    let (provider_id, bytes, ms) = (&provider.id, audio.len(), started.elapsed().as_millis());
+    match &res {
+        Ok(t) => tracing::info!(%provider_id, bytes, ms, chars = t.len(), "stt ok"),
+        Err(e) => tracing::error!(%provider_id, bytes, ms, "stt failed: {e}"),
     }
+    res
 }
 
 async fn transcribe_custom(
@@ -97,6 +104,7 @@ async fn transcribe_custom(
         });
     }
     tracing::debug!(provider = %p.id, body = %text, "stt response");
+
 
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|_| LlmError::SttResponse(format!("not JSON: {text}")))?;
