@@ -4,7 +4,7 @@ jobs:
     steps:
     - id: upstream
       name: Get upstream repo URL
-      uses: actions/github-script@v7
+      uses: actions/github-script@v8
       with:
         script: "const repo = await github.rest.repos.get({\n  owner: context.repo.owner,\n\
           \  repo: context.repo.repo,\n});\nif (!repo.data.fork || !repo.data.parent)\
@@ -13,7 +13,7 @@ jobs:
           core.setOutput('default_branch', parent.default_branch);\ncore.info(`Upstream:\
           \ ${parent.full_name}, branch: ${parent.default_branch}`);\n"
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         fetch-depth: 0
         token: ${{ secrets.GITHUB_TOKEN }}
