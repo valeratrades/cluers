@@ -31,13 +31,18 @@
             syncFork = true;
           };
 
-          combined = v_flakes.utils.combine [
-            github
-            { shellHook = v_flakes.utils.mkShellHook ''
-                cp -f ${(files.gitattributes) { inherit pkgs; lfs = false; }} ./.gitattributes
-              '';
-            }
-          ];
+          combined = v_flakes.utils.combine {
+            inherit rust;
+            modules = [
+              github
+              { shellHook = v_flakes.utils.mkShellHook ''
+                  cp -f ${(files.gitattributes) { inherit pkgs; lfs = false; }} ./.gitattributes
+                '';
+              }
+            ];
+          };
+
+          gstPlugins = with pkgs.gst_all_1; [ gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad ];
 
           linuxDeps = with pkgs; [
             # Tauri/WebKit runtime
@@ -54,7 +59,7 @@
             # Audio (cpal + libpulse-binding in Cargo.toml)
             alsa-lib
             libpulseaudio
-          ];
+          ] ++ gstPlugins; # WebKit media pipeline needs appsink/appsrc/autoaudiosink
 
           systemDeps = lib.optionals pkgs.stdenv.isLinux linuxDeps;
 
@@ -64,6 +69,7 @@
             text = ''
               export LD_LIBRARY_PATH="${lib.makeLibraryPath systemDeps}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               export RUST_BACKTRACE=1
+              export GST_PLUGIN_SYSTEM_PATH_1_0="${lib.makeSearchPath "lib/gstreamer-1.0" gstPlugins}"
               npm install --legacy-peer-deps
               exec npm run tauri dev "$@"
             '';
@@ -131,6 +137,7 @@
 
             env = {
               RUST_BACKTRACE = 1;
+              GST_PLUGIN_SYSTEM_PATH_1_0 = lib.makeSearchPath "lib/gstreamer-1.0" gstPlugins;
               RUST_LIB_BACKTRACE = 0;
               RUSTUP_TOOLCHAIN = "${rust}"; # ~/.cargo/bin rustup proxies shadow PATH for cargo subcommands
             };
