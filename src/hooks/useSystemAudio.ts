@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { useWindowResize, useGlobalShortcuts } from ".";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { jsLog } from "@/lib/log";
 import { useApp } from "@/contexts";
 import {
   DEFAULT_QUICK_ACTIONS,
@@ -84,11 +85,7 @@ const EMPTY_CONVERSATION: ChatConversation = {
 
 export type useSystemAudioType = ReturnType<typeof useSystemAudio>;
 
-// Forward diagnostics to the Rust log (the webview console is invisible in
-// normal terminal launches).
-const dbg = (msg: string) => {
-  invoke("js_log", { msg }).catch(() => {}); // logging a logging failure would recurse
-};
+const dbg = (msg: string) => void jsLog("debug", msg);
 
 export function useSystemAudio() {
   const { resizeWindow } = useWindowResize();

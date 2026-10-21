@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getShortcutsConfig } from "@/lib/storage";
 import { invoke } from "@tauri-apps/api/core";
 import { getPlatform } from "@/lib";
+import { jsLog } from "@/lib/log";
 
 export const useApp = () => {
   const systemAudio = useSystemAudio();
@@ -22,7 +23,7 @@ export const useApp = () => {
         await invoke("update_shortcuts", { config: getShortcutsConfig() });
       } catch (error) {
         setShortcutError(`${error}`);
-        await invoke("js_log", { msg: `shortcut init failed: ${error}` });
+        void jsLog("error", "shortcut init failed:", error);
       }
     })();
   }, []);
@@ -46,7 +47,7 @@ export const useApp = () => {
         if (JSON.stringify(rects) === sent) return;
         sent = JSON.stringify(rects);
         invoke("set_input_region", { rects }).catch((e) =>
-          invoke("js_log", { msg: `set_input_region failed: ${e}` })
+          jsLog("error", "set_input_region failed:", e)
         );
       });
     };

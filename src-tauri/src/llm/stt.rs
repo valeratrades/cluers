@@ -9,11 +9,12 @@ use crate::llm::{
     provider::{method, parse_curl, resolve_vars, substitute_string, substitute_value},
     secrets::{ProviderKind, Secrets},
     stream::extract_by_path,
-    LlmError, LlmState,
+    LlmError, LlmState, BODY_CLIP,
 };
 
 /// Entry point for every STT caller.
 /// `Ok("")` means the provider heard no speech.
+#[tracing::instrument(skip_all, fields(provider = %provider.id, hosted = provider.is_pluely_hosted, bytes = audio.len()))]
 pub async fn transcribe(
     app: &AppHandle,
     llm: &LlmState,
@@ -29,10 +30,10 @@ pub async fn transcribe(
     } else {
         transcribe_custom(&llm.http, &llm.secrets, provider, audio, mime).await
     };
-    let (provider_id, bytes, ms) = (&provider.id, audio.len(), started.elapsed().as_millis());
+    let ms = started.elapsed().as_millis();
     match &res {
-        Ok(t) => tracing::info!(%provider_id, bytes, ms, chars = t.len(), "stt ok"),
-        Err(e) => tracing::error!(%provider_id, bytes, ms, "stt failed: {e}"),
+        Ok(t) => tracing::info!(ms, chars = t.len(), "stt ok"),
+        Err(e) => tracing::error!(ms, error = e as &dyn std::error::Error, "stt failed"),
     }
     res
 }
@@ -94,23 +95,25 @@ async fn transcribe_custom(
         }
     };
 
+    tracing::debug!(method = %parsed.method, url = %parsed.url, "request"); // template url: secrets are still {{placeholders}}
+    let started = std::time::Instant::now();
     let resp = req.send().await?;
     let status = resp.status();
     let text = resp.text().await?;
+    let clipped: String = text.chars().take(BODY_CLIP).collect();
+    tracing::debug!(status = status.as_u16(), ms = started.elapsed().as_millis(), body = %clipped, "response");
     if !status.is_success() {
         return Err(LlmError::ProviderApi {
             status: status.as_u16(),
-            body: text,
+            body: clipped,
         });
     }
-    tracing::debug!(provider = %p.id, body = %text, "stt response");
-
 
     let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|_| LlmError::SttResponse(format!("not JSON: {text}")))?;
+        .map_err(|_| LlmError::SttResponse(format!("not JSON: {clipped}")))?;
     extract_by_path(&json, &p.response_content_path).ok_or_else(|| {
         LlmError::SttResponse(format!(
-            "`{}` is not a string in {text}",
+            "`{}` is not a string in {clipped}",
             p.response_content_path
         ))
     })

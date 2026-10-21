@@ -317,7 +317,7 @@ pub fn validate_shortcut_key(key: String) -> Result<bool, String> {
     match key.parse::<Shortcut>() {
         Ok(_) => Ok(true),
         Err(e) => {
-            eprintln!("Invalid shortcut '{}': {}", key, e);
+            tracing::debug!("Invalid shortcut '{key}': {e}");
             Ok(false)
         }
     }
@@ -361,7 +361,7 @@ pub fn set_app_icon_visibility<R: Runtime>(app: AppHandle<R>, visible: bool) -> 
                 .set_skip_taskbar(!visible)
                 .map_err(|e| format!("Failed to set panel visibility: {}", e))?;
         } else {
-            eprintln!("Main window not found on Linux");
+            tracing::error!("Main window not found on Linux");
         }
     }
 

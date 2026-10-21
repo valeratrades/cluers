@@ -22,7 +22,7 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::{error, warn, Instrument as _};
 
 pub(super) const STT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -99,6 +99,13 @@ pub(crate) struct Capture {
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(
+    vad = vad_config.enabled,
+    device = ?device_id,
+    mic = ?mic_device_id,
+    stt = %session.config.stt.id,
+    ai = %session.config.ai.id,
+), err)]
 pub async fn start_system_audio_capture(
     app: AppHandle,
     vad_config: VadConfig,
@@ -186,7 +193,8 @@ pub async fn start_system_audio_capture(
                 report_stream_error(&app, stream.error());
                 report_stream_error(&app, mic.error().map(|e| e.context("Microphone")));
                 report_stream_error(&app, stalled.map(anyhow::Error::msg));
-            })
+            }
+            .in_current_span())
         })
         .await
 }
@@ -246,6 +254,7 @@ fn emit<R: Runtime>(app: &AppHandle<R>, event: &str, payload: impl Serialize + C
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn system_audio_control(app: AppHandle, control: Control) -> Result<(), String> {
     app.state::<crate::AudioState>().control(control).await
 }
@@ -439,6 +448,7 @@ async fn drive(
     let mut transcripts = FuturesUnordered::<BoxFuture<'_, (u64, Result<String, String>)>>::new();
     let mut answer: Option<BoxFuture<'_, Result<String, LlmError>>> = None;
     let mut audio_done = false;
+    let mut asked = 0u32;
 
     loop {
         if audio_done && transcripts.is_empty() && answer.is_none() {
@@ -470,10 +480,14 @@ async fn drive(
                                             .await
                                             {
                                                 Ok(r) => r.map_err(|e| format!("Transcription failed: {e}")),
-                                                Err(_) => Err("Speech transcription timed out (30s)".to_string()),
+                                                Err(_) => {
+                                                    warn!(timeout_s = STT_TIMEOUT.as_secs(), "stt timed out");
+                                                    Err("Speech transcription timed out (30s)".to_string())
+                                                }
                                             };
                                             (start_ms, text)
                                         }
+                                        .instrument(tracing::info_span!("segment", start_ms, end_ms))
                                         .boxed(),
                                     );
                                 }
@@ -532,6 +546,8 @@ async fn drive(
                 match out {
                     Output::Ask { message, history } => {
                         assert!(answer.is_none(), "Turns asks one at a time");
+                        asked += 1;
+                        tracing::info!(turn = asked, chars = message.len(), history = history.len(), "ask");
                         let chat = Chat {
                             provider: config.ai.clone(),
                             message,
@@ -556,10 +572,14 @@ async fn drive(
                                 };
                                 complete(app, llm, chat, &mut on_delta).await
                             }
+                            .instrument(tracing::info_span!("answer", turn = asked))
                             .boxed(),
                         );
                     }
                     Output::Event(e) => {
+                        if !matches!(e, TurnEvent::Delta { .. }) {
+                            tracing::debug!(event = ?e, "turn");
+                        }
                         if let Err(err) = events.send(e) {
                             error!("Turn event channel closed, ending capture: {err}"); // its renderer is gone
                             return;
@@ -681,6 +701,7 @@ pub async fn request_system_audio_access(app: AppHandle) -> Result<(), String> {
 /// Refuses to run while a capture session is active (would fight over the
 /// audio device).
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn calibrate_vad_thresholds(
     app: AppHandle,
     duration_secs: u64,

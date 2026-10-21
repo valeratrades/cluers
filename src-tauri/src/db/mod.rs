@@ -48,7 +48,7 @@ impl Db {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create app_config_dir");
         }
-        tracing::info!(target = "pluely::db", "opening sqlite at {}", path.display());
+        tracing::info!("opening sqlite at {}", path.display());
         let mut conn = Connection::open(&path)?;
         migrations::run_migrations(&mut conn)?;
         Ok(Self {

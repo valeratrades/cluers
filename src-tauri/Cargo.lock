@@ -3814,6 +3814,7 @@ dependencies = [
  "hound",
  "image",
  "keyring",
+ "libc",
  "libpulse-binding",
  "libpulse-simple-binding",
  "reqwest 0.12.23",

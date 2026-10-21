@@ -241,3 +241,30 @@ grows to 600px for popovers). On Linux only the painted parts take input:
 popper wrappers to `set_input_region`, which sets the GTK input shape.
 Anything else painted in the main window must carry `data-input-region`,
 or clicks on it fall through to the app below.
+
+## Logging
+
+`src-tauri/src/logging.rs` owns every sink. One file, `~/.local/state/pluely/pluely.log` (Linux),
+appended across runs; each primary instance starts with a `session start` banner (version, OS,
+display env, audio devices). Over 16 MiB at startup it moves to `pluely.log.1`; `--action`
+forwarders never rotate, since they run next to the live instance.
+
+| Sink   | When                     | Default filter                   |
+|--------|--------------------------|----------------------------------|
+| file   | always (Linux)           | `info,pluely_lib=debug,js=debug` |
+| stderr | stderr is a TTY, or not Linux | `info`                      |
+
+`RUST_LOG` replaces both defaults; an invalid one panics. Off a TTY the log file is `dup2`'d onto
+fd 2, so raw GLib/WebKit/GStreamer output (web processes inherit fd 2) and glibc abort messages
+land in it too. The panic hook logs location, thread and a forced backtrace at `target: panic`.
+
+- Spans sit at the chokepoints: `complete` (all LLM), `stt::transcribe` (all STT), the capture
+  task (`start_system_audio_capture`, with `segment` / `answer{turn}` children), and the
+  user-facing commands (`#[instrument(err)]`). Every invoke is a `debug` line.
+- Errors are logged as `error = &e as &dyn Error`, so the fmt layer prints `error.sources`.
+- Secrets: values are never fields. `resolve_vars` logs each variable's *source*
+  (`keychain` / `user` / `missing`); request logs carry the template URL (still `{{VAR}}`);
+  `LlmError::Reqwest` drops the substituted URL. Provider bodies are clipped to `BODY_CLIP`.
+- The renderer logs through `jsLog(level, ...)` (`src/lib/log.ts`); `forwardConsole()` in
+  `main.tsx` also forwards `console.error`/`warn`, `error` and `unhandledrejection` events.
+  Events carry the webview label as `window`.

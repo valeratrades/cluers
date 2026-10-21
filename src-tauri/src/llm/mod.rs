@@ -42,7 +42,7 @@ pub enum StreamEvent {
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
     #[error(transparent)]
-    Reqwest(#[from] reqwest::Error),
+    Reqwest(reqwest::Error),
     #[error("keychain: {0}")]
     Keychain(#[from] keyring::Error),
     #[error(transparent)]
@@ -73,6 +73,15 @@ pub enum LlmError {
     DuplicateRequestId(String),
     #[error("cancelled")]
     Cancelled,
+}
+
+/// Provider error bodies kept in errors and logs.
+pub(crate) const BODY_CLIP: usize = 2000;
+
+impl From<reqwest::Error> for LlmError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Reqwest(e.without_url()) // the substituted url can carry a `?key=` secret
+    }
 }
 
 impl serde::Serialize for LlmError {

@@ -2,6 +2,7 @@ mod api;
 mod capture;
 mod db;
 mod llm;
+mod logging;
 mod shortcuts;
 mod window;
 use tauri::Manager;
@@ -29,44 +30,19 @@ fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-// Frontend log sink: the webview console is invisible when the app is
-// launched from a terminal, so the JS side forwards diagnostics here.
-#[tauri::command]
-fn js_log(msg: String) {
-    tracing::info!(target: "js", "{msg}");
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
-    if let Err(e) = shortcuts::cli_action(&std::env::args().collect::<Vec<_>>()) {
-        eprintln!("{e}");
-        std::process::exit(2);
-    }
-
-    // Without a subscriber every tracing::error!/warn! in the codebase is
-    // silently dropped. RUST_LOG overrides the default level.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let fmt = tracing_subscriber::fmt().with_env_filter(filter);
-    // Launched from a launcher/autostart, stderr is gone: persist it so a failed run can be studied afterwards.
-    #[cfg(target_os = "linux")]
-    {
-        use tracing_subscriber::fmt::writer::MakeWriterExt as _;
-        let dir = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set on linux sessions"))
-            .join(".local/state/pluely");
-        std::fs::create_dir_all(&dir).expect("state dir must be writable");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("pluely.log"))
-            .expect("log file must be writable");
-        fmt.with_ansi(false)
-            .with_writer(std::io::stderr.and(std::sync::Arc::new(file)))
-            .init();
-    }
+    let forwarder = match shortcuts::cli_action(&std::env::args().collect::<Vec<_>>()) {
+        Ok(action) => action.is_some(),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     #[cfg(not(target_os = "linux"))]
-    fmt.init();
+    let forwarder = false;
+    logging::init(forwarder);
 
     // Get PostHog API key
     let posthog_api_key = option_env!("POSTHOG_API_KEY").unwrap_or("").to_string();
@@ -105,57 +81,65 @@ pub fn run() {
         .plugin(tauri_plugin_machine_uid::init());
     #[cfg(target_os = "macos")]
     let builder = builder.plugin(tauri_nspanel::init());
+    let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
+        get_app_version,
+        logging::js_log,
+        window::set_window_height,
+        window::set_input_region,
+        window::open_dashboard,
+        capture::capture_to_base64,
+        capture::start_screen_capture,
+        capture::capture_selected_area,
+        capture::close_overlay_window,
+        shortcuts::update_shortcuts,
+        shortcuts::validate_shortcut_key,
+        shortcuts::set_app_icon_visibility,
+        shortcuts::set_always_on_top,
+        shortcuts::exit_app,
+        api::fetch_models,
+        api::fetch_prompts,
+        api::generate_system_prompt_via_api,
+        api::get_activity,
+        llm::commands::stream_chat,
+        llm::commands::cancel_chat,
+        llm::commands::set_provider_secret,
+        llm::commands::list_provider_secret_names,
+        llm::commands::delete_provider_secret,
+        llm::commands::delete_all_provider_secrets,
+        llm::commands::pluely_selected_model_get,
+        llm::commands::pluely_selected_model_set,
+        db::commands::list_conversation_summaries,
+        db::commands::load_conversation,
+        db::commands::append_turn,
+        db::commands::delete_conversation,
+        db::commands::delete_all_conversations,
+        db::commands::list_system_prompts,
+        db::commands::create_system_prompt,
+        db::commands::edit_system_prompt,
+        db::commands::delete_system_prompt,
+        speaker::start_system_audio_capture,
+        speaker::stop_system_audio_capture,
+        speaker::record_push_to_talk,
+        speaker::finish_push_to_talk,
+        speaker::system_audio_control,
+        speaker::check_system_audio_access,
+        speaker::request_system_audio_access,
+        speaker::default_vad_config,
+        speaker::update_vad_config,
+        speaker::calibrate_vad_thresholds,
+        speaker::get_input_devices,
+        speaker::get_output_devices,
+    ];
     let builder = builder
-        .invoke_handler(tauri::generate_handler![
-            get_app_version,
-            js_log,
-            window::set_window_height,
-            window::set_input_region,
-            window::open_dashboard,
-            capture::capture_to_base64,
-            capture::start_screen_capture,
-            capture::capture_selected_area,
-            capture::close_overlay_window,
-            shortcuts::update_shortcuts,
-            shortcuts::validate_shortcut_key,
-            shortcuts::set_app_icon_visibility,
-            shortcuts::set_always_on_top,
-            shortcuts::exit_app,
-            api::fetch_models,
-            api::fetch_prompts,
-            api::generate_system_prompt_via_api,
-            api::get_activity,
-            llm::commands::stream_chat,
-            llm::commands::cancel_chat,
-            llm::commands::set_provider_secret,
-            llm::commands::list_provider_secret_names,
-            llm::commands::delete_provider_secret,
-            llm::commands::delete_all_provider_secrets,
-            llm::commands::pluely_selected_model_get,
-            llm::commands::pluely_selected_model_set,
-            db::commands::list_conversation_summaries,
-            db::commands::load_conversation,
-            db::commands::append_turn,
-            db::commands::delete_conversation,
-            db::commands::delete_all_conversations,
-            db::commands::list_system_prompts,
-            db::commands::create_system_prompt,
-            db::commands::edit_system_prompt,
-            db::commands::delete_system_prompt,
-            speaker::start_system_audio_capture,
-            speaker::stop_system_audio_capture,
-            speaker::record_push_to_talk,
-            speaker::finish_push_to_talk,
-            speaker::system_audio_control,
-            speaker::check_system_audio_access,
-            speaker::request_system_audio_access,
-            speaker::default_vad_config,
-            speaker::update_vad_config,
-            speaker::calibrate_vad_thresholds,
-            speaker::get_input_devices,
-            speaker::get_output_devices,
-        ])
+        .invoke_handler(move |invoke| {
+            let command = invoke.message.command();
+            if command != "js_log" {
+                tracing::debug!(command, "invoke");
+            }
+            handler(invoke)
+        })
         .setup(|app| {
+            logging::banner(app.handle());
             // SQLite (rusqlite) state. Mirrors what tauri-plugin-sql resolved
             // for "sqlite:pluely.db": app_config_dir() + filename.
             let db_path = app
@@ -173,7 +157,7 @@ pub fn run() {
             let app_handle = app.handle();
             if app_handle.get_webview_window("dashboard").is_none() {
                 if let Err(e) = window::create_dashboard_window(app_handle) {
-                    eprintln!("Failed to pre-create dashboard window on startup: {}", e);
+                    tracing::error!("Failed to pre-create dashboard window on startup: {e}");
                 }
             }
 
@@ -186,7 +170,7 @@ pub fn run() {
                     MacosLauncher::LaunchAgent,
                     Some(vec![]),
                 )) {
-                    eprintln!("Failed to initialize autostart plugin: {}", e);
+                    tracing::error!("Failed to initialize autostart plugin: {e}");
                 }
             }
 

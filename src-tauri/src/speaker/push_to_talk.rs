@@ -43,6 +43,7 @@ impl PushToTalk {
 
 /// `Ok(None)`: discarded. `Ok(Some(""))`: the provider heard no speech.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(device = ?device_id, stt = %stt.id), err)]
 pub async fn record_push_to_talk(
     app: AppHandle,
     device_id: Option<String>,

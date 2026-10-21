@@ -223,13 +223,16 @@ async fn user_activity(
     }
 
     let url = format!("{}/api/activity", endpoint.trim_end_matches('/'));
-    let _ = http
+    if let Err(e) = http
         .post(&url)
         .header("Authorization", format!("Bearer {}", access_key))
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
-        .await;
+        .await
+    {
+        tracing::warn!(error = &e as &dyn std::error::Error, "activity report failed"); // telemetry only: the answer already streamed
+    }
 }
 
 pub async fn stream_pluely(
@@ -315,6 +318,7 @@ pub async fn stream_pluely(
     {
         Ok(r) => r,
         Err(e) => {
+            tracing::error!(error = &e as &dyn std::error::Error, "pluely chat request failed");
             let final_msg = map_api_error_message(&error_rules, &[e.to_string()]);
             report_api_error(
                 app, http, e.to_string(), "/api/chat".to_string(),
@@ -327,6 +331,7 @@ pub async fn stream_pluely(
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
+        tracing::error!(%status, body = %error_text.chars().take(super::BODY_CLIP).collect::<String>(), "pluely chat rejected");
         let mut sources = vec![error_text.clone(), status.to_string()];
         if let Ok(j) = serde_json::from_str::<serde_json::Value>(&error_text) {
             if let Some(s) = j.get("error").and_then(|v| v.as_str()) {

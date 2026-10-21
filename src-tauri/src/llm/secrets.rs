@@ -114,9 +114,12 @@ async fn ensure_loaded(
         return Ok(map.clone());
     }
     let svc_owned = svc.to_string();
-    let map = tokio::task::spawn_blocking(move || load_blocking(&svc_owned))
+    let started = std::time::Instant::now();
+    let loaded = tokio::task::spawn_blocking(move || load_blocking(&svc_owned))
         .await
-        .expect("secrets load spawn_blocking join")?;
+        .expect("secrets load spawn_blocking join");
+    tracing::debug!(service = svc, ms = started.elapsed().as_millis(), ok = loaded.is_ok(), "keychain load");
+    let map = loaded?;
     cache.insert(svc.to_string(), map.clone());
     Ok(map)
 }
@@ -124,9 +127,12 @@ async fn ensure_loaded(
 async fn store(svc: &str, map: &HashMap<String, String>) -> Result<(), LlmError> {
     let svc_owned = svc.to_string();
     let map_owned = map.clone();
-    tokio::task::spawn_blocking(move || store_blocking(&svc_owned, &map_owned))
+    let started = std::time::Instant::now();
+    let stored = tokio::task::spawn_blocking(move || store_blocking(&svc_owned, &map_owned))
         .await
-        .expect("secrets store spawn_blocking join")
+        .expect("secrets store spawn_blocking join");
+    tracing::debug!(service = svc, ms = started.elapsed().as_millis(), entries = map.len(), ok = stored.is_ok(), "keychain store");
+    stored
 }
 
 fn load_blocking(svc: &str) -> Result<HashMap<String, String>, LlmError> {

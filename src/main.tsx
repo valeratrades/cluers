@@ -7,6 +7,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import AppRoutes from "./routes";
 import { ErrorBoundary } from "react-error-boundary";
 import { ErrorLayout } from "./layouts/ErrorLayout";
+import { forwardConsole } from "./lib/log";
+
+forwardConsole();
 
 const currentWindow = getCurrentWindow();
 const windowLabel = currentWindow.label;

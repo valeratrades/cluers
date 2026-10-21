@@ -405,9 +405,25 @@ pub(crate) async fn resolve_vars(
         })
         .collect();
     if needed.is_empty() {
+        tracing::debug!(?kind, "template has no variables, keychain untouched");
         return Ok(vars); // keyless templates must work without a Secret Service
     }
-    vars.extend(secrets.provider(kind, &p.id).await?);
+    let keychain = secrets.provider(kind, &p.id).await?;
+    let sources: Vec<_> = needed
+        .iter()
+        .map(|v| {
+            let source = if keychain.contains_key(v) {
+                "keychain"
+            } else if vars.contains_key(v) {
+                "user"
+            } else {
+                "missing"
+            };
+            (v.as_str(), source)
+        })
+        .collect();
+    tracing::debug!(?kind, ?sources, "variables resolved");
+    vars.extend(keychain);
     for v in needed {
         if vars.get(&v).is_none_or(|s| s.trim().is_empty()) {
             return Err(LlmError::MissingVariable(v));
@@ -487,12 +503,14 @@ pub async fn stream_custom(
     let url = substitute_string(&parsed.url, &vars);
     let method = method(&parsed.method)?;
 
+    tracing::debug!(%method, url = %parsed.url, "request"); // template url: secrets are still {{placeholders}}
     let mut req_builder = http.request(method.clone(), url);
     for (k, v) in &parsed.headers {
         req_builder = req_builder.header(k, substitute_string(v, &vars));
     }
     req_builder = req_builder.header("Content-Type", "application/json");
 
+    let started = std::time::Instant::now();
     let response = if method == reqwest::Method::GET {
         req_builder.send()
     } else {
@@ -500,9 +518,13 @@ pub async fn stream_custom(
     }
     .await?;
 
+    let status = response.status().as_u16();
+    tracing::debug!(status, ms = started.elapsed().as_millis(), "response");
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
+        let body = match response.text().await {
+            Ok(b) => b.chars().take(crate::llm::BODY_CLIP).collect(),
+            Err(e) => format!("<body unreadable: {e}>"),
+        };
         return Err(LlmError::ProviderApi { status, body });
     }
 

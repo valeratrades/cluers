@@ -51,6 +51,13 @@ pub struct ProviderInput {
 
 /// Routes to the Pluely-hosted or custom path. Text attachments are inlined into the message
 /// so both paths see them uniformly; only images and PDFs survive as structured attachments.
+#[tracing::instrument(skip_all, fields(
+    provider = %chat.provider.id,
+    hosted = chat.provider.is_pluely_hosted,
+    streaming = chat.provider.streaming,
+    history = chat.history.len(),
+    attachments = chat.attached_files.len(),
+))]
 pub(crate) async fn complete(
     app: &AppHandle,
     llm: &LlmState,
@@ -74,14 +81,22 @@ pub(crate) async fn complete(
             chat.message, f.name, content
         );
     }
-    if chat.provider.is_pluely_hosted {
+    let started = std::time::Instant::now();
+    let res = if chat.provider.is_pluely_hosted {
         pluely::stream_pluely(app, &llm.http, chat, on_delta).await
     } else {
         provider::stream_custom(&llm.http, &llm.secrets, chat, on_delta).await
+    };
+    let ms = started.elapsed().as_millis();
+    match &res {
+        Ok(full) => tracing::info!(ms, chars = full.len(), "llm ok"),
+        Err(e) => tracing::error!(ms, error = e as &dyn std::error::Error, "llm failed"),
     }
+    res
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(request_id = %request.request_id), err)]
 pub async fn stream_chat(
     app: AppHandle,
     state: State<'_, LlmState>,
@@ -108,7 +123,10 @@ pub async fn stream_chat(
 
     let full_response = match result {
         Ok(full) => full,
-        Err(LlmError::Cancelled) => String::new(),
+        Err(LlmError::Cancelled) => {
+            tracing::info!("cancelled");
+            String::new()
+        }
         Err(e) => return Err(e.to_string()),
     };
     channel
@@ -126,6 +144,7 @@ pub fn cancel_chat(state: State<'_, LlmState>, request_id: String) {
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(kind = ?kind, provider = %provider_id, name = %name), err)]
 pub async fn set_provider_secret(
     state: State<'_, LlmState>,
     kind: ProviderKind,
@@ -144,6 +163,7 @@ pub async fn set_provider_secret(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(kind = ?kind, provider = %provider_id), err)]
 pub async fn list_provider_secret_names(
     state: State<'_, LlmState>,
     kind: ProviderKind,
@@ -161,6 +181,7 @@ pub async fn list_provider_secret_names(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(kind = ?kind, provider = %provider_id, name = %name), err)]
 pub async fn delete_provider_secret(
     state: State<'_, LlmState>,
     kind: ProviderKind,
@@ -175,6 +196,7 @@ pub async fn delete_provider_secret(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(kind = ?kind, provider = %provider_id), err)]
 pub async fn delete_all_provider_secrets(
     state: State<'_, LlmState>,
     kind: ProviderKind,
