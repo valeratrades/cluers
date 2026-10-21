@@ -18,7 +18,7 @@
           };
           inherit (pkgs) lib;
           pname = "pluely";
-          version = "0.1.9";
+          version = "0.1.15";
 
           rust = pkgs.rust-bin.stable.latest.default.override {
             extensions = [ "rust-src" "rust-analyzer" ];
@@ -89,13 +89,13 @@
             npmDeps = pkgs.fetchNpmDeps {
               src = ./.;
               fetcherVersion = 2;
-              hash = "sha256-PMBkc5PHR8K1bhLbMiE51p/XciCOPn9DCTrZG8s9iMw=";
+              hash = "sha256-JoAczNLTffa0S4U+08XDgG6LZpxhK/YmxXQPiZYs0fY=";
             };
 
             npmFlags = [ "--legacy-peer-deps" ];
             cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
               src = ./src-tauri;
-              hash = "sha256-fl5sJud2Dic1spafCX8U6ypLJsfP1nSh51kld1MyeQ4=";
+              hash = "sha256-ELobVqLDRDfGrjpnNGpPE3SyeuRUQm2n7+tk+vE1Wfk=";
             };
 
             nativeBuildInputs = [
