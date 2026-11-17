@@ -163,12 +163,12 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
 - Calibration holds the slot while sampling, so a concurrent start waits.
 - `vad.rs` is a pure segmenter (no Tauri, no clocks): samples + sample rate in,
   `VadEvent`s out. `VadConfig` durations are in ms and validated before use, so
-  behaviour is identical across sample rates. The spec is `tests/vad.rs` plus
+  behaviour is identical across sample rates. The spec is `src-tauri/tests/it/vad.rs` plus
   the fixtures, regenerated with `nix develop -c src-tauri/tests/fixtures/vad/gen.sh`.
 - `turn.rs` is the pure turn machine (sans-IO: segments, transcripts, replies
   and the audio clock in; asks and `TurnEvent`s out). It decides when a turn
   closes, joins its fragments chronologically, carries SKIPped text into the
-  next ask and orders history. The spec is `tests/turn.rs`.
+  next ask and orders history. The spec is `src-tauri/tests/it/turn.rs`.
 - The mic is captured through Pulse (`@DEFAULT_SOURCE@` or a named source),
   next to the monitor. VAD mode requires it; there is no cpal. Continuous
   mode records system audio only.
@@ -192,7 +192,7 @@ previous fire-and-forget `report_api_error` spawns are awaited inline.
     user holds the floor;
   - echo is judged by timing against the system reference, not by AEC, so
     the user barging in mid-question still waits for `TURN_GAP_MS`.
-- The attribution spec is the `tests/turn.rs` scenes, assembled from the
+- The attribution spec is the `src-tauri/tests/it/turn.rs` scenes, assembled from the
   `pauses` fixture (no extra WAVs).
 - The capture task (`drive`) owns every STT and LLM future: one answer at a
   time, FIFO, never cancelled by a newer turn. Stopping the capture drops

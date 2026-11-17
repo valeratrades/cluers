@@ -1,5 +1,5 @@
 //! Pure turn machine: segments, transcripts and replies in; LLM asks and UI events out. No IO, no clocks.
-//! Spec: `tests/turn.rs`.
+//! Spec: `tests/it/turn.rs`.
 use super::vad::{VadConfig, HOP_MS};
 use crate::db::schema::Role;
 use crate::llm::provider::HistoryMessage;
