@@ -2,7 +2,7 @@
 use pluely_lib::vad::{Segmenter, VadConfig, VadEvent, HOP_MS};
 use std::f32::consts::TAU;
 
-mod common;
+use crate::common;
 use common::{load, truth};
 
 const RATES: [u32; 3] = [16000, 44100, 48000];

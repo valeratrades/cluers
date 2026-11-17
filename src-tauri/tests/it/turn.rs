@@ -3,7 +3,7 @@ use pluely_lib::turn::{Input, Output, Speaker, TurnEvent, Turns};
 use pluely_lib::vad::{Segmenter, VadConfig, VadEvent};
 use std::collections::VecDeque;
 
-mod common;
+use crate::common;
 use common::{load, truth};
 
 const RATES: [u32; 3] = [16000, 44100, 48000];
